@@ -77,6 +77,10 @@ class Settings:
     bolna_llm_provider: str = field(default_factory=lambda: os.getenv("BOLNA_LLM_PROVIDER", "openai"))
     bolna_llm_model: str = field(default_factory=lambda: os.getenv("BOLNA_LLM_MODEL", "gpt-4.1-mini"))
     bolna_agent_languages: str = field(default_factory=lambda: os.getenv("BOLNA_AGENT_LANGUAGES", "hi,kn"))
+    # Sarvam models/voice used by the Bolna agent (bulbul:v2 was retired by Sarvam)
+    sarvam_tts_model: str = field(default_factory=lambda: os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"))
+    sarvam_tts_voice: str = field(default_factory=lambda: os.getenv("SARVAM_TTS_VOICE", "shubh"))
+    sarvam_asr_model: str = field(default_factory=lambda: os.getenv("SARVAM_ASR_MODEL", "saarika:v2.5"))
     # "var" = {"$var": "x"} type-safe markers, "legacy" = "%(x)s" string templates
     bolna_tool_param_style: str = field(default_factory=lambda: os.getenv("BOLNA_TOOL_PARAM_STYLE", "var"))
     tool_shared_secret: str = field(default_factory=lambda: os.getenv("TOOL_SHARED_SECRET", ""))

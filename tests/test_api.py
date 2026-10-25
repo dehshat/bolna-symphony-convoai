@@ -216,3 +216,30 @@ def test_auto_provision_reports_errors_without_crashing(monkeypatch):
     config.settings.bolna_api_key = "bn-bad"
     asyncio.run(main.auto_provision_bolna())
     assert main.BOLNA_SYNC["state"] == "error" and "401" in main.BOLNA_SYNC["detail"]
+
+
+def test_agent_uses_current_sarvam_models():
+    tools = bolna_client.build_agent_payload("hi")["agent_config"]["tasks"][0]["tools_config"]
+    assert tools["synthesizer"]["provider_config"]["model"] == "bulbul:v3"
+    assert tools["synthesizer"]["provider_config"]["voice_id"] == "shubh"
+
+
+def test_deprecated_model_is_swapped_and_retried(monkeypatch):
+    sent = []
+
+    async def fake_list(self):
+        return []
+
+    async def fake_create(self, payload):
+        model = payload["agent_config"]["tasks"][0]["tools_config"]["synthesizer"]["provider_config"]["model"]
+        sent.append(model)
+        if model == "bulbul:v3":
+            raise bolna_client.BolnaError('Bolna POST /v2/agent -> 400: {"message":"Model \'bulbul:v3\' is '
+                                          'deprecated and can no longer be used. Use \'bulbul:v4\' instead."}')
+        return {"agent_id": "agent-new"}
+
+    monkeypatch.setattr(bolna_client.BolnaClient, "list_agents", fake_list)
+    monkeypatch.setattr(bolna_client.BolnaClient, "create_agent", fake_create)
+    config.settings.bolna_api_key = "bn-test"
+    result = asyncio.run(bolna_client.sync_agents(["hi"], "https://x.onrender.com"))
+    assert sent == ["bulbul:v3", "bulbul:v4"] and result["agents"] == {"hi": "agent-new"}

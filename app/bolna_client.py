@@ -156,7 +156,7 @@ def build_agent_payload(language: str = "hi", base_url: Optional[str] = None) ->
                     "input": {"provider": telephony, "format": "wav"},
                     "output": {"provider": telephony, "format": "wav"},
                     "transcriber": {
-                        "provider": "sarvam", "model": "saarika:v2.5", "language": lang_code, "stream": True,
+                        "provider": "sarvam", "model": s.sarvam_asr_model, "language": lang_code, "stream": True,
                         "sampling_rate": 16000, "encoding": "linear16", "endpointing": 400,
                         "noise_reduction": True,
                         "keywords": "Innova,toll,bata,all-inclusive,per km,tempo,AC,gas,rupees,hazaar,saavira",
@@ -169,7 +169,8 @@ def build_agent_payload(language: str = "hi", base_url: Optional[str] = None) ->
                     },
                     "synthesizer": {
                         "provider": "sarvam", "stream": True, "buffer_size": 100, "audio_format": "wav",
-                        "provider_config": {"voice": "Abhilash", "voice_id": "abhilash", "model": "bulbul:v2",
+                        "provider_config": {"voice": s.sarvam_tts_voice.capitalize(),
+                                            "voice_id": s.sarvam_tts_voice.lower(), "model": s.sarvam_tts_model,
                                             "language": lang_code, "speed": 1.05},
                     },
                     "api_tools": {"tools": _tools(language), "tools_params": tools_params},
@@ -258,6 +259,27 @@ class BolnaClient:
         raise last or BolnaError("could not list agents")
 
 
+_DEPRECATED_RE = re.compile(r"Model '([^']+)' is deprecated.*?Use '([^']+)' instead", re.S)
+
+
+async def _push_agent(client: "BolnaClient", payload: dict, existing: str) -> dict:
+    """Create/update; if Bolna says a model is retired and names its replacement, swap it in and retry."""
+    import json as _json
+    for _ in range(3):
+        try:
+            if existing:
+                return await client.update_agent(existing, payload)
+            return await client.create_agent(payload)
+        except BolnaError as exc:
+            m = _DEPRECATED_RE.search(str(exc).replace('\\"', '"'))
+            if not m:
+                raise
+            old, new = m.group(1), m.group(2)
+            log.warning("Bolna says %s is deprecated; retrying with %s", old, new)
+            payload = _json.loads(_json.dumps(payload).replace(f'"{old}"', f'"{new}"'))
+    raise BolnaError("model deprecation retries exhausted")
+
+
 def agent_name(language: str) -> str:
     return f"Swarm Negotiator ({language.upper()})"
 
@@ -286,10 +308,10 @@ async def sync_agents(languages: Optional[list[str]] = None, base_url: Optional[
                     by_name = {}
             existing = by_name.get(agent_name(lang), "")
         if existing:
-            await client.update_agent(existing, payload)
+            await _push_agent(client, payload, existing)
             result["agents"][lang] = existing
         else:
-            created = await client.create_agent(payload)
+            created = await _push_agent(client, payload, "")
             agent_id = created.get("agent_id") or created.get("id")
             if not agent_id:
                 raise BolnaError(f"unexpected create response: {created}")
