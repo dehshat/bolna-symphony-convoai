@@ -155,10 +155,11 @@ def build_agent_payload(language: str = "hi", base_url: Optional[str] = None) ->
                 "tools_config": {
                     "input": {"provider": telephony, "format": "wav"},
                     "output": {"provider": telephony, "format": "wav"},
+                    # Bolna takes a plain code ("hi") for the Sarvam transcriber and resolves the locale itself;
+                    # sampling rate and encoding are set by Bolna to match the telephony provider.
                     "transcriber": {
-                        "provider": "sarvam", "model": s.sarvam_asr_model, "language": lang_code, "stream": True,
-                        "sampling_rate": 16000, "encoding": "linear16", "endpointing": 400,
-                        "noise_reduction": True,
+                        "provider": "sarvam", "model": s.sarvam_asr_model, "language": language, "stream": True,
+                        "endpointing": 400,
                         "keywords": "Innova,toll,bata,all-inclusive,per km,tempo,AC,gas,rupees,hazaar,saavira",
                     },
                     "llm_agent": {
@@ -260,24 +261,59 @@ class BolnaClient:
 
 
 _DEPRECATED_RE = re.compile(r"Model '([^']+)' is deprecated.*?Use '([^']+)' instead", re.S)
+_LANGUAGE_RE = re.compile(r"[Pp]rovided language:?\s*'?([A-Za-z-]+)'? is not available for the model:?\s*'?([\w:.\-]+)")
+
+
+def _toggle_locale(code: str) -> str:
+    """'hi-IN' <-> 'hi'."""
+    return code.split("-")[0] if "-" in code else SARVAM_LANG.get(code, f"{code}-IN")
+
+
+def _language_slots(payload: dict) -> list[dict]:
+    """The dicts that carry a {model, language} pair: transcriber and synthesizer.provider_config."""
+    tools = payload["agent_config"]["tasks"][0]["tools_config"]
+    return [d for d in (tools.get("transcriber"), (tools.get("synthesizer") or {}).get("provider_config")) if d]
+
+
+def _adapt_payload(payload: dict, error: str) -> Optional[str]:
+    """Fix the payload in place from a Bolna validation error. Returns a note, or None if not fixable."""
+    import json as _json
+    text = error.replace('\\"', '"')
+    m = _DEPRECATED_RE.search(text)
+    if m:
+        old, new = m.group(1), m.group(2)
+        fixed = _json.loads(_json.dumps(payload).replace(f'"{old}"', f'"{new}"'))
+        payload.clear()
+        payload.update(fixed)
+        return f"model {old} -> {new}"
+    m = _LANGUAGE_RE.search(text)
+    if m:
+        bad_lang, model = m.group(1), m.group(2)
+        slots = [d for d in _language_slots(payload) if d.get("model") == model and d.get("language") == bad_lang]
+        if not slots:
+            return None
+        for slot in slots:
+            slot["language"] = _toggle_locale(bad_lang)
+        return f"{model} language {bad_lang} -> {slots[0]['language']}"
+    return None
 
 
 async def _push_agent(client: "BolnaClient", payload: dict, existing: str) -> dict:
-    """Create/update; if Bolna says a model is retired and names its replacement, swap it in and retry."""
-    import json as _json
-    for _ in range(3):
+    """Create/update, self-correcting known Bolna validation errors (retired models, locale format)."""
+    seen: set[str] = set()
+    for _ in range(6):
         try:
             if existing:
                 return await client.update_agent(existing, payload)
             return await client.create_agent(payload)
         except BolnaError as exc:
-            m = _DEPRECATED_RE.search(str(exc).replace('\\"', '"'))
-            if not m:
+            message = str(exc)
+            note = None if message in seen else _adapt_payload(payload, message)
+            seen.add(message)
+            if not note:
                 raise
-            old, new = m.group(1), m.group(2)
-            log.warning("Bolna says %s is deprecated; retrying with %s", old, new)
-            payload = _json.loads(_json.dumps(payload).replace(f'"{old}"', f'"{new}"'))
-    raise BolnaError("model deprecation retries exhausted")
+            log.warning("Bolna rejected the agent; retrying with %s", note)
+    raise BolnaError("agent validation retries exhausted")
 
 
 def agent_name(language: str) -> str:
@@ -286,40 +322,51 @@ def agent_name(language: str) -> str:
 
 async def sync_agents(languages: Optional[list[str]] = None, base_url: Optional[str] = None,
                       dry_run: bool = False) -> dict:
-    """Create or update one negotiator agent per language. Returns {lang: agent_id} (+ payloads on dry run)."""
+    """Create or update one negotiator agent per language. Returns {lang: agent_id} (+ payloads on dry run).
+
+    Each language is synced independently, so one failing language never blocks the others."""
+    import json as _json
     s = config.settings
     langs = languages or [l.strip() for l in s.bolna_agent_languages.split(",") if l.strip()]
     result: dict = {"agents": {}, "dry_run": dry_run}
     client = BolnaClient()
     by_name: Optional[dict] = None
+    errors: dict[str, str] = {}
     for lang in langs:
         payload = build_agent_payload(lang, base_url)
         if dry_run:
             result.setdefault("payloads", {})[lang] = payload
             continue
-        existing = s.bolna_agent_ids.get(lang) or (s.bolna_agent_id if len(langs) == 1 else "")
-        if not existing:
-            # Re-use an agent created by an earlier deploy instead of piling up duplicates
-            if by_name is None:
-                try:
-                    by_name = {a["name"]: a["id"] for a in await client.list_agents() if a.get("id")}
-                except BolnaError as exc:
-                    log.info("could not list Bolna agents (%s); creating new ones", exc)
-                    by_name = {}
-            existing = by_name.get(agent_name(lang), "")
-        if existing:
-            await _push_agent(client, payload, existing)
-            result["agents"][lang] = existing
-        else:
-            created = await _push_agent(client, payload, "")
-            agent_id = created.get("agent_id") or created.get("id")
-            if not agent_id:
-                raise BolnaError(f"unexpected create response: {created}")
-            result["agents"][lang] = agent_id
+        try:
+            existing = s.bolna_agent_ids.get(lang) or (s.bolna_agent_id if len(langs) == 1 else "")
+            if not existing:
+                # Re-use an agent created by an earlier deploy instead of piling up duplicates
+                if by_name is None:
+                    try:
+                        by_name = {a["name"]: a["id"] for a in await client.list_agents() if a.get("id")}
+                    except BolnaError as exc:
+                        log.info("could not list Bolna agents (%s); creating new ones", exc)
+                        by_name = {}
+                existing = by_name.get(agent_name(lang), "")
+            if existing:
+                await _push_agent(client, payload, existing)
+                result["agents"][lang] = existing
+            else:
+                created = await _push_agent(client, payload, "")
+                agent_id = created.get("agent_id") or created.get("id")
+                if not agent_id:
+                    raise BolnaError(f"unexpected create response: {created}")
+                result["agents"][lang] = agent_id
+        except BolnaError as exc:
+            errors[lang] = str(exc)[:500]
+            log.warning("Bolna agent for %s failed: %s", lang, exc)
     if result["agents"]:
         s.bolna_agent_ids.update(result["agents"])  # usable immediately, until the process restarts
-        import json as _json
         result["env_hint"] = f"BOLNA_AGENT_IDS={_json.dumps(result['agents'], separators=(',', ':'))}"
+    if errors:
+        result["errors"] = errors
+        if not result["agents"]:
+            raise BolnaError("; ".join(f"[{k}] {v}" for k, v in errors.items()))
     return result
 
 

@@ -44,7 +44,10 @@ async def auto_provision_bolna() -> None:
     BOLNA_SYNC.update(state="syncing", detail=f"Provisioning agents for {s.public_base_url}")
     try:
         result = await bolna_client.sync_agents(None, s.public_base_url)
-        BOLNA_SYNC.update(state="ok", detail="Agents ready", agents=result["agents"])
+        partial = result.get("errors")
+        BOLNA_SYNC.update(state="ok" if not partial else "partial",
+                          detail="Agents ready" if not partial else f"Some languages failed: {partial}",
+                          agents=result["agents"])
         log.info("Bolna agents ready: %s", result["agents"])
     except Exception as exc:  # never block the app from booting
         BOLNA_SYNC.update(state="error", detail=str(exc)[:600])

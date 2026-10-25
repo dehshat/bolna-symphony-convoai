@@ -243,3 +243,82 @@ def test_deprecated_model_is_swapped_and_retried(monkeypatch):
     config.settings.bolna_api_key = "bn-test"
     result = asyncio.run(bolna_client.sync_agents(["hi"], "https://x.onrender.com"))
     assert sent == ["bulbul:v3", "bulbul:v4"] and result["agents"] == {"hi": "agent-new"}
+
+
+class FakeBolnaValidator:
+    """Mimics the hosted API's validation messages seen in production."""
+
+    def __init__(self, synth_wants_plain=False, reject_lang=None):
+        self.synth_wants_plain = synth_wants_plain
+        self.reject_lang = reject_lang
+        self.attempts = 0
+
+    async def create(self, _client, payload):
+        self.attempts += 1
+        tools = payload["agent_config"]["tasks"][0]["tools_config"]
+        asr, tts = tools["transcriber"], tools["synthesizer"]["provider_config"]
+        if self.reject_lang and asr["language"].startswith(self.reject_lang):
+            raise bolna_client.BolnaError('Bolna POST /v2/agent -> 400: {"message":"Something else entirely"}')
+        if tts["model"] == "bulbul:v2":
+            raise bolna_client.BolnaError("Bolna POST /v2/agent -> 400: {\"message\":\"Model 'bulbul:v2' is deprecated "
+                                          "and can no longer be used. Use 'bulbul:v3' instead.\"}")
+        if "-" in asr["language"]:
+            raise bolna_client.BolnaError('Bolna POST /v2/agent -> 400: {"message":"Provided language: '
+                                          f'{asr["language"]} is not available for the model: {asr["model"]}"}}')
+        if self.synth_wants_plain and "-" in tts["language"]:
+            raise bolna_client.BolnaError('Bolna POST /v2/agent -> 400: {"message":"Provided language: '
+                                          f'{tts["language"]} is not available for the model: {tts["model"]}"}}')
+        return {"agent_id": f"agent-{asr['language']}"}
+
+
+def _install(monkeypatch, validator):
+    async def fake_list(self):
+        return []
+    monkeypatch.setattr(bolna_client.BolnaClient, "list_agents", fake_list)
+    async def create(client_self, payload):
+        return await validator.create(client_self, payload)
+    monkeypatch.setattr(bolna_client.BolnaClient, "create_agent", create)
+    config.settings.bolna_api_key = "bn-test"
+
+
+def test_default_payload_passes_known_validation_first_time(monkeypatch):
+    v = FakeBolnaValidator()
+    _install(monkeypatch, v)
+    result = asyncio.run(bolna_client.sync_agents(["hi", "kn"], "https://x.onrender.com"))
+    assert result["agents"] == {"hi": "agent-hi", "kn": "agent-kn"} and v.attempts == 2
+    tools = bolna_client.build_agent_payload("hi")["agent_config"]["tasks"][0]["tools_config"]
+    assert tools["transcriber"]["model"] == "saaras:v4" and tools["transcriber"]["language"] == "hi"
+    assert "sampling_rate" not in tools["transcriber"] and "encoding" not in tools["transcriber"]
+
+
+def test_locale_format_is_self_corrected(monkeypatch):
+    config.settings.sarvam_tts_model = "bulbul:v2"  # also exercise the retired-model swap
+    v = FakeBolnaValidator(synth_wants_plain=True)
+    _install(monkeypatch, v)
+    payload = bolna_client.build_agent_payload("hi")
+    payload["agent_config"]["tasks"][0]["tools_config"]["transcriber"]["language"] = "hi-IN"
+    created = asyncio.run(bolna_client._push_agent(bolna_client.BolnaClient(), payload, ""))
+    tools = payload["agent_config"]["tasks"][0]["tools_config"]
+    assert created["agent_id"] == "agent-hi"
+    assert tools["transcriber"]["language"] == "hi" and tools["synthesizer"]["provider_config"]["language"] == "hi"
+    assert tools["synthesizer"]["provider_config"]["model"] == "bulbul:v3"
+
+
+def test_one_language_failing_does_not_block_the_other(monkeypatch):
+    from app import main
+    v = FakeBolnaValidator(reject_lang="kn")
+    _install(monkeypatch, v)
+    config.settings.bolna_agent_languages = "hi,kn"
+    asyncio.run(main.auto_provision_bolna())
+    assert main.BOLNA_SYNC["state"] == "partial" and main.BOLNA_SYNC["agents"] == {"hi": "agent-hi"}
+    assert config.settings.agent_id_for("hi") == "agent-hi"
+
+
+def test_unfixable_error_is_reported_not_looped(monkeypatch):
+    async def always(self, payload):
+        raise bolna_client.BolnaError('Bolna POST /v2/agent -> 400: {"message":"Provided language: hi is not '
+                                      'available for the model: saaras:v4"}')
+    monkeypatch.setattr(bolna_client.BolnaClient, "create_agent", always)
+    config.settings.bolna_api_key = "bn-test"
+    with pytest.raises(bolna_client.BolnaError):
+        asyncio.run(bolna_client._push_agent(bolna_client.BolnaClient(), bolna_client.build_agent_payload("hi"), ""))
