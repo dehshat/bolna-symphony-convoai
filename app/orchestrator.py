@@ -80,7 +80,8 @@ class Orchestrator:
             resp = await BolnaClient().place_call(agent_id, leg.vendor_phone, user_data, s.bolna_from_number or None)
         except BolnaError as exc:
             log.warning("place_call failed: %s", exc)
-            await self.engine.set_leg_status(session_id, leg_id, LegStatus.FAILED, error=str(exc)[:300])
+            await self.engine.set_leg_status(session_id, leg_id, LegStatus.FAILED,
+                                             error=explain_call_error(str(exc), leg.vendor_phone))
             return
         execution_id = resp.get("execution_id") or resp.get("id") or resp.get("call_id")
         await self.engine.set_leg_status(session_id, leg_id, LegStatus.DIALING, execution_id=execution_id)
@@ -122,6 +123,19 @@ class Orchestrator:
     def cancel(self, session_id: str) -> None:
         for task in self.tasks.pop(session_id, []):
             task.cancel()
+
+
+def explain_call_error(message: str, phone: str) -> str:
+    """Turn known Bolna call errors into a next step the user can act on from their phone."""
+    lower = message.lower()
+    if "verified phone number" in lower:
+        return (f"Bolna trial accounts can only call verified numbers. In the Bolna dashboard open your profile "
+                f"(bottom-left) → Verified numbers → add {phone} and confirm the OTP, then launch again.")
+    if "balance" in lower or "wallet" in lower:
+        return "Bolna wallet balance is too low for a call. Top up in the Bolna dashboard, then launch again."
+    if "concurren" in lower:
+        return "Bolna concurrency limit reached (trial: 2 calls). Wait for the other call to end, then launch again."
+    return message[:300]
 
 
 async def apply_execution_update(engine: AuctionEngine, parsed: dict) -> Optional[dict]:

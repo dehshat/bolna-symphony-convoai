@@ -322,3 +322,18 @@ def test_unfixable_error_is_reported_not_looped(monkeypatch):
     config.settings.bolna_api_key = "bn-test"
     with pytest.raises(bolna_client.BolnaError):
         asyncio.run(bolna_client._push_agent(bolna_client.BolnaClient(), bolna_client.build_agent_payload("hi"), ""))
+
+
+def test_trial_unverified_number_error_is_explained(client, monkeypatch):
+    config.settings.bolna_api_key = "bn-test"
+    config.settings.bolna_agent_ids = {"hi": "agent-hi"}
+
+    async def trial_reject(self, agent_id, phone, user_data, from_number=None):
+        raise bolna_client.BolnaError('Bolna POST /call -> 400: {"message":"Trial accounts can only make calls to '
+                                      'verified phone numbers."}')
+
+    monkeypatch.setattr(bolna_client.BolnaClient, "place_call", trial_reject)
+    sid = client.post("/api/session", json={"preset": "airport_innova", "mode": "hybrid",
+                                            "live_phone": "+918317494732"}).json()["session_id"]
+    snap = wait_for(client, sid, lambda s: s["legs"][0]["status"] == "FAILED")
+    assert "Verified numbers" in snap["legs"][0]["error"] and "+918317494732" in snap["legs"][0]["error"]
