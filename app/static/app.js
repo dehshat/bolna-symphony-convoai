@@ -95,10 +95,12 @@
     $("#hybridFields").hidden = mode !== "hybrid";
     $("#liveFields").hidden = mode !== "live";
     const c = S.config || {};
+    const sync = c.bolna_sync || {};
+    const why = sync.state && sync.state !== "ok" ? ` (Bolna setup: ${sync.state} — ${sync.detail || ""})` : "";
     const hints = {
       simulation: "3 AI-simulated vendors negotiate against each other through the same shared-memory engine. No phone, no cost.",
-      hybrid: c.bolna_ready ? "Your phone rings as Vendor A via Bolna + Sarvam. Vendors B & C are simulated; their quotes are used against you live." : "⚠ Hybrid needs BOLNA_API_KEY + a synced agent (⚙︎ Setup).",
-      live: c.bolna_ready ? "Dials 3 real numbers via Bolna in staggered waves (t=0, +8s, +16s)." : "⚠ Live needs BOLNA_API_KEY + a synced agent (⚙︎ Setup).",
+      hybrid: c.bolna_ready ? "Your phone rings as Vendor A via Bolna + Sarvam. Vendors B & C are simulated; their quotes are used against you live." : "⚠ Hybrid needs BOLNA_API_KEY + a synced agent (⚙︎ Setup)." + why,
+      live: c.bolna_ready ? "Dials 3 real numbers via Bolna in staggered waves (t=0, +8s, +16s)." : "⚠ Live needs BOLNA_API_KEY + a synced agent (⚙︎ Setup)." + why,
     };
     $("#modeHint").textContent = hints[mode];
     $("#launchBtn").textContent = mode === "simulation" ? "🚀 Launch swarm · 3 simulated calls" : mode === "hybrid" ? "📞 Launch · ring my phone + 2 AI vendors" : "📞 Launch · 3 real calls";
@@ -353,6 +355,7 @@
       ["Razorpay", c.razorpay_enabled ? "✓ test keys" : "mock checkout"],
       ["WhatsApp Cloud API", c.whatsapp_api_enabled ? "✓" : "wa.me link"],
       ["Tool auth secret", c.tool_auth_enabled ? "✓" : "off"],
+      ["Bolna auto-setup", `${c.bolna_sync?.state || "?"}: ${c.bolna_sync?.detail || ""}`],
     ];
     $("#cfgList").innerHTML = rows.map(([k, v]) => `<div><span class="muted">${esc(k)}</span><span>${esc(v)}</span></div>`).join("");
     $("#adminToken").value = store.get("adminToken", "");
@@ -383,7 +386,10 @@
     $("#livePhone").value = store.get("livePhone", "");
     setMode(S.mode);
     setupMic();
-    $$("#modeSeg button").forEach((b) => b.addEventListener("click", () => setMode(b.dataset.mode)));
+    $$("#modeSeg button").forEach((b) => b.addEventListener("click", async () => {
+      setMode(b.dataset.mode);
+      try { S.config = await api("/api/config"); setMode(b.dataset.mode); } catch { /* keep cached config */ }
+    }));
     $("#parseBtn").addEventListener("click", parseBrief);
     $("#launchBtn").addEventListener("click", launch);
     $("#lockBestBtn").addEventListener("click", () => lockWinner());
@@ -397,6 +403,14 @@
     });
     $("#adminBtn").addEventListener("click", openAdmin);
     $("#previewBtn").addEventListener("click", () => adminCall(true));
+    $("#checkBtn").addEventListener("click", async () => {
+      store.set("adminToken", $("#adminToken").value);
+      const out = $("#adminOut");
+      out.hidden = false;
+      out.textContent = "Checking Bolna key…";
+      try { out.textContent = "✓ Bolna key works\n" + JSON.stringify(await api("/api/admin/bolna_check"), null, 2); }
+      catch (e) { out.textContent = "✗ " + e.message; }
+    });
     $("#syncBtn").addEventListener("click", () => adminCall(false));
     const m = location.hash.match(/s=([a-f0-9]+)/);
     if (m) { try { startWarRoom(await api(`/api/session/${m[1]}`)); } catch { /* expired */ } }

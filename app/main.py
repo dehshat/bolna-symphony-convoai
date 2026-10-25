@@ -5,8 +5,10 @@ Run:  uvicorn app.main:app --host 0.0.0.0 --port $PORT      (one worker: the auc
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -24,7 +26,39 @@ from app.ws import broadcaster
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 STATIC = Path(__file__).parent / "static"
 
-app = FastAPI(title="Swarm Local Negotiator", version="1.0.0")
+log = logging.getLogger("main")
+
+# Shown in ⚙︎ Setup so you can see from your phone whether Bolna provisioning worked
+BOLNA_SYNC: dict = {"state": "not_configured", "detail": "Set BOLNA_API_KEY to enable hybrid/live calls"}
+
+
+async def auto_provision_bolna() -> None:
+    """On boot: point the Bolna agents' tools and webhook at this deployment (create them if missing)."""
+    s = config.settings
+    if not s.bolna_api_key or not s.auto_sync_bolna:
+        return
+    if not s.public_base_url:
+        BOLNA_SYNC.update(state="waiting_for_domain",
+                          detail="Generate a public domain (Railway → Settings → Networking) or set PUBLIC_BASE_URL")
+        return
+    BOLNA_SYNC.update(state="syncing", detail=f"Provisioning agents for {s.public_base_url}")
+    try:
+        result = await bolna_client.sync_agents(None, s.public_base_url)
+        BOLNA_SYNC.update(state="ok", detail="Agents ready", agents=result["agents"])
+        log.info("Bolna agents ready: %s", result["agents"])
+    except Exception as exc:  # never block the app from booting
+        BOLNA_SYNC.update(state="error", detail=str(exc)[:600])
+        log.warning("Bolna auto-provisioning failed: %s", exc)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    task = asyncio.create_task(auto_provision_bolna())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="Swarm Local Negotiator", version="1.0.0", lifespan=lifespan)
 app.include_router(webhook_router)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
@@ -118,6 +152,7 @@ async def get_config(request: Request) -> dict:
         "presets": {k: {"title": v["title"], "brief": v["brief"], "request": v["request"]}
                     for k, v in briefs.PRESETS.items()},
         "default_preset": briefs.DEFAULT_PRESET,
+        "bolna_sync": BOLNA_SYNC,
         "vendors": briefs.VENDOR_PERSONAS,
     }
 
@@ -242,11 +277,23 @@ async def agent_payload(request: Request, lang: str = "hi") -> dict:
     return bolna_client.build_agent_payload(lang, _base_url(request))
 
 
+@app.get("/api/admin/bolna_check")
+async def bolna_check(request: Request) -> dict:
+    _require_admin(request)
+    try:
+        return {"ok": True, "account": await bolna_client.BolnaClient().me(), "sync": BOLNA_SYNC}
+    except bolna_client.BolnaError as exc:
+        return JSONResponse({"ok": False, "error": str(exc), "sync": BOLNA_SYNC}, status_code=502)
+
+
 @app.post("/api/admin/sync_agent")
 async def sync_agent(request: Request, body: SyncBody) -> dict:
     _require_admin(request)
     try:
-        return await bolna_client.sync_agents(body.languages, body.base_url or _base_url(request), body.dry_run)
+        result = await bolna_client.sync_agents(body.languages, body.base_url or _base_url(request), body.dry_run)
+        if not body.dry_run:
+            BOLNA_SYNC.update(state="ok", detail="Agents ready (manual sync)", agents=result["agents"])
+        return result
     except bolna_client.BolnaError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 

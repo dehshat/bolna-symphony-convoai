@@ -143,7 +143,7 @@ def build_agent_payload(language: str = "hi", base_url: Optional[str] = None) ->
     telephony = s.bolna_telephony_provider
     return {
         "agent_config": {
-            "agent_name": f"Swarm Negotiator ({language.upper()})",
+            "agent_name": agent_name(language),
             "agent_type": "other",
             "agent_welcome_message": "{opening_line}",
             # Bolna's execution webhook carries no auth header of ours, so the shared secret rides in the URL
@@ -201,9 +201,12 @@ class BolnaClient:
     async def _request(self, method: str, path: str, json: Optional[dict] = None) -> dict:
         if not self.api_key:
             raise BolnaError("BOLNA_API_KEY is not set")
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.request(method, f"{self.base}{path}", json=json,
-                                     headers={"Authorization": f"Bearer {self.api_key}"})
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                r = await client.request(method, f"{self.base}{path}", json=json,
+                                         headers={"Authorization": f"Bearer {self.api_key}"})
+        except httpx.HTTPError as exc:
+            raise BolnaError(f"Bolna {method} {path} unreachable: {exc}") from exc
         if r.status_code >= 400:
             raise BolnaError(f"Bolna {method} {path} -> {r.status_code}: {r.text[:500]}")
         try:
@@ -229,6 +232,35 @@ class BolnaClient:
     async def get_execution(self, execution_id: str) -> dict:
         return await self._request("GET", f"/executions/{execution_id}")
 
+    async def me(self) -> dict:
+        """Read-only key check: account, wallet balance and concurrency."""
+        return await self._request("GET", "/user/me")
+
+    async def list_agents(self) -> list[dict]:
+        """[{id, name}] of the account's agents. Tries the v2 path, then the legacy one."""
+        last: Optional[Exception] = None
+        for path in ("/v2/agent/all", "/agent/all"):
+            try:
+                data = await self._request("GET", path)
+            except BolnaError as exc:
+                last = exc
+                continue
+            items = data if isinstance(data, list) else (data.get("agents") or data.get("data") or [])
+            out = []
+            for item in items if isinstance(items, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                nested = item.get("data") if isinstance(item.get("data"), dict) else item
+                agent_config = nested.get("agent_config") if isinstance(nested.get("agent_config"), dict) else {}
+                out.append({"id": item.get("agent_id") or item.get("id"),
+                            "name": item.get("agent_name") or agent_config.get("agent_name")})
+            return out
+        raise last or BolnaError("could not list agents")
+
+
+def agent_name(language: str) -> str:
+    return f"Swarm Negotiator ({language.upper()})"
+
 
 async def sync_agents(languages: Optional[list[str]] = None, base_url: Optional[str] = None,
                       dry_run: bool = False) -> dict:
@@ -237,12 +269,22 @@ async def sync_agents(languages: Optional[list[str]] = None, base_url: Optional[
     langs = languages or [l.strip() for l in s.bolna_agent_languages.split(",") if l.strip()]
     result: dict = {"agents": {}, "dry_run": dry_run}
     client = BolnaClient()
+    by_name: Optional[dict] = None
     for lang in langs:
         payload = build_agent_payload(lang, base_url)
         if dry_run:
             result.setdefault("payloads", {})[lang] = payload
             continue
         existing = s.bolna_agent_ids.get(lang) or (s.bolna_agent_id if len(langs) == 1 else "")
+        if not existing:
+            # Re-use an agent created by an earlier deploy instead of piling up duplicates
+            if by_name is None:
+                try:
+                    by_name = {a["name"]: a["id"] for a in await client.list_agents() if a.get("id")}
+                except BolnaError as exc:
+                    log.info("could not list Bolna agents (%s); creating new ones", exc)
+                    by_name = {}
+            existing = by_name.get(agent_name(lang), "")
         if existing:
             await client.update_agent(existing, payload)
             result["agents"][lang] = existing

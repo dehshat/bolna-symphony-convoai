@@ -167,3 +167,52 @@ def test_admin_dry_run_and_token(client):
     assert r["dry_run"] and "hi" in r["payloads"]
     config.settings.admin_token = "adm"
     assert client.post("/api/admin/sync_agent", json={"dry_run": True}).status_code == 401
+
+
+def test_public_url_from_railway_domain(monkeypatch):
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    monkeypatch.setenv("RAILWAY_PUBLIC_DOMAIN", "swarm-production.up.railway.app")
+    assert config.reload_settings().public_base_url == "https://swarm-production.up.railway.app"
+
+
+def test_auto_provision_reuses_existing_agent_and_creates_missing(monkeypatch):
+    from app import main
+    calls = []
+
+    async def fake_list(self):
+        return [{"id": "agent-hi-old", "name": "Swarm Negotiator (HI)"}]
+
+    async def fake_update(self, agent_id, payload):
+        calls.append(("update", agent_id, payload["agent_config"]["agent_name"]))
+        return {"agent_id": agent_id, "state": "updated"}
+
+    async def fake_create(self, payload):
+        calls.append(("create", None, payload["agent_config"]["agent_name"]))
+        return {"agent_id": "agent-kn-new", "state": "created"}
+
+    monkeypatch.setattr(bolna_client.BolnaClient, "list_agents", fake_list)
+    monkeypatch.setattr(bolna_client.BolnaClient, "update_agent", fake_update)
+    monkeypatch.setattr(bolna_client.BolnaClient, "create_agent", fake_create)
+    config.settings.bolna_api_key = "bn-test"
+    config.settings.bolna_agent_languages = "hi,kn"
+    asyncio.run(main.auto_provision_bolna())
+    assert main.BOLNA_SYNC["state"] == "ok"
+    assert main.BOLNA_SYNC["agents"] == {"hi": "agent-hi-old", "kn": "agent-kn-new"}
+    assert calls == [("update", "agent-hi-old", "Swarm Negotiator (HI)"), ("create", None, "Swarm Negotiator (KN)")]
+    assert config.settings.bolna_ready and config.settings.agent_id_for("kn") == "agent-kn-new"
+
+
+def test_auto_provision_reports_errors_without_crashing(monkeypatch):
+    from app import main
+
+    async def boom(self):
+        raise bolna_client.BolnaError("Bolna GET /v2/agent/all -> 401: invalid key")
+
+    async def fail_create(self, payload):
+        raise bolna_client.BolnaError("Bolna POST /v2/agent -> 401: invalid key")
+
+    monkeypatch.setattr(bolna_client.BolnaClient, "list_agents", boom)
+    monkeypatch.setattr(bolna_client.BolnaClient, "create_agent", fail_create)
+    config.settings.bolna_api_key = "bn-bad"
+    asyncio.run(main.auto_provision_bolna())
+    assert main.BOLNA_SYNC["state"] == "error" and "401" in main.BOLNA_SYNC["detail"]

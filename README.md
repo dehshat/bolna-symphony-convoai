@@ -44,37 +44,51 @@ Everything is served by **one FastAPI process on one origin**, so there is no CO
 
 ## 5-minute deploy from an Android phone (GitHub → Railway)
 
-1. **Railway:** open <https://railway.com> in Chrome → *Login with GitHub* → **New Project → Deploy from
-   GitHub repo** → pick `bolna-symphony-convoai` and the branch `claude/swarm-negotiator-buildathon-99ht6p`
-   (or `main` after you merge). Railway detects the `Dockerfile` / `railway.json` automatically.
-2. **Domain:** service → **Settings → Networking → Generate Domain**. Copy the URL
-   (e.g. `https://swarm-xyz.up.railway.app`).
-3. **Variables:** service → **Variables → Raw Editor**, paste and fill in:
-   ```env
-   PUBLIC_BASE_URL=https://swarm-xyz.up.railway.app
-   GEMINI_API_KEY=<your Google AI Studio key>
-   TOOL_SHARED_SECRET=<any long random string>
-   ADMIN_TOKEN=<another long random string>
-   ```
-   Railway redeploys. Open the URL, tap **🚀 Launch swarm**, and the simulation runs. **Sim mode is done.**
-4. **Bolna (for Hybrid/Live):** in the Bolna dashboard (works in mobile Chrome) copy your API key, then add
-   it to the Variables:
-   ```env
-   BOLNA_API_KEY=<bolna key>
-   BOLNA_TELEPHONY_PROVIDER=plivo      # or exotel if you've connected Exotel in Bolna
-   LIVE_TEST_PHONE=+91XXXXXXXXXX       # your own Android number
-   ```
-5. **Provision the agent from your phone:** open the app → **⚙︎** → enter the `ADMIN_TOKEN` → **Create /
-   update Bolna agents**. It shows a line like `BOLNA_AGENT_IDS={"hi":"…","kn":"…"}`. **Paste that into
-   Railway Variables** so it survives restarts. (Or run `python -m scripts.sync_bolna_agent` from any
-   terminal.)
-6. **Test Hybrid on one phone:** switch to **Hybrid**, enter your number, tap **📞 Launch**. Open the app in
-   Android **split-screen** with the dialer. Your phone rings about 6 seconds later. Answer as a cab
-   operator: *"Haan ji, 3000 lagega."* The agent comes back with the competing ₹ quote from the simulated
-   vendors and a counter-offer, while the card flashes on screen.
+The repo is Railway-ready: `Dockerfile` + `railway.json` (one replica, health check on `/api/health`).
+On boot the app **finds its own public URL** (`RAILWAY_PUBLIC_DOMAIN`, which Railway injects) and
+**creates or updates the Bolna agents automatically** (`AUTO_SYNC_BOLNA_AGENT=true`). It re-uses agents
+from earlier deploys by name, so redeploys don't pile up duplicates. No terminal needed.
 
-> **Render instead of Railway?** New → Blueprint → pick the repo (`render.yaml` is included). The free plan
-> sleeps after inactivity, so open the URL a minute before you demo.
+1. **Railway:** open <https://railway.com> in Chrome → *Login with GitHub* → **New Project → Deploy from
+   GitHub repo** → `bolna-symphony-convoai`. The default branch is
+   `claude/swarm-negotiator-buildathon-99ht6p`.
+2. **Variables:** service → **Variables → Raw Editor** → paste your private variables file (never commit
+   it; this repo is public):
+   ```env
+   EXECUTION_MODE=simulation
+   GEMINI_API_KEY=…
+   BOLNA_API_KEY=bn-…
+   BOLNA_TELEPHONY_PROVIDER=plivo
+   BOLNA_AGENT_LANGUAGES=hi,kn
+   LIVE_TEST_PHONE=+91XXXXXXXXXX
+   TOOL_SHARED_SECRET=<long random string>
+   ADMIN_TOKEN=<long random string>
+   ```
+3. **Domain:** service → **Settings → Networking → Generate Domain**. Railway redeploys. On that boot the
+   app provisions the Bolna agents against the new URL.
+4. **Check:** open the URL → **⚙︎** → paste `ADMIN_TOKEN` → **Check Bolna key**. "Bolna auto-setup" should
+   read `ok` with agent ids. If it shows an error, the exact Bolna response is shown there.
+5. **Sim test:** in **Sim** mode tap **🚀 Launch**. It needs no phone.
+6. **Call your phone:** switch to **Hybrid**, leave the phone box blank (it uses `LIVE_TEST_PHONE`), pick
+   the agent language (Hindi), choose the *Airport Innova* preset and tap **📞 Launch**. Answer as the cab
+   operator: *"Haan ji, milegi… teen hazaar lagega, sab milake."* The agent should counter with a
+   simulated competitor's real quote, and ⚡ flashes on screen.
+
+Optional: copy the `BOLNA_AGENT_IDS=…` line from ⚙︎ → *Create / update Bolna agents* into Variables to pin
+the ids. `PUBLIC_BASE_URL` overrides the auto-detected domain if you use a custom one.
+
+> **Render instead of Railway?** New → Blueprint → pick the repo (`render.yaml` is included;
+> `RENDER_EXTERNAL_URL` is auto-detected). The free plan sleeps when idle, so open the URL a minute before
+> you demo.
+
+**Troubleshooting a hybrid call**
+
+| Symptom | Fix |
+|---|---|
+| Card says *Bolna not configured* | ⚙︎ shows why. Usually a wrong `BOLNA_API_KEY` or no domain generated yet |
+| Phone never rings | Check the Bolna dashboard call log and wallet balance. Try `BOLNA_TELEPHONY_PROVIDER=twilio` or `exotel` (whatever your Bolna account uses), then redeploy |
+| Agent talks but never uses prices | Bolna can't reach the tools: the domain must be https and match the deployed app |
+| Agent literally says "{opening_line}" | Bolna didn't substitute `user_data` variables. Report it |
 
 ### Run locally
 

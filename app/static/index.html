@@ -53,7 +53,7 @@
         <label class="wide">Job <input id="summary" type="text"></label>
       </div>
       <div class="mode-extra" id="hybridFields" hidden>
-        <label>Your phone (you play Vendor A) <input id="livePhone" type="tel" placeholder="+91 98xxxxxxxx"></label>
+        <label>Your phone (you play Vendor A) <input id="livePhone" type="tel" placeholder="+91… (blank = LIVE_TEST_PHONE)"></label>
         <label>Agent language on your call
           <select id="liveLang"><option value="hi">Hindi / Hinglish</option><option value="kn">Kannada</option></select>
         </label>
@@ -116,6 +116,7 @@
         <input id="syncLangs" type="text" value="hi,kn">
       </label>
       <div class="modal-actions">
+        <button type="button" class="btn ghost" id="checkBtn">Check Bolna key</button>
         <button type="button" class="btn ghost" id="previewBtn">Preview agent JSON</button>
         <button type="button" class="btn primary" id="syncBtn">Create / update Bolna agents</button>
       </div>

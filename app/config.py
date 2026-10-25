@@ -48,11 +48,23 @@ def _json_map(name: str) -> dict:
         return {}
 
 
+def _public_url() -> str:
+    """PUBLIC_BASE_URL, else the domain Railway/Render inject automatically."""
+    url = os.getenv("PUBLIC_BASE_URL", "").strip()
+    if not url and os.getenv("RAILWAY_PUBLIC_DOMAIN"):
+        url = "https://" + os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    if not url:
+        url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+    return url.rstrip("/")
+
+
 @dataclass
 class Settings:
     # simulation | hybrid | live  (the UI can override per session)
     default_mode: str = field(default_factory=lambda: os.getenv("EXECUTION_MODE", "simulation").lower())
-    public_base_url: str = field(default_factory=lambda: os.getenv("PUBLIC_BASE_URL", "").rstrip("/"))
+    public_base_url: str = field(default_factory=_public_url)
+    # Create/update the Bolna agents on every boot (needs BOLNA_API_KEY and a public URL)
+    auto_sync_bolna: bool = field(default_factory=lambda: _bool("AUTO_SYNC_BOLNA_AGENT", True))
 
     # --- Bolna ---
     bolna_api_key: str = field(default_factory=lambda: os.getenv("BOLNA_API_KEY", ""))
