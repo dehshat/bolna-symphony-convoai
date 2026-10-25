@@ -35,6 +35,29 @@ Everything is served by **one FastAPI process on one origin**, so there is no CO
 
 ---
 
+## Any service: chat → map → calls → confirmed
+
+1. **Chat:** "I need a cook in Koramangala from Monday". The assistant asks only what's missing: area, time,
+   details, and a budget for priced jobs. It works for about 40 service types (cook, maid, plumber, electrician,
+   doctor, dentist, salon, tutor, movers, cab, pest control, gardener, caterer…) and for anything else in your
+   own words. Gemini understands messages when its quota allows; built-in rules do it otherwise.
+2. **Map search:** providers near you, ranked by **rating weighted by review count** (★4.6 from 2,000 reviews beats
+   ★5.0 from 3). Sources, in order: Google Places (`GOOGLE_MAPS_API_KEY`) → Gemini + Google Maps grounding →
+   OpenStreetMap → clearly-labelled demo listings.
+3. **Calls:** pick up to 5. Priced jobs (cook, plumber, cab…) are **negotiated** with truthful cross-call leverage
+   and the hidden-extras check. Clinics, salons and lawyers get an **appointment** flow: slot + fee, no haggling.
+4. **Finalize:** confirm the winner. You get a WhatsApp summary (plus a UPI token-advance link for priced jobs),
+   the others are released, and on live calls **the winner gets a confirmation call**.
+
+**Test mode (default):** every provider is dialled on your test phone (`TEST_PHONE_OVERRIDE`, else
+`LIVE_TEST_PHONE`) instead of the business. When several calls would ring the same phone, they go one after
+another. Set `CALL_REAL_NUMBERS=true` only when you really mean to call businesses.
+
+**Getting a Google Maps key** (for real ratings and phone numbers; your AI Studio key does not work for Places):
+console.cloud.google.com → create/select a project → enable **Places API (New)** → APIs & Services →
+Credentials → *Create credentials → API key* → add it as `GOOGLE_MAPS_API_KEY`. Google requires a billing
+account but gives a free monthly usage allowance.
+
 ## Which model does what
 
 | Where | Component | Job | Decides prices? |

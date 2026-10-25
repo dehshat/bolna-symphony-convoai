@@ -14,7 +14,9 @@
   const CATEGORY = { cab_outstation: "🚙 Cab", mini_truck: "🚚 Mini-truck", ac_repair: "❄️ AC repair" };
   const STATUS_LABEL = { PENDING: "QUEUED", DIALING: "DIALING", CONNECTED: "CONNECTED", QUOTED: "QUOTED", COUNTERED: "COUNTERED", HOLD: "ON HOLD", WON: "WON", RELEASED: "RELEASED", ENDED: "ENDED", FAILED: "FAILED" };
 
-  const S = { config: null, preset: null, mode: store.get("mode", "simulation"), session: null, ws: null, poll: null, seenTicks: new Set(), tickTimer: null, lastT: 0, lastTAt: 0 };
+  const S = { config: null, preset: null, mode: store.get("mode", "simulation"), session: null, ws: null, poll: null, seenTicks: new Set(), tickTimer: null, lastT: 0, lastTAt: 0,
+    chat: { id: null, task: {}, ready: false }, geo: null, providers: [], provSel: new Set(), provInfo: null };
+  const md = (t) => esc(t).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
 
   // ------------------------------------------------------------------ API
   async function api(path, opts = {}) {
@@ -88,6 +90,24 @@
     });
   }
 
+  function setupChatMic() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const btn = $("#chatMic");
+    if (!SR) { btn.disabled = true; btn.title = "Speech input not supported in this browser"; return; }
+    let rec = null;
+    btn.addEventListener("click", () => {
+      if (rec) { rec.stop(); return; }
+      rec = new SR();
+      rec.lang = $("#chatMicLang").value;
+      rec.interimResults = true;
+      rec.onresult = (ev) => { $("#chatInput").value = [...ev.results].map((r) => r[0].transcript).join(" "); };
+      rec.onend = () => { btn.classList.remove("rec"); rec = null; if ($("#chatInput").value.trim()) sendChat(); };
+      rec.onerror = () => { btn.classList.remove("rec"); rec = null; };
+      btn.classList.add("rec");
+      rec.start();
+    });
+  }
+
   function setMode(mode) {
     S.mode = mode;
     store.set("mode", mode);
@@ -103,6 +123,7 @@
       live: c.bolna_ready ? "Dials 3 real numbers via Bolna in staggered waves (t=0, +8s, +16s)." : "⚠ Live needs BOLNA_API_KEY + a synced agent (⚙︎ Setup)." + why,
     };
     $("#modeHint").textContent = hints[mode];
+    if (S.providers.length) updateCallHint();
     $("#launchBtn").textContent = mode === "simulation" ? "🚀 Launch swarm · 3 simulated calls" : mode === "hybrid" ? "📞 Launch · ring my phone + 2 AI vendors" : "📞 Launch · 3 real calls";
   }
 
@@ -142,12 +163,166 @@
     }
   }
 
+  // ------------------------------------------------------------------ 1. chat intake
+  function addMsg(role, text) {
+    const el = document.createElement("div");
+    el.className = `msg ${role}`;
+    el.innerHTML = md(text);
+    $("#chatLog").appendChild(el);
+    $("#chatLog").scrollTop = $("#chatLog").scrollHeight;
+    return el;
+  }
+  async function sendChat(raw) {
+    const text = (raw ?? $("#chatInput").value).trim();
+    if (/^find providers$/i.test(text)) { await findProviders(); return; }
+    if (text) addMsg("user", text);
+    $("#chatInput").value = "";
+    const typing = addMsg("bot typing", "…");
+    try {
+      const r = await api("/api/chat", { method: "POST", body: { conversation_id: S.chat.id, message: text, lat: S.geo?.lat, lng: S.geo?.lng } });
+      Object.assign(S.chat, { id: r.conversation_id, task: r.task, ready: r.ready });
+      typing.remove();
+      addMsg("bot", r.reply);
+      renderChips(r.suggestions || []);
+      renderTaskCard();
+    } catch (e) {
+      typing.remove();
+      addMsg("bot", "Sorry, something went wrong: " + e.message);
+    }
+  }
+  function renderChips(list) {
+    $("#chatChips").innerHTML = list.map((t) => `<button class="chip" type="button">${esc(t)}</button>`).join("");
+    $$("#chatChips .chip").forEach((b) => b.addEventListener("click", () => sendChat(b.textContent)));
+  }
+  function renderTaskCard() {
+    const t = S.chat.task || {};
+    $("#taskCard").hidden = !t.service_key;
+    if (!t.service_key) return;
+    $("#tService").value = t.service_label || "";
+    $("#tLocation").value = t.pickup && t.drop ? `${t.pickup} → ${t.drop}` : (t.location || "");
+    $("#tWhen").value = t.when || "";
+    $("#tDetails").value = t.details || "";
+    $("#tTarget").value = t.target_price || "";
+    $("#tCeiling").value = t.walkaway_ceiling || "";
+    const appt = t.goal === "appointment";
+    $$(".budget-field").forEach((el) => { el.hidden = appt; });
+    $("#tGoal").textContent = appt ? "Appointment: I'll book a slot and get the fee. No haggling with clinics."
+      : "Negotiation: your target and max are never told to the AI agent. It can't be talked above them.";
+    $("#findBtn").disabled = !S.chat.ready;
+  }
+  function readTaskCard() {
+    const t = S.chat.task;
+    t.service_label = $("#tService").value.trim() || t.service_label;
+    const loc = $("#tLocation").value.trim();
+    if (loc.includes("→")) { [t.pickup, t.drop] = loc.split("→").map((x) => x.trim()); t.location = t.pickup; } else if (loc) { t.location = loc; }
+    t.when = $("#tWhen").value.trim() || t.when;
+    t.details = $("#tDetails").value.trim();
+    if (t.goal !== "appointment") {
+      const tgt = parseInt($("#tTarget").value, 10), max = parseInt($("#tCeiling").value, 10);
+      if (tgt > 0) t.target_price = tgt;
+      if (max > 0) t.walkaway_ceiling = Math.max(max, t.target_price || 0);
+    }
+  }
+  function useLocation() {
+    if (!navigator.geolocation) { addMsg("bot", "Location isn't available in this browser."); return; }
+    navigator.geolocation.getCurrentPosition((p) => {
+      S.geo = { lat: p.coords.latitude, lng: p.coords.longitude };
+      $("#geoBtn").classList.add("active");
+      addMsg("bot", "📍 Got your location. I'll search near you.");
+    }, () => addMsg("bot", "Couldn't get your location. Just tell me the area instead."), { timeout: 8000 });
+  }
+
+  // ------------------------------------------------------------------ 2. providers
+  async function findProviders() {
+    if (!S.chat.ready) { addMsg("bot", "I still need a couple of details first."); return; }
+    readTaskCard();
+    const btn = $("#findBtn");
+    btn.disabled = true; btn.textContent = "Searching maps…";
+    try {
+      const r = await api("/api/providers/search", { method: "POST", body: { task: S.chat.task, lat: S.geo?.lat, lng: S.geo?.lng } });
+      S.providers = r.providers || [];
+      S.provInfo = r;
+      S.provSel = new Set(S.providers.slice(0, 3).map((p) => p.id));
+      renderProviders();
+      $("#providersPanel").hidden = false;
+      $("#providersPanel").scrollIntoView({ behavior: "smooth", block: "start" });
+      if (!S.providers.length) addMsg("bot", "I couldn't find providers for that. Try a broader area or different words.");
+    } catch (e) {
+      alert("Search failed: " + e.message);
+    } finally {
+      btn.disabled = false; btn.textContent = "🔎 Find the best-rated providers nearby";
+    }
+  }
+  function renderProviders() {
+    const r = S.provInfo || {};
+    const t = S.chat.task || {};
+    $("#provTitle").textContent = `2 · Best-rated ${t.service_label || "providers"} near ${(t.location || "you").split(",")[0]}`;
+    $("#provSource").textContent = r.source ? `source: ${r.providers?.[0]?.source || r.source}` : "";
+    const banner = $("#testBanner");
+    banner.hidden = !r.test_mode;
+    banner.textContent = `🧪 Test mode: every call rings ${r.test_phone || "your test phone"}, not the business. Set CALL_REAL_NUMBERS=true to call real numbers.`;
+    $("#provList").innerHTML = S.providers.map((p, i) => {
+      const meta = [
+        p.rating != null ? `<span class="stars">★ ${p.rating.toFixed(1)}</span> (${Number(p.reviews || 0).toLocaleString("en-IN")})` : "no ratings",
+        p.distance_km != null ? `${p.distance_km} km` : "",
+        p.open_now === true ? "open now" : p.open_now === false ? "closed now" : "",
+      ].filter(Boolean).join(" · ");
+      const phone = p.phone ? `listed ${esc(p.phone)}` : "no listed number";
+      return `<label class="prov ${S.provSel.has(p.id) ? "sel" : ""}" data-id="${esc(p.id)}">
+        <input type="checkbox" ${S.provSel.has(p.id) ? "checked" : ""}>
+        <div><div class="pname">${esc(p.name)}</div><div class="pmeta">${meta}</div>
+          <div class="pmeta">${esc(p.address || "")}</div>
+          <div class="pmeta">📞 ${phone}${p.test_number ? ` → test ${esc(p.dial_phone)}` : ""}${p.maps_uri ? ` · <a href="${esc(p.maps_uri)}" target="_blank" rel="noopener">map</a>` : ""}</div></div>
+        <div class="rank">#${i + 1}</div></label>`;
+    }).join("");
+    $$("#provList .prov").forEach((row) => {
+      $("input", row).addEventListener("change", (ev) => {
+        const id = row.dataset.id;
+        if (ev.target.checked) {
+          if (S.provSel.size >= 5) { ev.target.checked = false; alert("Up to 5 providers at a time."); return; }
+          S.provSel.add(id);
+        } else S.provSel.delete(id);
+        row.classList.toggle("sel", ev.target.checked);
+        updateCallHint();
+      });
+    });
+    updateCallHint();
+  }
+  function updateCallHint() {
+    const n = S.provSel.size;
+    const test = S.provInfo?.test_phone || "your test phone";
+    $("#callBtn").textContent = S.mode === "simulation" ? `🤖 Simulate ${n} call${n === 1 ? "" : "s"}` : `📞 Call ${n} selected`;
+    $("#callBtn").disabled = n === 0;
+    $("#callHint").textContent = {
+      simulation: "Sim mode: the selected providers are played by AI. No phone calls, no cost.",
+      hybrid: `Hybrid: #1 rings ${test} for real (you play the provider); the others are simulated and their quotes are used on the call.`,
+      live: `Live: every selected provider is called${S.provInfo?.test_mode ? ` on ${test}, one after another` : ""}. After you confirm, the winner gets a confirmation call.`,
+    }[S.mode];
+  }
+  async function callProviders() {
+    readTaskCard();
+    const chosen = S.providers.filter((p) => S.provSel.has(p.id));
+    if (!chosen.length) return;
+    const btn = $("#callBtn");
+    btn.disabled = true;
+    try {
+      const session = await api("/api/session", { method: "POST", body: { task: S.chat.task, providers: chosen, mode: S.mode, language: $("#callLang").value } });
+      startWarRoom(session);
+    } catch (e) {
+      alert("Could not start calls: " + e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   // ------------------------------------------------------------------ war room
   function startWarRoom(session) {
     S.session = session;
     S.seenTicks = new Set();
     $("#tickerTrack").innerHTML = '<span class="muted">Waiting for the first quote…</span>';
     $("#briefPanel").hidden = true;
+    $("#chatPanel").hidden = true;
+    $("#providersPanel").hidden = true;
     $("#warRoom").hidden = false;
     $("#ticker").hidden = false;
     history.replaceState(null, "", "#s=" + session.session_id);
@@ -185,18 +360,30 @@
     S.session = session;
     S.lastT = session.t; S.lastTAt = Date.now();
     const r = session.request;
-    $("#sbCategory").textContent = `${CATEGORY[r.category] || r.category} · ${session.mode.toUpperCase()} MODE`;
+    const appt = r.goal === "appointment";
+    $("#sbCategory").textContent = `${CATEGORY[r.category] || "🧰 " + (r.service_label || r.category)} · ${session.mode.toUpperCase()} MODE`;
     $("#sbJob").textContent = r.summary;
-    $("#sbMeta").textContent = `${r.when || ""} · target ${inr(r.target_price)} · walk-away ${inr(r.walkaway_ceiling)} (never told to the AI)`;
+    $("#sbMeta").textContent = appt ? `${r.location || ""} · preferred ${r.when || "any time"} · booking a slot, no haggling`
+      : `${r.when || ""} · target ${inr(r.target_price)} · walk-away ${inr(r.walkaway_ceiling)} (never told to the AI)`;
     const best = session.current_best_quote;
-    $("#sbBest").textContent = best ? inr(best.price) : "—";
-    $("#sbBestVendor").textContent = best ? best.vendor_name : "";
-    $("#sbSaved").textContent = session.savings_vs_worst_first_quote ? inr(session.savings_vs_worst_first_quote) : "—";
+    const bestLeg = best ? session.legs.find((l) => l.leg_id === best.leg_id) : null;
+    $("#sbBest").textContent = best ? (appt ? (bestLeg?.slot || "—") : inr(best.price)) : "—";
+    $("#sbBestVendor").textContent = best ? best.vendor_name + (appt && best.price ? ` · fee ${inr(best.price)}` : "") : "";
+    $("#sbBest").previousElementSibling.textContent = appt ? "Best slot" : "Best all-in";
+    if (appt) {
+      const held = session.legs.filter((l) => l.slot).length;
+      $("#sbSaved").textContent = `${held}/${session.legs.length}`;
+      $("#sbSaved").previousElementSibling.textContent = "Slots offered";
+      $("#sbSaved").nextElementSibling.textContent = "providers with a slot";
+    } else {
+      $("#sbSaved").textContent = session.savings_vs_worst_first_quote ? inr(session.savings_vs_worst_first_quote) : "—";
+    }
     $("#sbVersion").textContent = "state v" + session.state_version;
     if (session.status === "LOCKED") $("#sbTime").textContent = Math.round(session.t) + "s ✓";
-    const lockable = !session.locked_leg_id && best && best.price <= r.walkaway_ceiling;
+    const lockable = !session.locked_leg_id && best && (!r.has_budget || best.price <= r.walkaway_ceiling);
     $("#lockBestBtn").disabled = !lockable;
-    $("#lockBestBtn").textContent = session.locked_leg_id ? "Deal locked ✓" : "Lock best deal & send UPI token";
+    $("#lockBestBtn").textContent = session.locked_leg_id ? (appt ? "Appointment confirmed ✓" : "Deal locked ✓")
+      : (appt ? "Confirm best slot" : "Lock best deal & send UPI token");
 
     const cards = $("#cards");
     session.legs.forEach((leg) => {
@@ -210,7 +397,7 @@
       renderCard(card, leg, session);
     });
     renderTicker(session, event);
-    if (session.payment && session.locked_leg_id && !$("#lockModal").open && !S.modalShownFor) {
+    if (session.whatsapp && session.locked_leg_id && !$("#lockModal").open && !S.modalShownFor) {
       S.modalShownFor = session.session_id;
       showLockModal(session);
     }
@@ -228,9 +415,13 @@
     const saved = leg.first_all_in && leg.best_all_in && leg.first_all_in > leg.best_all_in ? leg.first_all_in - leg.best_all_in : 0;
     const flags = [];
     if (hidden) flags.push(`<span class="flag hidden">⚠ ${inr(hidden)} hidden add-ons caught</span>`);
-    if (unit) flags.push(`<span class="flag unit">${inr(leg.first_stated)}/${unitLabel} → ${inr(leg.first_all_in)} trip</span>`);
+    if (unit && leg.first_all_in !== leg.first_stated) flags.push(`<span class="flag unit">${inr(leg.first_stated)}/${unitLabel} → ${inr(leg.first_all_in)} total</span>`);
     if (saved) flags.push(`<span class="flag save">▼ ${inr(saved)} negotiated</span>`);
-    if (leg.best_all_in && leg.best_all_in > r.walkaway_ceiling) flags.push(`<span class="flag guard">🛡 above ceiling: blocked</span>`);
+    if (r.has_budget && leg.best_all_in && leg.best_all_in > r.walkaway_ceiling) flags.push(`<span class="flag guard">🛡 above ceiling: blocked</span>`);
+    const appt = r.goal === "appointment";
+    const pv = leg.provider || {};
+    const pmeta = [pv.rating != null ? `★ ${Number(pv.rating).toFixed(1)} (${Number(pv.reviews || 0).toLocaleString("en-IN")})` : "",
+      pv.distance_km != null ? `${pv.distance_km} km` : "", pv.test_number ? "🧪 test number" : ""].filter(Boolean).join(" · ");
     card.className = "card" + (leg.status === "WON" ? " won" : "") + (leg.status === "RELEASED" ? " released" : "");
     const levT = new Set((session.arbitrage_log || []).filter((a) => a.to_leg === leg.leg_id).map((a) => a.t));
     const seen = Number(card.dataset.seen || 0);
@@ -240,27 +431,34 @@
       const lev = t.role === "agent" && levT.has(t.t) ? " lev" : "";
       return `<div class="bubble ${esc(t.role)}${lev}${i >= seen ? " new" : ""}">${who ? `<span class="who">${esc(who)}</span>` : ""}${esc(t.text)}</div>`;
     }).join("");
-    const canLock = !session.locked_leg_id && leg.best_all_in && leg.best_all_in <= r.walkaway_ceiling && leg.status !== "FAILED";
+    const canLock = !session.locked_leg_id && leg.status !== "FAILED" && (appt ? !!leg.slot
+      : leg.best_all_in && (!r.has_budget || leg.best_all_in <= r.walkaway_ceiling));
+    const priceBoxes = appt ? `
+        <div class="pbox"><div class="l">Slot</div><div class="v">${esc(leg.slot || "—")}</div></div>
+        <div class="pbox"><div class="l">Fee</div><div class="v">${inr(leg.best_all_in)}</div></div>
+        <div class="pbox now"><div class="l">Rating</div><div class="v">${pv.rating != null ? "★ " + Number(pv.rating).toFixed(1) : "—"}</div></div>` : `
+        <div class="pbox"><div class="l">Said</div><div class="v">${unit ? inr(leg.first_stated) + "/" + unitLabel : inr(leg.first_stated)}</div></div>
+        <div class="pbox"><div class="l">Real all-in</div><div class="v ${saved ? "strike" : ""}">${inr(leg.first_all_in)}</div></div>
+        <div class="pbox now"><div class="l">Now</div><div class="v">${inr(leg.best_all_in)}</div></div>`;
+    const lockLabel = leg.status === "WON" ? "✓ Winner" : appt ? (leg.slot ? `Confirm ${leg.slot}` : "Waiting for a slot") : "Lock " + inr(leg.best_all_in);
     card.innerHTML = `
       <div class="card-head">
         <div>
           <div class="vname">${esc(leg.vendor_name)}</div>
+          ${pmeta ? `<div class="pmeta-card">${esc(pmeta)}</div>` : ""}
           <div class="tags"><span class="tag">${esc(LANG[leg.language] || leg.language)}</span>
             <span class="tag ${leg.mode === "live" ? "live" : ""}">${leg.mode === "live" ? "📞 LIVE" : "AI SIM"}</span>
             <span class="tag">LEG ${esc(leg.leg_id)}</span>${leg.rounds ? `<span class="tag">ROUND ${leg.rounds}</span>` : ""}</div>
         </div>
         <span class="badge st-${esc(leg.status)}">${esc(STATUS_LABEL[leg.status] || leg.status)}</span>
       </div>
-      <div class="prices">
-        <div class="pbox"><div class="l">Said</div><div class="v">${unit ? inr(leg.first_stated) + "/" + unitLabel : inr(leg.first_stated)}</div></div>
-        <div class="pbox"><div class="l">Real all-in</div><div class="v ${saved ? "strike" : ""}">${inr(leg.first_all_in)}</div></div>
-        <div class="pbox now"><div class="l">Now</div><div class="v">${inr(leg.best_all_in)}</div></div>
+      <div class="prices">${priceBoxes}
       </div>
       <div class="flags">${flags.join("")}</div>
       <div class="transcript">${bubbles || '<div class="bubble system">Waiting to dial…</div>'}</div>
       ${leg.recording_url ? `<audio controls preload="none" src="${esc(leg.recording_url)}"></audio>` : ""}
       ${leg.error ? `<div class="err">${esc(leg.error)}</div>` : ""}
-      <div class="card-foot"><button class="btn win" data-lock="${esc(leg.leg_id)}" ${canLock ? "" : "disabled"}>${leg.status === "WON" ? "✓ Winner" : "Lock " + inr(leg.best_all_in)}</button></div>`;
+      <div class="card-foot"><button class="btn win" data-lock="${esc(leg.leg_id)}" ${canLock ? "" : "disabled"}>${esc(lockLabel)}</button></div>`;
     const tr = $(".transcript", card);
     tr.scrollTop = atBottom ? tr.scrollHeight : keepTop;
     $("[data-lock]", card).addEventListener("click", () => lockWinner(leg.leg_id));
@@ -317,7 +515,17 @@
     const p = session.payment || {};
     const wa = session.whatsapp || {};
     const paid = p.status === "paid";
-    $("#lmTitle").textContent = paid ? "Token advance paid ✓" : "Deal locked 🎉";
+    const appt = session.request.goal === "appointment";
+    $("#lmTitle").textContent = appt ? "Appointment confirmed 🎉" : paid ? "Token advance paid ✓" : "Deal locked 🎉";
+    const confirmNote = leg?.mode === "live" ? `<div class="small">📞 Calling ${esc(leg.vendor_name)} back now to confirm it with them.</div>` : "";
+    if (appt) {
+      $("#lmBody").innerHTML = `<div class="deal"><div class="muted small">${esc(session.request.summary)}</div>
+        <div><b>${esc(leg?.vendor_name)}</b></div><div class="big">${esc(leg?.slot || "")}</div>
+        <div class="small">${leg?.best_all_in ? "Fee " + inr(leg.best_all_in) : "Fee to be confirmed"} · other providers released politely</div>${confirmNote}</div>`;
+      $("#lmActions").innerHTML = session.whatsapp?.link ? `<a class="btn win" href="${esc(session.whatsapp.link)}" target="_blank" rel="noopener">Send WhatsApp summary</a>` : "";
+      if (!$("#lockModal").open) $("#lockModal").showModal();
+      return;
+    }
     const mockUpi = p.provider === "mock" ? `
       <div class="upi"><div class="qr" aria-hidden="true"></div>
         <div><b>Razorpay Test Checkout (mock)</b><div style="font-size:12px">Test mode · no real money moves<br>Amount ${inr(p.amount)}${p.error ? `<br><span style="color:#b91c1c">${esc(p.error)}</span>` : ""}</div></div></div>` : "";
@@ -327,7 +535,7 @@
         <div><b>${esc(leg?.vendor_name)}</b> · all-inclusive</div>
         <div class="big">${inr(leg?.best_all_in)}</div>
         <div class="small">UPI token advance: <b>${inr(p.amount)}</b> · saved <b class="good">${inr(session.savings_vs_worst_first_quote)}</b> vs highest first quote</div>
-        <div class="small muted">Runner-ups released politely · your number shared with 0 vendors</div>
+        <div class="small muted">Runner-ups released politely · your number shared with 0 vendors</div>${confirmNote}
       </div>${mockUpi}`;
     const actions = [];
     if (p.provider === "razorpay" && p.url) actions.push(`<a class="btn primary" href="${esc(p.url)}" target="_blank" rel="noopener">Pay ${inr(p.amount)} (Razorpay ${p.test_mode ? "test" : ""})</a>`);
@@ -400,10 +608,19 @@
       clearInterval(S.poll); clearInterval(S.tickTimer);
       S.session = null; S.modalShownFor = null;
       $("#cards").innerHTML = "";
-      $("#warRoom").hidden = true; $("#ticker").hidden = true; $("#briefPanel").hidden = false;
+      $("#warRoom").hidden = true; $("#ticker").hidden = true; $("#chatPanel").hidden = false;
+      $("#providersPanel").hidden = !S.providers.length;
       history.replaceState(null, "", location.pathname);
     });
     $("#adminBtn").addEventListener("click", openAdmin);
+    $("#chatSend").addEventListener("click", () => sendChat());
+    $("#chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+    $("#findBtn").addEventListener("click", findProviders);
+    $("#callBtn").addEventListener("click", callProviders);
+    $("#geoBtn").addEventListener("click", useLocation);
+    $("#classicBtn").addEventListener("click", () => { $("#briefPanel").hidden = !$("#briefPanel").hidden; });
+    setupChatMic();
+    sendChat("");
     $("#previewBtn").addEventListener("click", () => adminCall(true));
     $("#checkBtn").addEventListener("click", async () => {
       store.set("adminToken", $("#adminToken").value);

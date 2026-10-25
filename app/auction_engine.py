@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -47,6 +48,9 @@ ACTION_TO_STATUS = {
     "RELEASE": LegStatus.RELEASED,
     "WON": LegStatus.WON,
     "NOT_AVAILABLE": LegStatus.ENDED,
+    "HOLD_SLOT": LegStatus.HOLD,
+    "BOOKING_OVER_BUDGET": LegStatus.ENDED,
+    "WON_BOOKING": LegStatus.WON,
 }
 
 
@@ -79,6 +83,10 @@ class Leg:
     last_action: Optional[str] = None
     last_counter_line: str = ""
     error: str = ""
+    provider: dict = field(default_factory=dict)   # rating, reviews, address, source, listed phone, maps link
+    persona: dict = field(default_factory=dict)    # simulated-vendor behaviour (sim legs only; never public)
+    call_ended: bool = False                      # Bolna says the phone call itself is over
+    confirm_execution_id: Optional[str] = None    # follow-up confirmation call to the winner
 
     def public(self) -> dict:
         phone = self.vendor_phone
@@ -86,6 +94,10 @@ class Leg:
         return {
             "leg_id": self.leg_id,
             "vendor_name": self.vendor_name,
+            "slot": self.neg.slot,
+            "provider": self.provider,
+            "call_ended": self.call_ended,
+            "confirm_execution_id": self.confirm_execution_id,
             "language": self.language,
             "mode": self.mode,
             "vendor_phone": masked,
@@ -126,6 +138,13 @@ class Session:
         return round(time.time() - self.created_at, 1)
 
     def current_best(self, exclude: Optional[str] = None, verified_only: bool = True) -> Optional[Competitor]:
+        if self.request.goal == "appointment":
+            held = [l for l in self.legs.values() if l.leg_id != exclude and l.neg.slot
+                    and l.status not in {LegStatus.FAILED, LegStatus.ENDED}]
+            if not held:
+                return None
+            pick = min(held, key=lambda l: (l.neg.best_all_in or 0, -(l.provider.get("rating") or 0)))
+            return Competitor(pick.leg_id, pick.vendor_name, pick.neg.best_all_in or 0)
         best = None
         for leg in self.legs.values():
             if leg.leg_id == exclude or leg.status == LegStatus.FAILED:
@@ -143,7 +162,7 @@ class Session:
             savings = max(first_quotes) - best.price
         return {
             "session_id": self.session_id,
-            "request": self.request.to_dict(),
+            "request": {**self.request.to_dict(), "has_budget": self.request.has_budget},
             "mode": self.mode,
             "status": self.status,
             "locked_leg_id": self.locked_leg_id,
@@ -175,9 +194,13 @@ class Store:
         self._conn.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, "
                            "session_id TEXT, type TEXT, payload TEXT, ts REAL)")
         self._conn.commit()
-        self._write_lock = asyncio.Lock()
+        self._write_lock = threading.Lock()  # loop-independent: writes run in a worker thread
 
     def _save(self, session_id: str, snapshot: dict, event: Optional[dict]) -> None:
+        with self._write_lock:
+            self._save_locked(session_id, snapshot, event)
+
+    def _save_locked(self, session_id: str, snapshot: dict, event: Optional[dict]) -> None:
         now = time.time()
         self._conn.execute("INSERT INTO sessions VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
                            "snapshot=excluded.snapshot, updated_at=excluded.updated_at",
@@ -188,11 +211,10 @@ class Store:
         self._conn.commit()
 
     async def save(self, session_id: str, snapshot: dict, event: Optional[dict] = None) -> None:
-        async with self._write_lock:
-            try:
-                await asyncio.to_thread(self._save, session_id, snapshot, event)
-            except sqlite3.Error as exc:  # persistence must never break a live call
-                log.warning("sqlite save failed: %s", exc)
+        try:
+            await asyncio.to_thread(self._save, session_id, snapshot, event)
+        except sqlite3.Error as exc:  # persistence must never break a live call
+            log.warning("sqlite save failed: %s", exc)
 
     def load_snapshot(self, session_id: str) -> Optional[dict]:
         row = self._conn.execute("SELECT snapshot FROM sessions WHERE session_id=?", (session_id,)).fetchone()
@@ -245,11 +267,12 @@ class AuctionEngine:
     # ------------------------------------------------------------------ lifecycle
     async def create_session(self, request: ServiceRequest, vendors: list[dict], mode: str = "simulation") -> Session:
         legs = {}
-        for i, v in enumerate(vendors[:3]):
-            leg_id = v.get("leg_id") or "ABC"[i]
+        for i, v in enumerate(vendors[:5]):
+            leg_id = v.get("leg_id") or "ABCDE"[i]
             legs[leg_id] = Leg(leg_id=leg_id, vendor_name=v.get("name", f"Vendor {leg_id}"),
                                language=v.get("language", "hi"), mode=v.get("mode", "sim"),
-                               vendor_phone=v.get("phone", ""))
+                               vendor_phone=v.get("phone", ""), provider=dict(v.get("provider") or {}),
+                               persona=dict(v.get("persona") or {}))
         session = Session(session_id=uuid.uuid4().hex[:10], request=request, legs=legs, mode=mode)
         self.sessions[session.session_id] = session
         await self._emit(session, {"type": "session_created"})
@@ -317,6 +340,9 @@ class AuctionEngine:
             if session.status == "CREATED":
                 session.status = "RUNNING"
 
+            slot = args.get("slot")
+            if isinstance(slot, str) and slot.strip().lower() not in {"", "unknown", "none", "na", "n/a", "null"}:
+                leg.neg.slot = slot.strip()[:80]
             new_charges = {k: args.get(k) for k in ("toll", "driver_bata", "other_charges") if k in args}
             leg.charges = merge_charges(leg.charges, new_charges)
             price = args.get("price")
@@ -450,12 +476,17 @@ class AuctionEngine:
             leg = session.legs.get(leg_id)
             if leg is None:
                 raise GuardrailViolation("unknown leg")
+            req = session.request
             price = leg.neg.best_all_in
-            if price is None:
+            if req.goal == "appointment":
+                if not leg.neg.slot:
+                    raise GuardrailViolation("this provider hasn't offered a slot yet")
+                price = price or 0
+            elif price is None:
                 raise GuardrailViolation("this vendor has not given a usable quote yet")
-            if price > session.request.walkaway_ceiling:
+            if req.has_budget and price > req.walkaway_ceiling:
                 raise GuardrailViolation(f"{format_inr(price)} is above your walk-away ceiling "
-                                         f"{format_inr(session.request.walkaway_ceiling)}")
+                                         f"{format_inr(req.walkaway_ceiling)}")
             if leg.status == LegStatus.FAILED:
                 raise GuardrailViolation("this call failed")
             session.locked_leg_id = leg_id
@@ -468,6 +499,7 @@ class AuctionEngine:
                     released.append(other.leg_id)
             session.state_version += 1
             result = {"leg_id": leg_id, "vendor_name": leg.vendor_name, "price": price, "released": released,
+                      "slot": leg.neg.slot, "goal": req.goal,
                       "unresolved_addons": list(leg.last_quote.unknown_items) if leg.last_quote else []}
         await self._emit(session, {"type": "locked", **result})
         return result

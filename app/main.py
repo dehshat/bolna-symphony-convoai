@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app import bolna_client, briefs, config, llm, payments, state
+from app import bolna_client, briefs, config, intake, llm, payments, places, services, state
 from app.auction_engine import GuardrailViolation
 from app.pricing import ServiceRequest
 from app.webhooks import router as webhook_router
@@ -93,6 +93,24 @@ class CreateSession(BaseModel):
     vendor_names: Optional[list[str]] = None
     vendor_languages: Optional[list[str]] = None
     autostart: bool = True
+    task: Optional[dict] = None                # from the chat intake (any service)
+    providers: Optional[list[dict]] = None     # chosen from the map search (up to 5)
+    language: Optional[str] = None             # call language for task sessions: hi | kn | en | ta
+
+
+class ChatBody(BaseModel):
+    conversation_id: Optional[str] = None
+    message: str = Field(default="", max_length=600)
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+
+class ProviderSearch(BaseModel):
+    conversation_id: Optional[str] = None
+    task: Optional[dict] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    limit: int = Field(default=8, ge=1, le=15)
 
 
 class BriefText(BaseModel):
@@ -156,6 +174,7 @@ async def get_config(request: Request) -> dict:
                     for k, v in briefs.PRESETS.items()},
         "default_preset": briefs.DEFAULT_PRESET,
         "bolna_sync": BOLNA_SYNC,
+        "services": services.catalogue(),
         "gemini": llm.status(),
         "vendors": briefs.VENDOR_PERSONAS,
     }
@@ -168,12 +187,69 @@ async def parse_brief(body: BriefText) -> dict:
 
 # ----------------------------------------------------------------------------- sessions
 
+@app.post("/api/chat")
+async def chat(body: ChatBody) -> dict:
+    return await intake.chat(body.conversation_id, body.message, body.lat, body.lng)
+
+
+def _task_from(conversation_id: Optional[str], task: Optional[dict]) -> dict:
+    if task:
+        return task
+    convo = intake.CONVERSATIONS.get(conversation_id or "")
+    if not convo:
+        raise HTTPException(404, "conversation not found; send a task")
+    return convo.task
+
+
+@app.post("/api/providers/search")
+async def search_providers(body: ProviderSearch) -> dict:
+    task = _task_from(body.conversation_id, body.task)
+    if not task.get("service_key") and not task.get("service_label"):
+        raise HTTPException(422, "tell me what service you need first")
+    lat, lng = body.lat if body.lat is not None else task.get("lat"), body.lng if body.lng is not None else task.get("lng")
+    return await places.search(task.get("service_key", "other"), task.get("service_label", ""),
+                               task.get("location") or task.get("pickup") or "Bengaluru", lat, lng, body.limit)
+
+
+async def _create_task_session(body: CreateSession, mode: str) -> dict:
+    """Chat + map flow: legs come from the chosen providers; sim/live per mode; test phone unless real calls on."""
+    s = config.settings
+    try:
+        req = intake.to_request(body.task or {})
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, str(exc))
+    providers = (body.providers or [])[:5]
+    if not providers:
+        raise HTTPException(422, "pick at least one provider")
+    language = body.language or body.live_language or "hi"
+    personas = briefs.personas_for_providers(req, providers, language)
+    test_phone = s.test_phone_override or s.live_test_phone
+    vendors = []
+    for i, (p, persona) in enumerate(zip(providers, personas)):
+        live = mode == "live" or (mode == "hybrid" and i == 0)
+        dial = (p.get("phone") if s.call_real_numbers and p.get("phone") else test_phone) if live else ""
+        if live and not dial:
+            raise HTTPException(422, "set LIVE_TEST_PHONE (or TEST_PHONE_OVERRIDE) to place test calls")
+        provider_meta = {k: p.get(k) for k in ("rating", "reviews", "address", "distance_km", "maps_uri", "source",
+                                               "phone", "open_now")}
+        provider_meta["test_number"] = live and dial != p.get("phone")
+        vendors.append({"name": p.get("name", f"Provider {i + 1}"), "language": language,
+                        "mode": "live" if live else "sim", "phone": _phone(dial) if dial else "",
+                        "provider": provider_meta, "persona": persona})
+    session = await state.engine.create_session(req, vendors, mode)
+    if body.autostart:
+        await state.orchestrator.start(session.session_id)
+    return session.public()
+
+
 @app.post("/api/session")
 async def create_session(body: CreateSession) -> dict:
     s = config.settings
     mode = (body.mode or s.default_mode or "simulation").lower()
     if mode not in {"simulation", "hybrid", "live"}:
         raise HTTPException(422, "mode must be simulation, hybrid or live")
+    if body.task:
+        return await _create_task_session(body, mode)
     overrides = body.request.model_dump(exclude_none=True) if body.request else {}
     preset = body.preset or briefs.DEFAULT_PRESET
     if overrides.get("category") and overrides["category"] != briefs.PRESETS.get(preset, {}).get(
@@ -251,13 +327,17 @@ async def lock_winner(session_id: str, body: LockBody) -> dict:
     except GuardrailViolation as exc:
         raise HTTPException(409, str(exc))
     session = state.engine.get(session_id)
-    payment = await payments.create_payment_link(session_id, result["leg_id"], result["vendor_name"],
-                                                 result["price"], session.request.summary)
+    payment = None
+    if session.request.goal == "negotiate" and result["price"]:
+        payment = await payments.create_payment_link(session_id, result["leg_id"], result["vendor_name"],
+                                                     result["price"], session.request.summary)
     text = payments.deal_summary(session.request.to_dict(), result["vendor_name"], result["price"], payment,
-                                 session.public().get("savings_vs_worst_first_quote"))
+                                 session.public().get("savings_vs_worst_first_quote"), result.get("slot", ""))
     whatsapp = await payments.whatsapp_summary(text)
     await state.engine.attach(session_id, payment=payment, whatsapp=whatsapp)
     await state.orchestrator.on_lock(session_id, result["leg_id"])
+    # Finalize: phone the winner back to confirm (live legs). Runs in the background.
+    asyncio.create_task(state.orchestrator.confirm_winner(session_id, result["leg_id"]))
     return {**result, "payment": payment, "whatsapp": whatsapp, "session": session.public()}
 
 

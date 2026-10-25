@@ -163,32 +163,65 @@ CATEGORIES = {
     },
 }
 
-PRICING_MODELS = {"flat", "per_km", "per_hour", "per_day"}
+PRICING_MODELS = {"flat", "per_km", "per_hour", "per_day", "per_month", "per_visit"}
+
+
+def category_rules(category: str) -> dict:
+    """Add-on rules for a category. Known transport/repair categories have their own; every other service
+    (cook, plumber, clinic…) uses one generic "extra charges" item."""
+    if category in CATEGORIES:
+        return CATEGORIES[category]
+    from app import services  # local import: services has no dependency on pricing
+    svc = services.get(category)
+    # Every negotiated job gets one "anything extra?" check, the hidden-charge trap is universal
+    return {"label": svc.label, "required": ["other_charges"], "optional": [],
+            "labels": {"toll": "toll", "driver_bata": "visiting charge", "other_charges": svc.addon_label}}
 
 
 @dataclass
 class ServiceRequest:
-    category: str = "cab_outstation"
+    category: str = "cab_outstation"   # a key from app.services, or "other"
     summary: str = ""
     pickup: str = ""
     drop: str = ""
     when: str = ""
-    target_price: int = 2200
-    walkaway_ceiling: int = 2600
+    target_price: int = 2200            # 0 = no budget (appointments)
+    walkaway_ceiling: int = 2600        # 0 = no budget (appointments)
     est_km: float = 0.0          # one-way or total billable distance estimate
     days: int = 1
     est_hours: float = 4.0
     min_km_per_day: float = 250.0  # standard outstation minimum billing
     language_hint: str = "kn"
+    service_label: str = ""       # what the user called it ("home cook", "dentist")
+    goal: str = "negotiate"       # negotiate | appointment
+    details: str = ""             # free-text requirements gathered in the chat
+    location: str = ""            # area / address the service is needed in
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    months: int = 1               # for per-month services (cook, maid, tutor)
+    visits: int = 1               # for per-visit services
 
     def __post_init__(self) -> None:
-        if self.category not in CATEGORIES:
-            self.category = "cab_outstation"
-        self.target_price = int(self.target_price)
-        self.walkaway_ceiling = int(self.walkaway_ceiling)
-        if self.walkaway_ceiling < self.target_price:
+        from app import services
+        if self.category not in CATEGORIES and self.category not in services.BY_KEY:
+            self.category = "other"
+        if not self.service_label:
+            self.service_label = services.get(self.category).label
+        if self.goal not in {"negotiate", "appointment"}:
+            self.goal = services.get(self.category).goal
+        self.target_price = int(self.target_price or 0)
+        self.walkaway_ceiling = int(self.walkaway_ceiling or 0)
+        if self.walkaway_ceiling and self.walkaway_ceiling < self.target_price:
             raise ValueError("walkaway_ceiling must be >= target_price")
+        if self.goal == "negotiate" and not self.walkaway_ceiling:
+            raise ValueError("a negotiation needs a walk-away ceiling")
         self.days = max(1, int(self.days or 1))
+        self.months = max(1, int(self.months or 1))
+        self.visits = max(1, int(self.visits or 1))
+
+    @property
+    def has_budget(self) -> bool:
+        return self.walkaway_ceiling > 0
 
     def estimates(self) -> dict[str, int]:
         """Conservative padding used when a vendor won't say what an add-on costs."""
@@ -200,7 +233,9 @@ class ServiceRequest:
             }
         if self.category == "mini_truck":
             return {"toll": 0 if self.est_km < 40 else round_to(self.est_km * 2), "driver_bata": 0, "other_charges": 800}
-        return {"toll": 0, "driver_bata": 299, "other_charges": 1500}
+        if self.category == "ac_repair":
+            return {"toll": 0, "driver_bata": 299, "other_charges": 1500}
+        return {"toll": 0, "driver_bata": 0, "other_charges": round_to(max(self.target_price, 500) * 0.1)}
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -266,6 +301,10 @@ def detect_pricing_model(value: Any, said: str = "") -> str:
         return "per_hour"
     if re.search(r"(per\s*day|din\s*ka|/\s*day|daily|dina ke)", text):
         return "per_day"
+    if re.search(r"(per\s*month|/\s*month|monthly|mahina|mahine|tingala|maasa|salary)", text):
+        return "per_month"
+    if re.search(r"(per\s*visit|consultation|consult fee|visit fee|per session|per class)", text):
+        return "per_visit"
     return "flat"
 
 
@@ -297,7 +336,7 @@ class NormalizedQuote:
 def normalize_quote(req: ServiceRequest, price: Any, pricing_model: Any = "flat",
                     charges: Optional[dict] = None, said: str = "") -> NormalizedQuote:
     """Turn a raw spoken quote into an all-inclusive trip price with explicit components."""
-    rules = CATEGORIES[req.category]
+    rules = category_rules(req.category)
     model = detect_pricing_model(pricing_model, said)
     stated = parse_inr(price)
     charges = {k: parse_charge(v) for k, v in (charges or {}).items()}
@@ -320,6 +359,12 @@ def normalize_quote(req: ServiceRequest, price: Any, pricing_model: Any = "flat"
     elif model == "per_day":
         base = stated * req.days
         base_label = f"{format_inr(stated)}/day × {req.days} day"
+    elif model == "per_month":
+        base = stated * req.months
+        base_label = f"{format_inr(stated)}/month" + (f" × {req.months} months" if req.months > 1 else "")
+    elif model == "per_visit":
+        base = stated * req.visits
+        base_label = f"{format_inr(stated)}/visit" + (f" × {req.visits} visits" if req.visits > 1 else "")
     else:
         base = stated
         base_label = "quoted fare"
@@ -329,9 +374,9 @@ def normalize_quote(req: ServiceRequest, price: Any, pricing_model: Any = "flat"
     reason = ""
     if model == "per_km" and stated > 200:
         reason = "per_km_rate_too_high"
-    elif model == "flat" and stated < 0.3 * req.target_price:
+    elif req.has_budget and model == "flat" and stated < 0.3 * req.target_price:
         reason = "price_too_low_maybe_unit_rate"
-    elif base > 5 * req.walkaway_ceiling:
+    elif req.has_budget and base > 5 * req.walkaway_ceiling:
         reason = "price_too_high_maybe_misheard"
     if reason:
         return NormalizedQuote("CLARIFY", model, stated, base, None, charges={k: asdict(v) for k, v in charges.items()},

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0b0f17">
   <title>Swarm Negotiator</title>
-  <meta name="description" content="One voice brief, three concurrent AI phone negotiations, zero phone numbers leaked.">
+  <meta name="description" content="Chat once: it finds the best-rated providers nearby, calls them, negotiates or books, and confirms. Your number never leaks.">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐝</text></svg>">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
@@ -30,8 +30,54 @@
   </header>
 
   <main>
-    <!-- ======================= BRIEF ======================= -->
-    <section class="panel" id="briefPanel">
+    <!-- ======================= 1. CHAT INTAKE ======================= -->
+    <section class="panel" id="chatPanel">
+      <div class="panel-head">
+        <h2>1 · Tell me what you need</h2>
+        <button class="linkish small" id="classicBtn" type="button">Classic demo presets</button>
+      </div>
+      <div class="chat-log" id="chatLog" aria-live="polite"></div>
+      <div class="chips" id="chatChips"></div>
+      <div class="chat-input">
+        <select id="chatMicLang" aria-label="Speech language"><option value="en-IN">EN</option><option value="hi-IN">हि</option><option value="kn-IN">ಕ</option></select>
+        <button class="mic" id="chatMic" type="button" aria-label="Speak">🎙</button>
+        <button class="mic" id="geoBtn" type="button" aria-label="Use my location" title="Use my location">📍</button>
+        <input id="chatInput" type="text" autocomplete="off" placeholder="e.g. I need a cook in Koramangala from Monday" aria-label="Message">
+        <button class="btn primary" id="chatSend" type="button">Send</button>
+      </div>
+      <div class="task-card" id="taskCard" hidden>
+        <div class="task-grid">
+          <label>Service <input id="tService" type="text"></label>
+          <label>Area <input id="tLocation" type="text"></label>
+          <label>When <input id="tWhen" type="text"></label>
+          <label class="budget-field">Target ₹ <input id="tTarget" type="number" inputmode="numeric" min="0"></label>
+          <label class="budget-field">Max ₹ <input id="tCeiling" type="number" inputmode="numeric" min="0"></label>
+          <label class="wide">Details <input id="tDetails" type="text"></label>
+        </div>
+        <div class="muted small" id="tGoal"></div>
+        <button class="btn primary launch" id="findBtn" type="button">🔎 Find the best-rated providers nearby</button>
+      </div>
+    </section>
+
+    <!-- ======================= 2. PROVIDERS ======================= -->
+    <section class="panel" id="providersPanel" hidden>
+      <div class="panel-head">
+        <h2 id="provTitle">2 · Best-rated nearby</h2>
+        <span class="muted small" id="provSource"></span>
+      </div>
+      <div class="test-banner" id="testBanner" hidden></div>
+      <div class="prov-list" id="provList"></div>
+      <div class="prov-actions">
+        <label class="small muted">Call language
+          <select id="callLang"><option value="hi">Hindi / Hinglish</option><option value="kn">Kannada</option><option value="en">English</option></select>
+        </label>
+        <button class="btn primary" id="callBtn" type="button">📞 Call selected</button>
+      </div>
+      <p class="hint" id="callHint"></p>
+    </section>
+
+    <!-- ======================= CLASSIC BRIEF (presets) ======================= -->
+    <section class="panel" id="briefPanel" hidden>
       <div class="panel-head">
         <h2>1 · Tell us once</h2>
         <span class="muted small" id="parsedBy"></span>

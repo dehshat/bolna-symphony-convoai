@@ -92,6 +92,15 @@ class Settings:
     tool_shared_secret: str = field(default_factory=lambda: os.getenv("TOOL_SHARED_SECRET", ""))
     admin_token: str = field(default_factory=lambda: os.getenv("ADMIN_TOKEN", ""))
 
+    # --- Provider search + calling safety ---
+    # Google Maps Platform key with "Places API (New)" enabled. The AI Studio key does NOT work for Places.
+    google_maps_api_key: str = field(default_factory=lambda: os.getenv("GOOGLE_MAPS_API_KEY", ""))
+    # Off by default: every provider found on the map is dialled on the test phone instead of their real number
+    call_real_numbers: bool = field(default_factory=lambda: _bool("CALL_REAL_NUMBERS", False))
+    test_phone_override: str = field(default_factory=lambda: os.getenv("TEST_PHONE_OVERRIDE", ""))
+    # parallel | sequential | auto (auto = sequential when several legs would ring the same phone)
+    dial_strategy: str = field(default_factory=lambda: os.getenv("DIAL_STRATEGY", "auto").lower())
+
     # Phone numbers for hybrid/live mode (E.164, e.g. +919876543210)
     live_test_phone: str = field(default_factory=lambda: os.getenv("LIVE_TEST_PHONE", ""))
     live_vendor_phones: str = field(default_factory=lambda: os.getenv("LIVE_VENDOR_PHONES", ""))
@@ -137,6 +146,12 @@ class Settings:
             "bolna_llm_model": self.bolna_llm_model,
             "bolna_from_number_set": bool(self.bolna_from_number),
             "live_test_phone_set": bool(self.live_test_phone),
+            "google_maps_enabled": bool(self.google_maps_api_key),
+            "call_real_numbers": self.call_real_numbers,
+            "test_phone": (self.test_phone_override or self.live_test_phone)[:4] + "••••"
+                          + (self.test_phone_override or self.live_test_phone)[-3:]
+                          if (self.test_phone_override or self.live_test_phone) else "",
+            "dial_strategy": self.dial_strategy,
             "gemini_enabled": bool(self.gemini_api_key and self.llm_enabled),
             "gemini_model": self.gemini_model,
             "sim_llm_rephrase": self.sim_llm_rephrase,

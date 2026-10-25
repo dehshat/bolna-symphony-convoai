@@ -40,7 +40,7 @@ STILL_THERE = {
 }
 
 TOOL_FIELDS = ["session_id", "leg_id", "vendor_said", "price", "pricing_model", "toll", "driver_bata",
-               "other_charges", "availability"]
+               "other_charges", "availability", "slot"]
 CHARGE_DESC = ("'included', 'extra', 'extra <amount in digits>', 'na' (not applicable) or 'unknown' "
                "(vendor has not said)")
 
@@ -80,6 +80,7 @@ asking for a price on behalf of a customer. Sound like a real local person on th
 warm, casual {lang}, the way people actually talk ("bhaiya", "anna", "achha", "theek hai").
 
 THE JOB: {{service_brief}}
+YOUR GOAL ON THIS CALL: {{call_goal}}
 VENDOR: {{vendor_name}}
 CALL IDS (pass unchanged to every tool): session_id = {{session_id}}, leg_id = {{leg_id}}
 
@@ -88,14 +89,15 @@ HOW TO SPEAK
 - One or two short sentences per turn, then stop and let the vendor talk. Never stack two questions.
 - Say rupee amounts with digits and the ₹ sign exactly as the tools give them (e.g. ₹2,450).
 - If you didn't catch something, ask them to repeat it instead of guessing.
-- Answer simple job questions from THE JOB (pickup, drop, date/time, vehicle). For details you don't have
-  (exact address, luggage, passengers), say the customer will share them on WhatsApp.
+- Answer simple questions from THE JOB (place, date/time, requirements). For details you don't have
+  (exact address, names, medical history), say the customer will share them on WhatsApp.
 
-CALL FLOW
-1. Confirm they can do the job.
-2. Get their total price. If they ask your budget first, call submit_and_counter with price "unknown" and say its line.
-3. Every time they say a price, a per-km rate, or any charge (toll, driver bata, parking, loading, gas, visiting
-   charge), IMMEDIATELY call submit_and_counter with what they said, then say its "say_this" line naturally.
+CALL FLOW (follow YOUR GOAL ON THIS CALL)
+1. Confirm they can do the job / see the customer.
+2. Get their price, or for appointments their slot and fee. If they ask your budget first, call submit_and_counter
+   with price "unknown" and say its line.
+3. Every time they say a price, a rate (per km / hour / month / visit), any extra charge, or an appointment slot,
+   IMMEDIATELY call submit_and_counter with what they said, then say its "say_this" line naturally.
 4. If they ask you to wait or say they'll check, call check_auction_status and follow it.
 5. When a tool result has end_call = true, say the line, thank them warmly and end the call.
 
@@ -132,7 +134,8 @@ def _tools(language: str) -> list[dict]:
                                     "description": "Short English paraphrase of the vendor's last sentence, no quotes"},
                     "price": {"type": "string", "description": "The amount the vendor quoted in digits, e.g. 2500 or "
                                                                "22 for 22 per km. 'unknown' if no number was said"},
-                    "pricing_model": {"type": "string", "enum": ["flat", "per_km", "per_hour", "per_day", "unknown"],
+                    "pricing_model": {"type": "string", "enum": ["flat", "per_km", "per_hour", "per_day", "per_month",
+                                                                   "per_visit", "unknown"],
                                       "description": "Is the price a total (flat) or a per-unit rate?"},
                     "toll": {"type": "string", "description": f"Toll: {CHARGE_DESC}"},
                     "driver_bata": {"type": "string",
@@ -141,6 +144,8 @@ def _tools(language: str) -> list[dict]:
                                       "description": "Parking/night charge (cab), loading-unloading labour (tempo) or "
                                                      f"gas refill/parts (repair): {CHARGE_DESC}"},
                     "availability": {"type": "string", "enum": ["yes", "no", "unknown"]},
+                    "slot": {"type": "string", "description": "Appointment/visit time the vendor offered, as said "
+                                                              "(e.g. 'tomorrow 11 AM'); 'unknown' if none"},
                 },
                 "required": TOOL_FIELDS,
             },

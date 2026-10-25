@@ -49,20 +49,11 @@ def enabled() -> bool:
     return bool(s.gemini_api_key and s.llm_enabled)
 
 
-async def generate(prompt: str, *, system: str = "", max_tokens: int = 160, temperature: float = 0.8,
-                   json_mode: bool = False, timeout: float = 4.0) -> Optional[str]:
+async def _call(body: dict, timeout: float) -> Optional[dict]:
+    """POST to the first model that isn't rate-limited; returns the first candidate (or None)."""
     if not enabled():
         return None
     s = config.settings
-    body: dict = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature,
-                             "thinkingConfig": {"thinkingBudget": 0}},
-    }
-    if system:
-        body["systemInstruction"] = {"parts": [{"text": system}]}
-    if json_mode:
-        body["generationConfig"]["responseMimeType"] = "application/json"
     now = time.time()
     models = [m for m in [s.gemini_model] + [m for m in FALLBACK_MODELS if m != s.gemini_model]
               if m not in _dead_models and _cooldown.get(m, 0) <= now]
@@ -86,15 +77,51 @@ async def generate(prompt: str, *, system: str = "", max_tokens: int = 160, temp
                     continue
                 return None
             try:
-                parts = r.json()["candidates"][0]["content"]["parts"]
-                return "".join(p.get("text", "") for p in parts).strip() or None
+                return r.json()["candidates"][0]
             except (KeyError, IndexError, ValueError):
                 return None
     return None
 
 
-def _digits(amount: int) -> set[str]:
-    return {str(amount), f"{amount:,}", f"{amount:,}".replace(",", "")}
+def _text(candidate: Optional[dict]) -> Optional[str]:
+    try:
+        parts = candidate["content"]["parts"]
+    except (TypeError, KeyError):
+        return None
+    return "".join(p.get("text", "") for p in parts).strip() or None
+
+
+async def generate(prompt: str, *, system: str = "", max_tokens: int = 160, temperature: float = 0.8,
+                   json_mode: bool = False, timeout: float = 4.0) -> Optional[str]:
+    body: dict = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature,
+                             "thinkingConfig": {"thinkingBudget": 0}},
+    }
+    if system:
+        body["systemInstruction"] = {"parts": [{"text": system}]}
+    if json_mode:
+        body["generationConfig"]["responseMimeType"] = "application/json"
+    return _text(await _call(body, timeout))
+
+
+async def generate_with_maps(prompt: str, lat: Optional[float] = None,
+                             lng: Optional[float] = None) -> Optional[tuple[str, list[dict]]]:
+    """Gemini with Grounding with Google Maps. Returns (text, [{title, uri}]) or None."""
+    body: dict = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "tools": [{"googleMaps": {}}],
+        "generationConfig": {"maxOutputTokens": 1200, "temperature": 0.1},
+    }
+    if lat is not None and lng is not None:
+        body["toolConfig"] = {"retrievalConfig": {"latLng": {"latitude": lat, "longitude": lng}}}
+    candidate = await _call(body, timeout=20)
+    text = _text(candidate)
+    if not text:
+        return None
+    chunks = [c.get("maps", {}) for c in (candidate.get("groundingMetadata") or {}).get("groundingChunks", [])
+              if isinstance(c, dict) and c.get("maps")]
+    return text, chunks
 
 
 ROMAN_STYLE = {

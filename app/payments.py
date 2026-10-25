@@ -49,18 +49,22 @@ async def create_payment_link(session_id: str, leg_id: str, vendor_name: str, pr
             "amount": amount, "deal_price": price, "status": "created", "test_mode": True, "error": error}
 
 
-def deal_summary(request: dict, vendor_name: str, price: int, payment: dict, savings: int | None) -> str:
+def deal_summary(request: dict, vendor_name: str, price: int, payment: dict | None, savings: int | None,
+                 slot: str = "") -> str:
+    appointment = request.get("goal") == "appointment"
     lines = [
-        "✅ Deal locked by Swarm Negotiator",
-        f"Job: {request.get('summary') or request.get('category')}",
-        f"When: {request.get('when') or '-'}",
-        f"Vendor: {vendor_name}",
-        f"All-inclusive price: {format_inr(price)}",
-        f"UPI token advance: {format_inr(payment['amount'])}",
+        "✅ Appointment booked by Swarm Negotiator" if appointment else "✅ Deal locked by Swarm Negotiator",
+        f"Job: {request.get('summary') or request.get('service_label') or request.get('category')}",
+        f"When: {slot or request.get('when') or '-'}",
+        f"{'Provider' if appointment else 'Vendor'}: {vendor_name}",
     ]
-    if payment.get("provider") == "razorpay" and payment.get("url"):
-        lines.append(f"Pay: {payment['url']}")
-    if savings:
+    if price:
+        lines.append(f"{'Fee' if appointment else 'All-inclusive price'}: {format_inr(price)}")
+    if payment:
+        lines.append(f"UPI token advance: {format_inr(payment['amount'])}")
+        if payment.get("provider") == "razorpay" and payment.get("url"):
+            lines.append(f"Pay: {payment['url']}")
+    if savings and not appointment:
         lines.append(f"Saved vs. highest first quote: {format_inr(savings)}")
     lines.append("Your number was never shared with any vendor.")
     return "\n".join(lines)

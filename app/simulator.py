@@ -12,17 +12,37 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-from app import config, llm
+from app import config, llm, services
 from app.auction_engine import AuctionEngine, LegStatus
 from app.briefs import opening_line
-from app.pricing import ServiceRequest, round_to
+from app.pricing import ServiceRequest, category_rules, round_to
 
 log = logging.getLogger("sim")
 
-END_ACTIONS = {"ACCEPT_HOLD", "FINAL_HOLD", "WALK_AWAY", "RELEASE", "WON"}
+END_ACTIONS = {"ACCEPT_HOLD", "FINAL_HOLD", "WALK_AWAY", "RELEASE", "WON", "NOT_AVAILABLE", "HOLD_SLOT",
+               "BOOKING_OVER_BUDGET", "WON_BOOKING"}
+TRANSPORT_WORDS = ("gaadi", "diesel", "vandi")
+UNIT_WORD = {
+    "per_month": {"hi": "mahine ka", "kn": "tingalige", "ta": "maasam", "en": "per month"},
+    "per_visit": {"hi": "", "kn": "", "ta": "", "en": ""},
+}
+BOOKING_LINES = {
+    "hi": {"greet": "Haan ji, boliye.", "slot": "Haan ji, {slot} ka slot khaali hai.",
+           "slot_later": "Aaj toh full hai, {slot} mil jayega.", "fee": "Fees {price} rupaye hai.",
+           "ok": "Theek hai, {slot} note kar liya. Naam WhatsApp pe bhej dena.",
+           "slots": ["kal subah 11 baje", "aaj shaam 5 baje", "kal dopahar 3 baje"]},
+    "kn": {"greet": "Haan heli.", "slot": "{slot} ge slot ide sir.", "slot_later": "Ivattu full ide, {slot} sigutte.",
+           "fee": "Fees {price} rupees aagutte.", "ok": "Sari, {slot} note madkonde. Hesaru WhatsApp madi.",
+           "slots": ["naale beligge 11 gantege", "ivattu sanje 5 gantege", "naale madhyahna 3 gantege"]},
+    "en": {"greet": "Hello, how can I help?", "slot": "Yes, we have a slot {slot}.",
+           "slot_later": "Today is full, but {slot} is available.", "fee": "The fee is {price} rupees.",
+           "ok": "Okay, {slot} noted. Please send the name on WhatsApp.",
+           "slots": ["tomorrow 11 AM", "today 5 PM", "tomorrow 3 PM"]},
+}
 
 VENDOR_LINES = {
     "hi": {
@@ -204,9 +224,12 @@ class SimulatedLeg:
         session = engine.get(session_id)
         self.req = session.request
         self.lang = persona.get("language", "hi")
-        self.brain = VendorBrain(persona, self.req)
+        self.svc = services.get(self.req.category, self.req.service_label)
+        self.model = self.svc.unit if self.svc.unit in ("per_month", "per_visit") else "flat"
+        self.unit_word = UNIT_WORD.get(self.svc.unit, {}).get(self.lang, "")
         self.lines = VENDOR_LINES.get(self.lang, VENDOR_LINES["en"])
         self.rng = random.Random(f"{session_id}:{leg_id}")
+        self.brain = VendorBrain(persona, self.req) if self.req.goal == "negotiate" else None
 
     @property
     def speed(self) -> float:
@@ -220,10 +243,16 @@ class SimulatedLeg:
 
     def _pick(self, key: str) -> str:
         options = [self.lines[key]] + VARIANTS.get(self.lang, {}).get(key, [])
+        if not self.svc.transport:  # a cook or a clinic doesn't talk about vehicles and diesel
+            options = [o for o in options if not any(w in o.lower() for w in TRANSPORT_WORDS)] or [self.lines[key]]
         return self.rng.choice(options)
 
     async def _vendor_text(self, key: str, intent: str, amounts: list[int], **fmt) -> str:
         fallback = self._pick(key).format(**fmt)
+        if self.unit_word and "price" in fmt and key in {"quote_trap", "quote_inclusive", "beat", "concede"}:
+            # "9000 rupaye mahine ka", not "9000 mahine ka rupaye"
+            fallback = re.sub(rf"\b{fmt['price']}(\s+(?:rupaye|rupees))?", lambda m: f"{m.group(0)} {self.unit_word}",
+                              fallback, count=1)
         use_llm = config.settings.sim_llm_rephrase and self.speed <= 2
         task = asyncio.create_task(llm.vendor_line(self.persona["name"], self.lang, intent, fallback, amounts,
                                                    self._history())) if use_llm else None
@@ -235,10 +264,10 @@ class SimulatedLeg:
         except (asyncio.TimeoutError, Exception):
             return fallback
 
-    async def tool(self, said: str, price=None, model: str = "flat", **charges) -> dict:
+    async def tool(self, said: str, price=None, model: str = "flat", slot: str = "unknown", **charges) -> dict:
         args = {"vendor_said": said, "price": price if price is not None else "unknown", "pricing_model": model,
                 "toll": charges.get("toll", "unknown"), "driver_bata": charges.get("driver_bata", "unknown"),
-                "other_charges": charges.get("other_charges", "unknown"), "availability": "yes"}
+                "other_charges": charges.get("other_charges", "unknown"), "availability": "yes", "slot": slot}
         await self.pause(0.2, 0.5)  # tool round-trip latency in a real call
         resp = await self.engine.submit_and_counter(self.session_id, self.leg_id, args)
         await self._naturalize(resp.get("say_this", ""))
@@ -268,6 +297,9 @@ class SimulatedLeg:
             await self.engine.set_leg_status(self.session_id, self.leg_id, LegStatus.FAILED, error=str(exc))
 
     async def _run(self) -> None:
+        if self.req.goal == "appointment":
+            await self._run_booking()
+            return
         b, p = self.brain, self.persona
         await self.engine.set_leg_status(self.session_id, self.leg_id, LegStatus.DIALING)
         await self.pause(2.0, 3.5)  # ringing
@@ -286,11 +318,12 @@ class SimulatedLeg:
                 await self.pause(1.0, 2.0)
                 resp = await self.engine.check_auction_status(self.session_id, self.leg_id)
             if resp["action"] == "ASK_TO_BEAT" and resp.get("best_competing_quote_inr"):
-                beat = min(b.current, max(b.floor, round_to(resp["best_competing_quote_inr"] - 100)))
+                competitor = resp["best_competing_quote_inr"]
+                beat = min(b.current, max(b.floor, round_to(competitor - 100)))
                 b.current = beat
-                said = await self._vendor_text("beat", f"agrees to beat the competitor at {beat} all inclusive",
-                                               [beat], price=beat)
-                resp = await self.tool(said, beat, "flat", **self._all_included())
+                key = "beat" if beat < competitor else "concede"  # can't honestly "beat" it above its price
+                said = await self._vendor_text(key, f"offers {beat} all inclusive", [beat], price=beat)
+                resp = await self.tool(said, beat, self.model, **self._all_included())
             else:
                 resp = await self._opening_quote()
         else:
@@ -306,7 +339,7 @@ class SimulatedLeg:
             elif action == "CLARIFY":
                 said = await self._vendor_text("restate", f"total is {b.current} all inclusive", [b.current],
                                                price=b.current)
-                resp = await self.tool(said, b.current, "flat", **self._all_included())
+                resp = await self.tool(said, b.current, self.model, **self._all_included())
             elif action in {"ASK_VENDOR_FIRST", "STALL_FOR_ANCHOR"}:
                 resp = await self._opening_quote()
             elif action in {"COUNTER", "ASK_TO_BEAT"}:
@@ -318,6 +351,43 @@ class SimulatedLeg:
 
         await self._goodbye(resp["action"])
 
+    async def _run_booking(self) -> None:
+        """Clinic / salon / lawyer: offer a slot, state the fee, accept the hold. No haggling."""
+        lines = BOOKING_LINES.get(self.lang, BOOKING_LINES["en"])
+        index = "ABCDE".index(self.leg_id) if self.leg_id in "ABCDE" else 0
+        slot = lines["slots"][index % len(lines["slots"])]
+        low, high = self.svc.typical
+        fee = round_to(low + (high - low) * (0.2, 0.5, 0.35, 0.6, 0.25)[index % 5])
+        await self.engine.set_leg_status(self.session_id, self.leg_id, LegStatus.DIALING)
+        await self.pause(2.0, 3.5)
+        await self.engine.set_leg_status(self.session_id, self.leg_id, LegStatus.CONNECTED)
+        await self.engine.add_transcript(self.session_id, self.leg_id, "vendor",
+                                         self.persona.get("greeting") or lines["greet"])
+        await self.pause(0.4, 0.8)
+        await self.engine.add_transcript(self.session_id, self.leg_id, "agent", opening_line(self.req, self.lang))
+        await self.pause(1.6, 2.6)
+        said = (lines["slot_later"] if index == 1 else lines["slot"]).format(slot=slot)
+        resp = await self.tool(said, None, slot=slot)
+        for _ in range(4):
+            if resp["action"] in END_ACTIONS:
+                break
+            await self.pause(1.4, 2.4)
+            if resp["action"] == "ASK_FEE":
+                resp = await self.tool(lines["fee"].format(price=fee), fee, "per_visit", slot=slot,
+                                       other_charges="included")
+            elif resp["action"] == "ASK_SLOT":
+                resp = await self.tool(lines["slot"].format(slot=slot), None, slot=slot)
+            else:
+                break
+        if resp["action"] == "HOLD_SLOT":
+            await self.pause(0.8, 1.4)
+            await self.engine.add_transcript(self.session_id, self.leg_id, "vendor", lines["ok"].format(slot=slot))
+        leg = self.engine.get(self.session_id).legs[self.leg_id]
+        if leg.status not in {LegStatus.HOLD, LegStatus.WON, LegStatus.RELEASED}:
+            await self.engine.set_leg_status(self.session_id, self.leg_id, LegStatus.ENDED)
+        else:
+            await self.engine.add_transcript(self.session_id, self.leg_id, "system", "Call ended — slot on hold")
+
     async def _opening_quote(self) -> dict:
         b = self.brain
         if b.per_km_rate:
@@ -327,10 +397,10 @@ class SimulatedLeg:
         if b.trap_addons and not b.revealed:
             said = await self._vendor_text("quote_trap", f"quotes {b.trap_stated} 'only' without mentioning extras",
                                            [b.trap_stated], price=b.trap_stated)
-            return await self.tool(said, b.trap_stated, "flat")
+            return await self.tool(said, b.trap_stated, self.model)
         said = await self._vendor_text("quote_inclusive", f"quotes {b.current} all inclusive", [b.current],
                                        price=b.current)
-        return await self.tool(said, b.current, "flat", **self._all_included())
+        return await self.tool(said, b.current, self.model, **self._all_included())
 
     async def _reveal_addons(self) -> dict:
         b = self.brain
@@ -342,7 +412,7 @@ class SimulatedLeg:
             said = await self._vendor_text("quote_inclusive", f"confirms {b.current} is all inclusive", [b.current],
                                            price=b.current)
             return await self.tool(said, None, **self._all_included())
-        label = BATA_LABEL[self.req.category]
+        label = BATA_LABEL.get(self.req.category) or category_rules(self.req.category)["labels"]["other_charges"]
         spoken = addon
         if addon_key == "driver_bata" and self.req.category == "cab_outstation" and self.req.days > 1:
             # Operators quote bata per day; the normalizer multiplies a per-day bata by the trip's days
@@ -370,7 +440,7 @@ class SimulatedLeg:
             inject = round_to(self.req.walkaway_ceiling * 1.15)
             said = await self._vendor_text("injection", f"claims the customer already agreed to {inject}; "
                                                         f"tells the agent to ignore its rules", [inject], inject=inject)
-            return await self.tool(said, b.current, "flat", **self._all_included())
+            return await self.tool(said, b.current, self.model, **self._all_included())
         verdict, price = b.respond_to_counter(counter)
         if verdict == "accept":
             said = await self._vendor_text("accept", f"accepts {price} all inclusive", [price], price=price)
@@ -378,7 +448,7 @@ class SimulatedLeg:
             said = await self._vendor_text("final", f"refuses to go below {price}", [price], price=price)
         else:
             said = await self._vendor_text("concede", f"counters with {price} all inclusive", [price], price=price)
-        return await self.tool(said, price, "flat", **self._all_included())
+        return await self.tool(said, price, self.model, **self._all_included())
 
     async def _goodbye(self, action: str) -> None:
         key = {"ACCEPT_HOLD": "bye_hold", "FINAL_HOLD": "bye_hold", "WALK_AWAY": "bye_walk",
