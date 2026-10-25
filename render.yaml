@@ -1,3 +1,5 @@
+# Render Blueprint (optional). Dashboard → New → Blueprint → pick this repo.
+# Values marked sync:false are asked for once in the dashboard; never commit real keys (the repo is public).
 services:
   - type: web
     name: swarm-negotiator
@@ -8,13 +10,19 @@ services:
     envVars:
       - key: EXECUTION_MODE
         value: simulation
+      - key: BOLNA_TELEPHONY_PROVIDER
+        value: plivo
+      - key: BOLNA_AGENT_LANGUAGES
+        value: hi,kn
       - key: GEMINI_API_KEY
-        sync: false
-      - key: PUBLIC_BASE_URL
         sync: false
       - key: BOLNA_API_KEY
         sync: false
+      - key: LIVE_TEST_PHONE
+        sync: false
       - key: TOOL_SHARED_SECRET
-        generateValue: true
+        sync: false
       - key: ADMIN_TOKEN
-        generateValue: true
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
