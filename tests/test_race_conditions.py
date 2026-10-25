@@ -178,3 +178,12 @@ def test_late_webhook_does_not_resurrect_finished_leg():
         return s
     s = run(scenario())
     assert s.legs["A"].status == LegStatus.HOLD
+
+
+def test_tool_response_tells_the_llm_what_was_heard():
+    async def scenario():
+        e = make_engine()
+        s = await new_session(e)
+        return await e.submit_and_counter(s.session_id, "A", quote(2500))
+    r = run(scenario())
+    assert "₹2,500" in r["heard"]

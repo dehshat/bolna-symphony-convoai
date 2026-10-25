@@ -72,7 +72,7 @@ class Orchestrator:
         user_data = {
             "session_id": session_id, "leg_id": leg_id, "vendor_name": leg.vendor_name,
             "service_brief": f"{req.summary}. Pickup: {req.pickup}. Drop: {req.drop}. When: {req.when}.",
-            "opening_line": opening_line(req, leg.language), "language": leg.language,
+            "opening_line": opening_line(req, leg.language, native=True), "language": leg.language,
         }
         await self.engine.set_leg_status(session_id, leg_id, LegStatus.DIALING)
         await self.engine.add_transcript(session_id, leg_id, "system", f"Dialing {leg.vendor_phone[:3]}•••• via Bolna")

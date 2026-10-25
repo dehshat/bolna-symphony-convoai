@@ -351,7 +351,9 @@
       ["Bolna agents", Object.keys(c.bolna_agent_ids || {}).length ? JSON.stringify(c.bolna_agent_ids) : "none yet"],
       ["Telephony", c.bolna_telephony_provider],
       ["Your test phone", c.live_test_phone_set ? "✓ set" : "enter in Hybrid form"],
-      ["Gemini (sim wording + brief parsing)", c.gemini_enabled ? "✓ " + c.gemini_model : "off (rules fallback)"],
+      ["Gemini (brief parsing" + (c.sim_llm_rephrase ? " + sim wording)" : ")"),
+        !c.gemini_enabled ? "off (rules fallback)" : Object.keys(c.gemini?.rate_limited_models || {}).length
+          ? "⚠ free daily quota used up, using rules until it resets" : "✓ " + c.gemini_model],
       ["Razorpay", c.razorpay_enabled ? "✓ test keys" : "mock checkout"],
       ["WhatsApp Cloud API", c.whatsapp_api_enabled ? "✓" : "wa.me link"],
       ["Tool auth secret", c.tool_auth_enabled ? "✓" : "off"],

@@ -94,6 +94,9 @@ class Settings:
     gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", ""))
     gemini_model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
     llm_enabled: bool = field(default_factory=lambda: _bool("LLM_ENABLED", True))
+    # Gemini rewording of simulated call lines (~25 requests per simulation). Off by default because the
+    # free tier allows only ~20 requests/day/model; brief parsing still uses Gemini.
+    sim_llm_rephrase: bool = field(default_factory=lambda: _bool("SIM_LLM_REPHRASE", False))
 
     # --- Payments + WhatsApp ---
     razorpay_key_id: str = field(default_factory=lambda: os.getenv("RAZORPAY_KEY_ID", ""))
@@ -129,6 +132,7 @@ class Settings:
             "live_test_phone_set": bool(self.live_test_phone),
             "gemini_enabled": bool(self.gemini_api_key and self.llm_enabled),
             "gemini_model": self.gemini_model,
+            "sim_llm_rephrase": self.sim_llm_rephrase,
             "razorpay_enabled": bool(self.razorpay_key_id and self.razorpay_key_secret),
             "whatsapp_api_enabled": bool(self.whatsapp_token and self.whatsapp_phone_number_id),
             "tool_auth_enabled": bool(self.tool_shared_secret),

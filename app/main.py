@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app import bolna_client, briefs, config, payments, state
+from app import bolna_client, briefs, config, llm, payments, state
 from app.auction_engine import GuardrailViolation
 from app.pricing import ServiceRequest
 from app.webhooks import router as webhook_router
@@ -156,6 +156,7 @@ async def get_config(request: Request) -> dict:
                     for k, v in briefs.PRESETS.items()},
         "default_preset": briefs.DEFAULT_PRESET,
         "bolna_sync": BOLNA_SYNC,
+        "gemini": llm.status(),
         "vendors": briefs.VENDOR_PERSONAS,
     }
 

@@ -32,6 +32,21 @@ Everything is served by **one FastAPI process on one origin**, so there is no CO
 
 ---
 
+## Which model does what
+
+| Where | Component | Job | Decides prices? |
+|---|---|---|---|
+| **Live call** (Hybrid/Live) | **Sarvam `saaras:v4`** via Bolna | Ears: turns the vendor's Hindi/Kannada speech into text | No |
+| | **OpenAI `gpt-4.1-mini`** via Bolna | Brain for wording: understands the vendor, calls our tools, speaks the tool's line naturally in Devanagari/Kannada script | **No**, only the numbers our tools return |
+| | **Our Python engine** (`negotiation.py`) | Every rupee amount: counters, leverage, accept/walk away, ceiling guardrail | **Yes** |
+| | **Sarvam `bulbul:v3`** (voice `shubh`) via Bolna | Mouth: speaks the reply | No |
+| **Sim mode** | Templates (several phrasings per line) | Simulated vendors' and negotiator's words | No |
+| | Gemini (optional) | Parses your typed/spoken brief; with `SIM_LLM_REPHRASE=true` it also rewords simulated lines (amounts verified) | No |
+
+Gemini is **not** used on a live phone call. Live-call quality depends on Sarvam (hearing and voice), the Bolna
+LLM (how natural the wording is) and the strategy lines. Model choices are env vars: `SARVAM_TTS_MODEL`,
+`SARVAM_TTS_VOICE`, `SARVAM_ASR_MODEL`, `BOLNA_LLM_MODEL`.
+
 ## Three execution modes
 
 | Mode | Phones needed | What happens |
@@ -184,7 +199,7 @@ snippets (`POST /v2/agent`, `POST /call`, `POST /call/{execution_id}/stop`, exec
 4. **1:00** A judge's phone rings (the judge plays Vendor A). The room hears one real Sarvam voice.
 5. **1:30** The judge quotes high. ⚡ **Leverage injected** flashes as the agent cites the simulated
    vendor's real quote.
-6. **2:00** Point at the Sri Sai card: "₹11,200 said → ₹13,450 real". The hidden bata and toll were caught.
+6. **2:00** Point at the Sri Sai card: "₹11,200 said → ₹12,650 real". The hidden bata and toll were caught.
 7. **2:20** **Lock best deal**, then the Razorpay test link and WhatsApp summary. Runner-ups get released.
 8. **2:45** "₹2,550 saved, zero numbers leaked." If the network dies, switch to **Sim** and the same show
    runs offline.

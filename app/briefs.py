@@ -22,7 +22,7 @@ PRESETS: dict[str, dict] = {
         "brief": "Need an Innova 7-seater tomorrow 6 AM from JP Nagar to Kempegowda airport. "
                  "Target ₹2,200, hard max ₹2,600.",
         "request": dict(category="cab_outstation", summary="Innova 7-seater, JP Nagar → KIA airport drop",
-                        pickup="JP Nagar, Bengaluru", drop="Kempegowda International Airport", when="Tomorrow 6:00 AM",
+                        pickup="JP Nagar, Bengaluru", drop="Kempegowda Airport", when="Tomorrow 6:00 AM",
                         target_price=2200, walkaway_ceiling=2600, est_km=45, days=1, min_km_per_day=0,
                         language_hint="kn"),
     },
@@ -106,8 +106,37 @@ def localize_when(when: str, language: str) -> str:
     return "".join(out).replace(",", "").strip()
 
 
-def opening_line(req: ServiceRequest, language: str) -> str:
-    """The first sentence after pickup: the job, the date and the place, no company name, no pitch."""
+NATIVE_WHEN = {
+    "hi": {"tomorrow": "कल", "today": "आज", "tonight": "आज रात", "asap": "जल्दी", "saturday": "शनिवार",
+           "sunday": "रविवार", "morning": "सुबह", "evening": "शाम"},
+    "kn": {"tomorrow": "ನಾಳೆ", "today": "ಇವತ್ತು", "tonight": "ಇವತ್ತು ರಾತ್ರಿ", "asap": "ಬೇಗ", "saturday": "ಶನಿವಾರ",
+           "sunday": "ಭಾನುವಾರ", "morning": "ಬೆಳಿಗ್ಗೆ", "evening": "ಸಂಜೆ"},
+}
+
+
+def native_when(when: str, language: str) -> str:
+    """'Tomorrow 6:00 AM' -> 'कल सुबह 6 बजे' / 'ನಾಳೆ ಬೆಳಿಗ್ಗೆ 6 ಗಂಟೆಗೆ' so Sarvam's TTS reads it naturally."""
+    words = NATIVE_WHEN[language]
+    text = (when or "tomorrow").strip()
+
+    def clock(m: re.Match) -> str:
+        hour, ampm = int(m.group(1)), (m.group(3) or "").lower()
+        part = "evening" if ampm == "pm" and hour != 12 else "morning"
+        suffix = "बजे" if language == "hi" else "ಗಂಟೆಗೆ"
+        return f"{words[part]} {hour} {suffix}"
+
+    text = re.sub(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", clock, text, flags=re.I)
+    out = [words.get(w.lower(), w) for w in re.split(r"(\s+|,)", text)]
+    return "".join(out).replace(",", "").strip()
+
+
+def opening_line(req: ServiceRequest, language: str, native: bool = False) -> str:
+    """The first sentence after pickup: the job, the date and the place, no company name, no pitch.
+
+    native=True gives Devanagari/Kannada script for live calls (Sarvam pronounces it far better than
+    romanized text); the romanized version stays for the on-screen simulation."""
+    if native and language in NATIVE_WHEN:
+        return _native_opening(req, language)
     pickup = req.pickup.split(",")[0] or "JP Nagar"
     drop = (req.drop.split(",")[0] or "").strip()
     when = localize_when(req.when, language)
@@ -129,6 +158,23 @@ def opening_line(req: ServiceRequest, language: str) -> str:
         "hi": f"Namaste ji, {pickup} mein split AC cooling nahi kar raha, {when.lower()} koi aa sakta hai?",
         "ta": f"Vanakkam, {pickup} la split AC cooling aagala, {when.lower()} technician vara mudiyuma?",
     }.get(language, f"Hello, my split AC in {pickup} is not cooling. Can a technician come {when.lower()}?")
+
+
+def _native_opening(req: ServiceRequest, language: str) -> str:
+    pickup = req.pickup.split(",")[0] or "JP Nagar"
+    drop = (req.drop.split(",")[0] or "").strip()
+    when = native_when(req.when, language)
+    if language == "hi":
+        if req.category == "cab_outstation":
+            return f"नमस्ते भैया, {when} {pickup} से {drop} के लिए Innova 7-seater चाहिए, मिल जाएगी?"
+        if req.category == "mini_truck":
+            return f"नमस्ते भैया, {when} {pickup} से {drop} 1BHK का सामान shift करना है, छोटा tempo मिलेगा?"
+        return f"नमस्ते जी, {pickup} में split AC ठंडा नहीं कर रहा, {when} कोई technician आ सकता है?"
+    if req.category == "cab_outstation":
+        return f"ನಮಸ್ಕಾರ ಅಣ್ಣ, {when} {pickup} ಇಂದ {drop} ಗೆ Innova 7-seater ಬೇಕಿತ್ತು, ಸಿಗುತ್ತಾ?"
+    if req.category == "mini_truck":
+        return f"ನಮಸ್ಕಾರ ಅಣ್ಣ, {when} {pickup} ಇಂದ {drop} ಗೆ 1BHK shifting ಇದೆ, ಚಿಕ್ಕ tempo ಸಿಗುತ್ತಾ?"
+    return f"ನಮಸ್ಕಾರ, {pickup} ಅಲ್ಲಿ split AC cooling ಆಗ್ತಿಲ್ಲ, {when} technician ಬರ್ತಾರಾ?"
 
 
 def _fallback_parse(text: str) -> dict:

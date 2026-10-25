@@ -99,6 +99,50 @@ VENDOR_LINES = {
     },
 }
 
+# Extra natural phrasings so simulated vendors don't repeat themselves (no LLM needed)
+VARIANTS = {
+    "hi": {
+        "avail_budget": ["Gaadi mil jayegi. Pehle aap bataiye, budget kya hai?",
+                         "Haan haan, ho jayega. Kitne tak dekh rahe ho aap?"],
+        "quote_trap": ["{price} lagega sir, bas.", "Ho jayega, {price} rupaye dena."],
+        "quote_inclusive": ["{price} lagega bhaiya, sab include hai.", "Ho jayega. {price} final rate hai, sab milake."],
+        "accept": ["Chalo theek hai, {price} mein kar denge. Jaldi bata dena.",
+                   "Achha theek hai, {price} pakka. Confirm karke batao."],
+        "concede": ["Itne mein nahi padta bhaiya. {price} kar sakta hoon, sab milake.",
+                    "Diesel bhi mehenga hai bhaiya. {price} tak aa sakta hoon, sab milake."],
+        "final": ["{price} last hai bhaiya, isse neeche nahi.", "Bhaiya, {price} se kam mein gaadi nahi chalegi."],
+        "beat": ["Usse kam karta hoon, {price} de dena, sab milake.", "Chalo, {price} mein kar denge, sab include."],
+        "think": ["Ruko zara, check karke batata hoon..."],
+        "bye_hold": ["Ok bhaiya, message kar dena."],
+    },
+    "kn": {
+        "avail_budget": ["Gaadi ide sir. Modlu nim budget heli.", "Aagutte sir. Eshtu varegu nodtidira?"],
+        "quote_trap": ["{price} aagutte sir, ashte.", "Aagutte, {price} kodi saaku."],
+        "quote_inclusive": ["{price} aagutte sir, ella include.", "Aagutte. {price} final rate, ella serisi."],
+        "accept": ["Aaytu sir, {price} ge maadtini. Bega heli.", "Sari, {price} pakka. Confirm maadi heli."],
+        "concede": ["Adakke aagalla sir. {price} maadbahudu, ella serisi.",
+                    "Diesel rate jaasti sir. {price} varegu barbahudu, ella serisi."],
+        "final": ["{price} last sir, adakkinta kelage illa.", "Sir, {price} ginta kammi alli gaadi hogalla."],
+        "beat": ["Adakkinta kammi maadtini, {price} kodi, ella serisi.", "Sari, {price} ge maadtini, ella include."],
+        "think": ["Swalpa iri sir, check maadi heltini..."],
+        "bye_hold": ["Ok sir, message maadi."],
+    },
+    "en": {
+        "avail_budget": ["We can do it. Tell me your budget first.", "Yes yes. How much are you looking at?"],
+        "quote_trap": ["{price} rupees, that's it.", "Can do. {price} rupees."],
+        "quote_inclusive": ["It'll be {price}, everything included.", "Possible. {price} is the rate, all inclusive."],
+        "accept": ["Alright, {price} works. Confirm quickly.", "Fine, {price}, all inclusive. Let me know soon."],
+        "concede": ["Can't do that much. {price}, all inclusive.", "Costs are high, sir. Best I can do is {price}."],
+        "final": ["{price} is my last, can't go lower.", "Sir, below {price} it doesn't work for us."],
+        "beat": ["I'll beat that, {price}, all inclusive.", "Fine, {price}, everything included."],
+        "think": ["Hold on, let me check..."],
+        "bye_hold": ["Sure, message me."],
+    },
+}
+
+PER_DAY_BATA = {"hi": "driver bata roz ka", "kn": "driver bata dina ge", "ta": "driver bata dhinamum",
+                "en": "driver bata per day"}
+
 BATA_LABEL = {"cab_outstation": "driver bata", "mini_truck": "loading labour", "ac_repair": "gas refill"}
 
 
@@ -171,10 +215,18 @@ class SimulatedLeg:
     async def pause(self, low: float, high: float) -> None:
         await asyncio.sleep(self.rng.uniform(low, high) / self.speed)
 
+    def _history(self) -> list[dict]:
+        return self.engine.get(self.session_id).legs[self.leg_id].transcript[-4:]
+
+    def _pick(self, key: str) -> str:
+        options = [self.lines[key]] + VARIANTS.get(self.lang, {}).get(key, [])
+        return self.rng.choice(options)
+
     async def _vendor_text(self, key: str, intent: str, amounts: list[int], **fmt) -> str:
-        fallback = self.lines[key].format(**fmt)
-        task = asyncio.create_task(llm.vendor_line(self.persona["name"], self.lang, intent, fallback, amounts)) \
-            if self.speed <= 2 else None
+        fallback = self._pick(key).format(**fmt)
+        use_llm = config.settings.sim_llm_rephrase and self.speed <= 2
+        task = asyncio.create_task(llm.vendor_line(self.persona["name"], self.lang, intent, fallback, amounts,
+                                                   self._history())) if use_llm else None
         await self.pause(1.6, 2.8)  # the vendor is "speaking"
         if task is None:
             return fallback
@@ -188,7 +240,20 @@ class SimulatedLeg:
                 "toll": charges.get("toll", "unknown"), "driver_bata": charges.get("driver_bata", "unknown"),
                 "other_charges": charges.get("other_charges", "unknown"), "availability": "yes"}
         await self.pause(0.2, 0.5)  # tool round-trip latency in a real call
-        return await self.engine.submit_and_counter(self.session_id, self.leg_id, args)
+        resp = await self.engine.submit_and_counter(self.session_id, self.leg_id, args)
+        await self._naturalize(resp.get("say_this", ""))
+        return resp
+
+    async def _naturalize(self, say: str) -> None:
+        """Like the live Bolna LLM, speak the deterministic line in natural words (amounts are verified)."""
+        if not say or self.speed > 2 or not llm.enabled() or not config.settings.sim_llm_rephrase:
+            return
+        try:
+            natural = await asyncio.wait_for(llm.agent_line(self.lang, say, self._history()[:-1]), timeout=3.5)
+        except (asyncio.TimeoutError, Exception):
+            return
+        if natural and natural != say:
+            await self.engine.rephrase_agent_line(self.session_id, self.leg_id, say, natural)
 
     def _all_included(self) -> dict:
         return {"toll": "included", "driver_bata": "included", "other_charges": "included"}
@@ -277,14 +342,20 @@ class SimulatedLeg:
             said = await self._vendor_text("quote_inclusive", f"confirms {b.current} is all inclusive", [b.current],
                                            price=b.current)
             return await self.tool(said, None, **self._all_included())
+        label = BATA_LABEL[self.req.category]
+        spoken = addon
+        if addon_key == "driver_bata" and self.req.category == "cab_outstation" and self.req.days > 1:
+            # Operators quote bata per day; the normalizer multiplies a per-day bata by the trip's days
+            spoken = addon // self.req.days
+            label = PER_DAY_BATA.get(self.lang, PER_DAY_BATA["en"])
         if toll:
-            said = await self._vendor_text("reveal", f"admits toll {toll} and {addon} are extra", [toll, addon],
-                                           toll=toll, bata=addon, bata_label=BATA_LABEL[self.req.category])
+            said = await self._vendor_text("reveal", f"admits toll {toll} and {label} {spoken} are extra",
+                                           [toll, spoken], toll=toll, bata=spoken, bata_label=label)
         else:
-            said = await self._vendor_text("reveal_one", f"admits {addon} is extra", [addon], bata=addon,
-                                           bata_label=BATA_LABEL[self.req.category])
+            said = await self._vendor_text("reveal_one", f"admits {label} {spoken} is extra", [spoken], bata=spoken,
+                                           bata_label=label)
         charges = {"toll": f"extra {toll}" if toll else "na", "driver_bata": "na", "other_charges": "na"}
-        charges[addon_key] = f"extra {addon}"
+        charges[addon_key] = f"extra {spoken}"
         return await self.tool(said, None, **charges)
 
     async def _answer_counter(self, resp: dict) -> dict:
@@ -314,7 +385,7 @@ class SimulatedLeg:
                "RELEASE": "bye_release", "WON": "bye_hold"}.get(action)
         if key:
             await self.pause(0.8, 1.5)
-            await self.engine.add_transcript(self.session_id, self.leg_id, "vendor", self.lines[key])
+            await self.engine.add_transcript(self.session_id, self.leg_id, "vendor", self._pick(key))
         leg = self.engine.get(self.session_id).legs[self.leg_id]
         if leg.status not in {LegStatus.HOLD, LegStatus.WON, LegStatus.RELEASED}:
             await self.engine.set_leg_status(self.session_id, self.leg_id, LegStatus.ENDED)

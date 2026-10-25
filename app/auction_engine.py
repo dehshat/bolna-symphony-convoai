@@ -281,6 +281,17 @@ class AuctionEngine:
             session.state_version += 1
         await self._emit(session, {"type": "transcript", "leg_id": leg_id, "role": role, "text": text})
 
+    async def rephrase_agent_line(self, session_id: str, leg_id: str, original: str, natural: str) -> None:
+        """Swap a deterministic agent line for its natural wording (simulation only; amounts already verified)."""
+        session = self.get(session_id)
+        async with self.lock_for(session_id):
+            for entry in reversed(session.legs[leg_id].transcript):
+                if entry["role"] == "agent" and entry["text"] == original:
+                    entry["text"] = natural
+                    break
+            session.state_version += 1
+        await self._emit(session, {"type": "transcript_rephrased", "leg_id": leg_id})
+
     async def replace_transcript(self, session_id: str, leg_id: str, lines: list[dict]) -> None:
         session = self.get(session_id)
         async with self.lock_for(session_id):
@@ -411,9 +422,24 @@ class AuctionEngine:
             "end_call": decision.end_call,
             "instruction": decision.instruction,
             "vendor_all_in_estimate_inr": quote.all_in if quote else None,
+            "heard": AuctionEngine._heard(quote),
             "best_competing_quote_inr": competitor.price if competitor else None,
             "state_version": session.state_version,
         }
+
+    @staticmethod
+    def _heard(quote: Optional[NormalizedQuote]) -> str:
+        """How the server understood the vendor, so the voice LLM can acknowledge it (or be corrected)."""
+        if quote is None or quote.stated_price is None:
+            return "No price stated yet."
+        if quote.status == "CLARIFY":
+            return f"Heard {format_inr(quote.stated_price)} but it is unclear; ask the vendor to confirm the total."
+        unit = {"per_km": "per km", "per_hour": "per hour", "per_day": "per day"}.get(quote.pricing_model)
+        said = f"{format_inr(quote.stated_price)} {unit}" if unit else format_inr(quote.stated_price)
+        note = f"Vendor said {said}; total all-inclusive works out to about {format_inr(quote.all_in)}."
+        if quote.unknown_items:
+            note += " Some add-ons are still unclear."
+        return note
 
     # ------------------------------------------------------------------ buyer actions
     async def lock_winner(self, session_id: str, leg_id: str) -> dict:
