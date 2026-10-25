@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0f17">
+  <title>Swarm Negotiator</title>
+  <meta name="description" content="One voice brief, three concurrent AI phone negotiations, zero phone numbers leaked.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐝</text></svg>">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🐝</span>
+      <div>
+        <div class="brand-name">Swarm Negotiator</div>
+        <div class="brand-tag">The Anti-Justdial · your number never leaves this screen</div>
+      </div>
+    </div>
+    <div class="top-actions">
+      <div class="seg" id="modeSeg" role="radiogroup" aria-label="Execution mode">
+        <button data-mode="simulation" class="active">Sim</button>
+        <button data-mode="hybrid">Hybrid</button>
+        <button data-mode="live">Live</button>
+      </div>
+      <span class="conn" id="conn" title="Live connection"><i></i><span>idle</span></span>
+      <button class="icon-btn" id="adminBtn" aria-label="Admin & Bolna setup">⚙︎</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- ======================= BRIEF ======================= -->
+    <section class="panel" id="briefPanel">
+      <div class="panel-head">
+        <h2>1 · Tell us once</h2>
+        <span class="muted small" id="parsedBy"></span>
+      </div>
+      <div class="chips" id="presetChips"></div>
+      <div class="brief-box">
+        <textarea id="briefText" rows="3" placeholder="Speak or type: “Need an Innova 7-seater tomorrow 6 AM from JP Nagar to Coorg, target ₹11,000, max ₹13,000”"></textarea>
+        <div class="brief-tools">
+          <select id="micLang" aria-label="Speech language">
+            <option value="en-IN">EN</option><option value="hi-IN">हि</option><option value="kn-IN">ಕ</option>
+          </select>
+          <button class="mic" id="micBtn" aria-label="Speak your request">🎙</button>
+          <button class="btn ghost" id="parseBtn">✨ Parse</button>
+        </div>
+      </div>
+      <div class="grid-fields">
+        <label>Target <span class="cur">₹<input id="target" type="number" inputmode="numeric" min="1"></span></label>
+        <label>Walk-away ceiling <span class="cur">₹<input id="ceiling" type="number" inputmode="numeric" min="1"></span></label>
+        <label class="wide">Job <input id="summary" type="text"></label>
+      </div>
+      <div class="mode-extra" id="hybridFields" hidden>
+        <label>Your phone (you play Vendor A) <input id="livePhone" type="tel" placeholder="+91 98xxxxxxxx"></label>
+        <label>Agent language on your call
+          <select id="liveLang"><option value="hi">Hindi / Hinglish</option><option value="kn">Kannada</option></select>
+        </label>
+      </div>
+      <div class="mode-extra" id="liveFields" hidden>
+        <div class="live-row"><input class="lp" type="tel" placeholder="Vendor A +91…"><input class="ln" type="text" placeholder="Name"><select class="ll"><option value="kn">KN</option><option value="hi">HI</option><option value="ta">TA</option></select></div>
+        <div class="live-row"><input class="lp" type="tel" placeholder="Vendor B +91…"><input class="ln" type="text" placeholder="Name"><select class="ll"><option value="hi">HI</option><option value="kn">KN</option><option value="ta">TA</option></select></div>
+        <div class="live-row"><input class="lp" type="tel" placeholder="Vendor C +91…"><input class="ln" type="text" placeholder="Name"><select class="ll"><option value="hi">HI</option><option value="kn">KN</option><option value="ta">TA</option></select></div>
+      </div>
+      <button class="btn primary launch" id="launchBtn">🚀 Launch swarm · 3 calls</button>
+      <p class="hint" id="modeHint"></p>
+    </section>
+
+    <!-- ======================= WAR ROOM ======================= -->
+    <section id="warRoom" hidden>
+      <div class="scoreboard">
+        <div class="sb-job">
+          <div class="muted small" id="sbCategory"></div>
+          <div class="sb-title" id="sbJob"></div>
+          <div class="muted small" id="sbMeta"></div>
+        </div>
+        <div class="sb-stats">
+          <div class="stat"><span class="muted small">Best all-in</span><b id="sbBest">—</b><span class="small" id="sbBestVendor"></span></div>
+          <div class="stat"><span class="muted small">Saved</span><b class="good" id="sbSaved">—</b><span class="small muted">vs highest first quote</span></div>
+          <div class="stat"><span class="muted small">Elapsed</span><b id="sbTime">0s</b><span class="small muted" id="sbVersion">v0</span></div>
+        </div>
+        <div class="sb-actions">
+          <span class="privacy">🔒 Numbers shared: <b>0</b></span>
+          <button class="btn win" id="lockBestBtn" disabled>Lock best deal</button>
+          <button class="btn ghost" id="newBtn">New</button>
+        </div>
+      </div>
+      <div class="cards" id="cards"></div>
+    </section>
+  </main>
+
+  <!-- ======================= ARBITRAGE TICKER ======================= -->
+  <footer class="ticker" id="ticker" hidden>
+    <div class="ticker-label">⚡ Shared-memory arbitrage</div>
+    <div class="ticker-track" id="tickerTrack"><span class="muted">Waiting for the first quote…</span></div>
+  </footer>
+  <div class="flash" id="flash" hidden></div>
+
+  <!-- ======================= LOCK / CHECKOUT MODAL ======================= -->
+  <dialog id="lockModal">
+    <form method="dialog" class="modal">
+      <div class="modal-head"><h3 id="lmTitle">Deal locked</h3><button class="icon-btn" value="close" aria-label="Close">✕</button></div>
+      <div id="lmBody"></div>
+      <div class="modal-actions" id="lmActions"></div>
+    </form>
+  </dialog>
+
+  <!-- ======================= ADMIN DRAWER ======================= -->
+  <dialog id="adminModal">
+    <form method="dialog" class="modal">
+      <div class="modal-head"><h3>Setup · Bolna + Sarvam</h3><button class="icon-btn" value="close" aria-label="Close">✕</button></div>
+      <div id="cfgList" class="cfg"></div>
+      <label class="small">Admin token (only if ADMIN_TOKEN is set)<input id="adminToken" type="password" autocomplete="off"></label>
+      <label class="small">Languages to provision
+        <input id="syncLangs" type="text" value="hi,kn">
+      </label>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="previewBtn">Preview agent JSON</button>
+        <button type="button" class="btn primary" id="syncBtn">Create / update Bolna agents</button>
+      </div>
+      <pre id="adminOut" class="out" hidden></pre>
+    </form>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
