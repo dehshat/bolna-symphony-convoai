@@ -337,3 +337,40 @@ def test_trial_unverified_number_error_is_explained(client, monkeypatch):
                                             "live_phone": "+918317494732"}).json()["session_id"]
     snap = wait_for(client, sid, lambda s: s["legs"][0]["status"] == "FAILED")
     assert "Verified numbers" in snap["legs"][0]["error"] and "+918317494732" in snap["legs"][0]["error"]
+
+
+def test_agent_uses_fast_modern_llm():
+    llm_cfg = bolna_client.build_agent_payload("hi")["agent_config"]["tasks"][0]["tools_config"]["llm_agent"]["llm_config"]
+    assert llm_cfg["model"] == "gpt-5.4-mini"
+    assert llm_cfg["reasoning_effort"] == "none" and llm_cfg["verbosity"] == "low"
+    assert "temperature" not in llm_cfg  # reasoning models fix their own temperature
+
+
+def test_llm_falls_back_when_bolna_rejects_it(monkeypatch):
+    sent = []
+
+    async def fake_list(self):
+        return []
+
+    async def fake_create(self, payload):
+        llm_cfg = payload["agent_config"]["tasks"][0]["tools_config"]["llm_agent"]["llm_config"]
+        sent.append(llm_cfg["model"])
+        if llm_cfg["model"] == "gpt-5.4-mini":
+            raise bolna_client.BolnaError('Bolna POST /v2/agent -> 400: {"message":"Model gpt-5.4-mini is not '
+                                          'enabled for this account"}')
+        assert "reasoning_effort" not in llm_cfg and llm_cfg["temperature"] == 0.2
+        return {"agent_id": "agent-hi"}
+
+    monkeypatch.setattr(bolna_client.BolnaClient, "list_agents", fake_list)
+    monkeypatch.setattr(bolna_client.BolnaClient, "create_agent", fake_create)
+    config.settings.bolna_api_key = "bn-test"
+    result = asyncio.run(bolna_client.sync_agents(["hi"], "https://x.onrender.com"))
+    assert sent == ["gpt-5.4-mini", "gpt-4.1-mini"] and result["agents"] == {"hi": "agent-hi"}
+
+
+def test_language_errors_do_not_downgrade_the_llm(monkeypatch):
+    payload = bolna_client.build_agent_payload("hi")
+    note = bolna_client._adapt_payload(payload, 'Bolna POST /v2/agent -> 400: {"message":"Provided language: hi is '
+                                                'not available for the model: saaras:v4"}')
+    assert note and payload["agent_config"]["tasks"][0]["tools_config"]["llm_agent"]["llm_config"]["model"] == \
+        "gpt-5.4-mini"

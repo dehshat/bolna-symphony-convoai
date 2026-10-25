@@ -75,7 +75,13 @@ class Settings:
     bolna_from_number: str = field(default_factory=lambda: os.getenv("BOLNA_FROM_NUMBER", ""))
     bolna_telephony_provider: str = field(default_factory=lambda: os.getenv("BOLNA_TELEPHONY_PROVIDER", "plivo"))
     bolna_llm_provider: str = field(default_factory=lambda: os.getenv("BOLNA_LLM_PROVIDER", "openai"))
-    bolna_llm_model: str = field(default_factory=lambda: os.getenv("BOLNA_LLM_MODEL", "gpt-4.1-mini"))
+    # gpt-5.4-mini is Bolna's recommended voice model (fastest TTFT). reasoning_effort "none" skips thinking
+    # for the lowest latency; verbosity "low" keeps spoken turns short. Falls back to gpt-4.1-mini if rejected.
+    bolna_llm_model: str = field(default_factory=lambda: os.getenv("BOLNA_LLM_MODEL", "gpt-5.4-mini"))
+    bolna_llm_reasoning_effort: str = field(default_factory=lambda: os.getenv("BOLNA_LLM_REASONING_EFFORT", "none"))
+    bolna_llm_verbosity: str = field(default_factory=lambda: os.getenv("BOLNA_LLM_VERBOSITY", "low"))
+    bolna_llm_fallback_model: str = field(default_factory=lambda: os.getenv("BOLNA_LLM_FALLBACK_MODEL",
+                                                                            "gpt-4.1-mini"))
     bolna_agent_languages: str = field(default_factory=lambda: os.getenv("BOLNA_AGENT_LANGUAGES", "hi,kn"))
     # Sarvam models/voice used by the Bolna agent (bulbul:v2 and saarika were retired by Sarvam)
     sarvam_tts_model: str = field(default_factory=lambda: os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"))
@@ -128,6 +134,7 @@ class Settings:
             "bolna_agent_ids": self.bolna_agent_ids or ({"default": self.bolna_agent_id} if self.bolna_agent_id else {}),
             "bolna_ready": self.bolna_ready,
             "bolna_telephony_provider": self.bolna_telephony_provider,
+            "bolna_llm_model": self.bolna_llm_model,
             "bolna_from_number_set": bool(self.bolna_from_number),
             "live_test_phone_set": bool(self.live_test_phone),
             "gemini_enabled": bool(self.gemini_api_key and self.llm_enabled),

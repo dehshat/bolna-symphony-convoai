@@ -37,7 +37,7 @@ Everything is served by **one FastAPI process on one origin**, so there is no CO
 | Where | Component | Job | Decides prices? |
 |---|---|---|---|
 | **Live call** (Hybrid/Live) | **Sarvam `saaras:v4`** via Bolna | Ears: turns the vendor's Hindi/Kannada speech into text | No |
-| | **OpenAI `gpt-4.1-mini`** via Bolna | Brain for wording: understands the vendor, calls our tools, speaks the tool's line naturally in Devanagari/Kannada script | **No**, only the numbers our tools return |
+| | **OpenAI `gpt-5.4-mini`** via Bolna (reasoning `none`, verbosity `low`; auto-fallback `gpt-4.1-mini`) | Brain for wording: understands the vendor, calls our tools, speaks the tool's line naturally in Devanagari/Kannada script | **No**, only the numbers our tools return |
 | | **Our Python engine** (`negotiation.py`) | Every rupee amount: counters, leverage, accept/walk away, ceiling guardrail | **Yes** |
 | | **Sarvam `bulbul:v3`** (voice `shubh`) via Bolna | Mouth: speaks the reply | No |
 | **Sim mode** | Templates (several phrasings per line) | Simulated vendors' and negotiator's words | No |

@@ -155,6 +155,21 @@ def _tools(language: str) -> list[dict]:
     ]
 
 
+def llm_config(model: str) -> dict:
+    """LLM block for the agent. GPT-5.x reasoning models get the lowest-latency settings Bolna supports."""
+    s = config.settings
+    cfg: dict = {"provider": s.bolna_llm_provider, "family": s.bolna_llm_provider, "model": model,
+                 "max_tokens": 150, "temperature": 0.2, "request_json": False}
+    if model.startswith(("gpt-5", "gpt-6")):
+        # Reasoning models fix temperature themselves; effort "none" = no thinking pause before speaking
+        cfg.pop("temperature")
+        if s.bolna_llm_reasoning_effort:
+            cfg["reasoning_effort"] = s.bolna_llm_reasoning_effort
+        if s.bolna_llm_verbosity:
+            cfg["verbosity"] = s.bolna_llm_verbosity
+    return cfg
+
+
 def _param_template(fields: list[str], style: str) -> Any:
     if style == "legacy":
         return {f: f"%({f})s" for f in fields}
@@ -202,9 +217,7 @@ def build_agent_payload(language: str = "hi", base_url: Optional[str] = None) ->
                     },
                     "llm_agent": {
                         "agent_type": "simple_llm_agent", "agent_flow_type": "streaming",
-                        "llm_config": {"provider": s.bolna_llm_provider, "family": s.bolna_llm_provider,
-                                       "model": s.bolna_llm_model, "max_tokens": 150, "temperature": 0.2,
-                                       "request_json": False},
+                        "llm_config": llm_config(s.bolna_llm_model),
                     },
                     "synthesizer": {
                         "provider": "sarvam", "stream": True, "buffer_size": 100, "audio_format": "wav",
@@ -324,6 +337,14 @@ def _adapt_payload(payload: dict, error: str) -> Optional[str]:
         payload.clear()
         payload.update(fixed)
         return f"model {old} -> {new}"
+    llm = payload["agent_config"]["tasks"][0]["tools_config"]["llm_agent"]["llm_config"]
+    fallback = config.settings.bolna_llm_fallback_model
+    if llm.get("model") != fallback and re.search(
+            rf"{re.escape(str(llm.get('model', '')))}|reasoning|verbosity|llm", text, re.I):
+        # The newer LLM (or its reasoning settings) isn't accepted on this account: keep calls working
+        llm.clear()
+        llm.update(llm_config(fallback))
+        return f"LLM -> {fallback}"
     m = _LANGUAGE_RE.search(text)
     if m:
         bad_lang, model = m.group(1), m.group(2)
