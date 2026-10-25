@@ -8,6 +8,9 @@ a vendor.**
 
 Built for **Bolna Symphony 2026** (Bolna voice orchestration + Sarvam ASR/TTS + Exotel/Plivo telephony).
 
+> **Buildathon submission:** demo video, deck and form values are in [`docs/SUBMISSION.md`](docs/SUBMISSION.md).
+> Demo video: _add link_ · Pitch deck: _add link_ · Live app: _add Render URL_
+
 > Read [`ARCHITECTURE_CRITIQUE.md`](ARCHITECTURE_CRITIQUE.md) first. It is the red-team assessment (call
 > psychology, race conditions, adversarial vendors, honest judging scores). Every fix it proposes is
 > implemented here.
