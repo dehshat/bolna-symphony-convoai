@@ -37,7 +37,11 @@ class Provider:
     id: str
     name: str
     phone: str = ""                 # number as listed (may be empty)
+    phone_local: str = ""           # same number in local format, e.g. "099720 19812"
     dial_phone: str = ""            # number that will actually be called
+    website: str = ""
+    hours: list = field(default_factory=list)   # ["Monday: 9:00 AM – 8:00 PM", ...]
+    category: str = ""
     rating: Optional[float] = None
     reviews: int = 0
     address: str = ""
@@ -108,6 +112,32 @@ def haversine_km(lat1, lng1, lat2, lng2) -> Optional[float]:
     return round(2 * r * math.asin(math.sqrt(a)), 1)
 
 
+NEAR_ME_RE = re.compile(r"^\W*(?:near(?:by| me| you)?|around me|here|(?:my|your) (?:current |live )?location|"
+                        r"current location|use my (?:current |live )?location)\W*$", re.I)
+
+
+def is_near_me(location: str) -> bool:
+    """True when the location means "wherever I am right now" rather than a named area."""
+    return not (location or "").strip() or bool(NEAR_ME_RE.match(location.strip()))
+
+
+async def reverse_geocode(lat: float, lng: float) -> str:
+    """Live GPS position -> "Koramangala, Bengaluru" (OpenStreetMap Nominatim; no Google Geocoding API needed)."""
+    try:
+        async with httpx.AsyncClient(timeout=6, headers=UA) as client:
+            r = await client.get("https://nominatim.openstreetmap.org/reverse",
+                                 params={"lat": lat, "lon": lng, "format": "json", "zoom": 16, "addressdetails": 1})
+        addr = (r.json() if r.status_code < 400 else {}).get("address") or {}
+    except (httpx.HTTPError, ValueError):
+        return ""
+    area = next((addr[k] for k in ("suburb", "neighbourhood", "quarter", "city_district", "village", "town")
+                 if addr.get(k)), "")
+    city = next((addr[k] for k in ("city", "town", "state_district", "county") if addr.get(k)), "")
+    if city == "Bangalore":
+        city = "Bengaluru"
+    return ", ".join(dict.fromkeys(x for x in (area, city) if x))
+
+
 def _pid(*parts) -> str:
     return hashlib.sha1("|".join(str(p) for p in parts).encode()).hexdigest()[:10]
 
@@ -118,13 +148,21 @@ async def google_places(svc: ServiceType, location: str, lat=None, lng=None, lim
     key = config.settings.google_maps_api_key
     if not key:
         return []
-    body: dict = {"textQuery": f"{svc.maps_query or svc.label} in {location}", "maxResultCount": min(limit * 2, 20),
+    what = svc.maps_query or svc.label
+    gps = lat is not None and lng is not None
+    near_me = gps and is_near_me(location)
+    body: dict = {"textQuery": what if near_me else f"{what} in {location}", "maxResultCount": min(limit * 2, 20),
                   "languageCode": "en", "regionCode": "IN"}
-    if lat is not None and lng is not None:
-        body["locationBias"] = {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": 8000.0}}
+    if gps:
+        # "near me": stay close to the live position; a named area: just prefer results near the user
+        body["locationBias"] = {"circle": {"center": {"latitude": lat, "longitude": lng},
+                                           "radius": 5000.0 if near_me else 8000.0}}
+    # Every contact field Google has. All of these are in the same (Enterprise) billing tier as rating + phone.
     fields = ",".join(f"places.{f}" for f in ("id", "displayName", "formattedAddress", "rating", "userRatingCount",
                                                "nationalPhoneNumber", "internationalPhoneNumber", "location",
-                                               "googleMapsUri", "currentOpeningHours.openNow", "businessStatus"))
+                                               "googleMapsUri", "websiteUri", "currentOpeningHours.openNow",
+                                               "regularOpeningHours.weekdayDescriptions", "primaryTypeDisplayName",
+                                               "businessStatus"))
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post("https://places.googleapis.com/v1/places:searchText", json=body,
@@ -144,6 +182,9 @@ async def google_places(svc: ServiceType, location: str, lat=None, lng=None, lim
         out.append(Provider(
             id=p.get("id") or _pid(p.get("displayName")), name=(p.get("displayName") or {}).get("text", "Unknown"),
             phone=p.get("internationalPhoneNumber") or p.get("nationalPhoneNumber") or "",
+            phone_local=p.get("nationalPhoneNumber", ""), website=p.get("websiteUri", ""),
+            hours=list((p.get("regularOpeningHours") or {}).get("weekdayDescriptions") or []),
+            category=(p.get("primaryTypeDisplayName") or {}).get("text", ""),
             rating=p.get("rating"), reviews=int(p.get("userRatingCount") or 0), address=p.get("formattedAddress", ""),
             lat=loc.get("latitude"), lng=loc.get("longitude"), maps_uri=p.get("googleMapsUri", ""),
             open_now=(p.get("currentOpeningHours") or {}).get("openNow"), source="Google Maps"))
@@ -155,8 +196,9 @@ async def google_places(svc: ServiceType, location: str, lat=None, lng=None, lim
 async def gemini_maps(svc: ServiceType, location: str, lat=None, lng=None, limit: int = 8) -> list[Provider]:
     if not llm.enabled():
         return []
+    where = "my current location" if is_near_me(location) else f"{location}, India"
     prompt = (f"Using Google Maps, list up to {limit} real {svc.maps_query or svc.label} businesses in or near "
-              f"{location}, India. Return ONLY a JSON array, each item: "
+              f"{where}. Return ONLY a JSON array, each item: "
               '{"name": str, "address": str, "rating": number or null, "reviews": integer or null, '
               '"phone": str or null}. Use only data from Google Maps; use null when unknown.')
     raw = await llm.generate_with_maps(prompt, lat, lng)
@@ -251,7 +293,7 @@ DEMO_PREFIX = ("Sri Lakshmi", "Namma", "Royal", "Green Leaf", "City", "Sai Krupa
 
 async def demo(svc: ServiceType, location: str, lat=None, lng=None, limit: int = 6) -> list[Provider]:
     rng = random.Random(f"{svc.key}:{svc.label}:{location}".lower())
-    area = (location or "Bengaluru").split(",")[0].strip() or "Bengaluru"
+    area = ("Bengaluru" if is_near_me(location) else location).split(",")[0].strip() or "Bengaluru"
     area = area if any(c.isupper() for c in area) else area.title()
     noun = svc.label.split("/")[0].strip().title()
     names = rng.sample(DEMO_PREFIX, k=min(limit, len(DEMO_PREFIX)))
@@ -278,10 +320,12 @@ async def search(service_key: str, service_label: str, location: str, lat: Optio
     svc = services.get(service_key, service_label)
     if service_label and svc.key == "other":
         svc = services.get("other", service_label)
+    if is_near_me(location) and (lat is None or lng is None):
+        location = "Bengaluru"      # "near me" but the browser gave no position
     tried = []
     for name, backend in BACKENDS:
         try:
-            found = await backend(svc, location or "Bengaluru", lat, lng, limit)
+            found = await backend(svc, location, lat, lng, limit)
         except Exception as exc:  # one broken source must never break the search
             log.warning("provider backend %s crashed: %s", name, exc)
             found = []

@@ -43,7 +43,9 @@ Everything is served by **one FastAPI process on one origin**, so there is no CO
    own words. Gemini understands messages when its quota allows; built-in rules do it otherwise.
 2. **Map search:** providers near you, ranked by **rating weighted by review count** (★4.6 from 2,000 reviews beats
    ★5.0 from 3). Sources, in order: Google Places (`GOOGLE_MAPS_API_KEY`) → Gemini + Google Maps grounding →
-   OpenStreetMap → clearly-labelled demo listings.
+   OpenStreetMap → clearly-labelled demo listings. Say "near me" or tap 📍 and the search runs around your
+   live GPS position (the area is named via OpenStreetMap). Each card shows every contact detail Google has:
+   phone, website, address, opening hours and the Maps link.
 3. **Calls:** pick up to 5. Priced jobs (cook, plumber, cab…) are **negotiated** with truthful cross-call leverage
    and the hidden-extras check. Clinics, salons and lawyers get an **appointment** flow: slot + fee, no haggling.
 4. **Finalize:** confirm the winner. You get a WhatsApp summary (plus a UPI token-advance link for priced jobs),

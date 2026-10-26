@@ -15,7 +15,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-from app import llm, services
+from app import llm, places, services
 from app.pricing import ServiceRequest, format_inr, parse_inr
 
 BENGALURU_AREAS = (
@@ -152,6 +152,8 @@ def extract_rules(text: str, task: dict, asking: str) -> dict:
     loc = _find_location(text)
     if loc and not pickup:
         out["location"] = loc
+    elif not pickup and re.search(r"\bnear\s*(?:me|by)\b|\bnearby\b|\b(?:my|current|live) location\b", text, re.I):
+        out["location"] = "near me"         # the browser's live position fills this in
     elif asking == "location" and not loc and not pickup and not SKIP_RE.match(text):
         out["location"] = text.strip(" .!?")[:80]
     when = WHEN_RE.search(text)
@@ -241,7 +243,8 @@ def question(field_name: str, task: dict) -> tuple[str, list[str]]:
         if svc.transport:
             return f"Got it: {label}. Where from, and where to?", ["From JP Nagar to Kempegowda Airport"]
         return ("Got it. Which area should I search in?" if generic else
-                f"Got it: {label}. Which area should I search in?"), ["JP Nagar, Bengaluru", "Koramangala, Bengaluru"]
+                f"Got it: {label}. Which area should I search in?"), ["📍 Use my current location",
+                                                                        "JP Nagar, Bengaluru", "Koramangala, Bengaluru"]
     if field_name == "when":
         prompt = ("When would you like the appointment?" if svc.goal == "appointment" else
                   "When do you need this done?" if generic else f"When do you need the {label}?")
@@ -279,6 +282,9 @@ async def chat(conversation_id: Optional[str], message: str, lat: Optional[float
     text = (message or "").strip()[:600]
     if lat is not None and lng is not None:
         intake.task.update(lat=lat, lng=lng)
+        if places.is_near_me(intake.task.get("location", "")) and not intake.task.get("pickup"):
+            # live location: name the area so the user can see (and correct) where we'll search
+            intake.task["location"] = await places.reverse_geocode(lat, lng) or "your current location"
     if text:
         asking = intake.last_question
         updates = extract_rules(text, intake.task, asking)

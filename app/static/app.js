@@ -175,6 +175,7 @@
   async function sendChat(raw) {
     const text = (raw ?? $("#chatInput").value).trim();
     if (/^find providers$/i.test(text)) { await findProviders(); return; }
+    if (/use my (current |live )?location/i.test(text)) { $("#chatInput").value = ""; await useLocation(); return; }
     if (text) addMsg("user", text);
     $("#chatInput").value = "";
     const typing = addMsg("bot typing", "…");
@@ -185,6 +186,7 @@
       addMsg("bot", r.reply);
       renderChips(r.suggestions || []);
       renderTaskCard();
+      if (!S.geo && !S.geoDenied && NEAR_ME.test(r.task?.location || "")) await useLocation();
     } catch (e) {
       typing.remove();
       addMsg("bot", "Sorry, something went wrong: " + e.message);
@@ -223,13 +225,26 @@
       if (max > 0) t.walkaway_ceiling = Math.max(max, t.target_price || 0);
     }
   }
-  function useLocation() {
-    if (!navigator.geolocation) { addMsg("bot", "Location isn't available in this browser."); return; }
-    navigator.geolocation.getCurrentPosition((p) => {
+  const NEAR_ME = /^\W*(near(by| me| you)?|around me|here|(my|your) (current |live )?location|current location)\W*$/i;
+  // Live GPS position from the browser (asks permission once). Resolves to null if denied/unavailable.
+  function getGeo() {
+    if (S.geo) return Promise.resolve(S.geo);
+    if (!navigator.geolocation || S.geoDenied) return Promise.resolve(null);
+    return new Promise((resolve) => navigator.geolocation.getCurrentPosition((p) => {
       S.geo = { lat: p.coords.latitude, lng: p.coords.longitude };
       $("#geoBtn").classList.add("active");
-      addMsg("bot", "📍 Got your location. I'll search near you.");
-    }, () => addMsg("bot", "Couldn't get your location. Just tell me the area instead."), { timeout: 8000 });
+      resolve(S.geo);
+    }, () => { S.geoDenied = true; resolve(null); }, { timeout: 10000, maximumAge: 120000, enableHighAccuracy: true }));
+  }
+  async function useLocation() {
+    if (!navigator.geolocation) { addMsg("bot", "Location isn't available in this browser."); return; }
+    S.geoDenied = false;
+    if (!(await getGeo())) { addMsg("bot", "Couldn't get your location. Just tell me the area instead."); return; }
+    addMsg("bot", "📍 Got your live location. I'll search near you.");
+    if (S.chat.id) {
+      if (S.chat.task && NEAR_ME.test(S.chat.task.location || "")) S.chat.task.location = "";
+      await sendChat("");  // the server names your area from the GPS position
+    }
   }
 
   // ------------------------------------------------------------------ 2. providers
@@ -239,6 +254,7 @@
     const btn = $("#findBtn");
     btn.disabled = true; btn.textContent = "Searching maps…";
     try {
+      await getGeo();  // live location: results ranked by distance from where you are
       const r = await api("/api/providers/search", { method: "POST", body: { task: S.chat.task, lat: S.geo?.lat, lng: S.geo?.lng } });
       S.providers = r.providers || [];
       S.provInfo = r;
@@ -267,12 +283,20 @@
         p.distance_km != null ? `${p.distance_km} km` : "",
         p.open_now === true ? "open now" : p.open_now === false ? "closed now" : "",
       ].filter(Boolean).join(" · ");
-      const phone = p.phone ? `listed ${esc(p.phone)}` : "no listed number";
+      const phone = p.phone ? `<a href="tel:${esc(p.phone)}">${esc(p.phone_local || p.phone)}</a>` : "no listed number";
+      const links = [
+        p.website ? `<a href="${esc(p.website)}" target="_blank" rel="noopener">🌐 website</a>` : "",
+        p.maps_uri ? `<a href="${esc(p.maps_uri)}" target="_blank" rel="noopener">🗺️ map</a>` : "",
+      ].filter(Boolean).join(" · ");
+      const hours = (p.hours || []).length
+        ? `<details class="pmeta phours"><summary>🕒 Opening hours</summary>${p.hours.map((h) => esc(h)).join("<br>")}</details>` : "";
       return `<label class="prov ${S.provSel.has(p.id) ? "sel" : ""}" data-id="${esc(p.id)}">
         <input type="checkbox" ${S.provSel.has(p.id) ? "checked" : ""}>
-        <div><div class="pname">${esc(p.name)}</div><div class="pmeta">${meta}</div>
-          <div class="pmeta">${esc(p.address || "")}</div>
-          <div class="pmeta">📞 ${phone}${p.test_number ? ` → test ${esc(p.dial_phone)}` : ""}${p.maps_uri ? ` · <a href="${esc(p.maps_uri)}" target="_blank" rel="noopener">map</a>` : ""}</div></div>
+        <div><div class="pname">${esc(p.name)}</div><div class="pmeta">${p.category ? `${esc(p.category)} · ` : ""}${meta}</div>
+          <div class="pmeta">📍 ${esc(p.address || "")}</div>
+          <div class="pmeta">📞 ${phone}${links ? ` · ${links}` : ""}</div>
+          ${p.test_number ? `<div class="pmeta">↪ our call rings <b>${esc(p.dial_phone)}</b>, not the business</div>` : ""}
+          ${hours}</div>
         <div class="rank">#${i + 1}</div></label>`;
     }).join("");
     $$("#provList .prov").forEach((row) => {

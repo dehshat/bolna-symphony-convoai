@@ -119,6 +119,8 @@ textarea { resize: vertical; padding-right: 12px; min-height: 84px; }
 .prov input { width: 20px; height: 20px; accent-color: var(--accent); }
 .prov .pname { font-weight: 800; }
 .prov .pmeta { font-size: 12px; color: var(--muted); }
+.prov .pmeta a { color: var(--accent-2); }
+.prov .phours summary { cursor: pointer; }
 .prov .rank { font-weight: 900; font-size: 18px; color: var(--accent-2); }
 .stars { color: var(--warn); font-weight: 800; }
 .prov-actions { display: flex; gap: 10px; align-items: end; justify-content: space-between; margin-top: 12px; flex-wrap: wrap; }

@@ -208,7 +208,7 @@ async def search_providers(body: ProviderSearch) -> dict:
         raise HTTPException(422, "tell me what service you need first")
     lat, lng = body.lat if body.lat is not None else task.get("lat"), body.lng if body.lng is not None else task.get("lng")
     return await places.search(task.get("service_key", "other"), task.get("service_label", ""),
-                               task.get("location") or task.get("pickup") or "Bengaluru", lat, lng, body.limit)
+                               task.get("location") or task.get("pickup") or "", lat, lng, body.limit)
 
 
 async def _create_task_session(body: CreateSession, mode: str) -> dict:

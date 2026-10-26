@@ -101,6 +101,75 @@ def test_search_falls_back_to_demo_listings_when_no_source_is_available(monkeypa
     assert all(p["dial_phone"] == "+918317494732" for p in r["providers"])
 
 
+class FakePlaces:
+    """Stands in for httpx.AsyncClient: records the Places request, answers with one listing."""
+    sent: dict = {}
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, json=None, headers=None, **k):
+        FakePlaces.sent = {"url": url, "body": json, "headers": headers}
+        import httpx
+        return httpx.Response(200, json={"places": [{
+            "id": "p1", "displayName": {"text": "Lakshmi Plumbing works"}, "rating": 4.7, "userRatingCount": 43,
+            "nationalPhoneNumber": "099720 19812", "internationalPhoneNumber": "+91 99720 19812",
+            "websiteUri": "https://lakshmi.example", "formattedAddress": "3rd Cross Rd, Koramangala, Bengaluru",
+            "regularOpeningHours": {"weekdayDescriptions": ["Monday: 9:00 AM – 8:00 PM"]},
+            "primaryTypeDisplayName": {"text": "Plumber"}, "location": {"latitude": 12.93, "longitude": 77.62}}]})
+
+
+def test_near_me_searches_around_the_live_gps_position(monkeypatch):
+    monkeypatch.setattr(config.settings, "google_maps_api_key", "test-key")
+    monkeypatch.setattr(places.httpx, "AsyncClient", FakePlaces)
+    monkeypatch.setattr(config.settings, "test_phone_override", "+918317494732")
+    r = asyncio.run(places.search("plumber", "plumber", "near me", lat=12.9352, lng=77.6245))
+    body = FakePlaces.sent["body"]
+    assert " in " not in body["textQuery"]
+    assert body["locationBias"]["circle"]["center"] == {"latitude": 12.9352, "longitude": 77.6245}
+    assert r["source"] == "google_places"
+    p = r["providers"][0]
+    assert p["distance_km"] is not None and p["distance_km"] < 2
+
+
+def test_google_listing_carries_every_contact_detail_but_dials_the_test_phone(monkeypatch):
+    monkeypatch.setattr(config.settings, "google_maps_api_key", "test-key")
+    monkeypatch.setattr(places.httpx, "AsyncClient", FakePlaces)
+    monkeypatch.setattr(config.settings, "test_phone_override", "+918317494732")
+    r = asyncio.run(places.search("plumber", "plumber", "Koramangala, Bengaluru"))
+    assert FakePlaces.sent["body"]["textQuery"].endswith("in Koramangala, Bengaluru")
+    for f in ("websiteUri", "regularOpeningHours.weekdayDescriptions", "internationalPhoneNumber"):
+        assert f"places.{f}" in FakePlaces.sent["headers"]["X-Goog-FieldMask"]
+    p = r["providers"][0]
+    assert (p["phone"], p["phone_local"]) == ("+919972019812", "099720 19812")
+    assert p["website"] == "https://lakshmi.example" and p["hours"] and p["category"] == "Plumber"
+    assert p["dial_phone"] == "+918317494732" and p["test_number"]
+
+
+@pytest.mark.parametrize("text, near", [("near me", True), ("", True), ("my current location", True),
+                                        ("Nearby", True), ("Koramangala, Bengaluru", False), ("Near Me Road", False)])
+def test_is_near_me(text, near):
+    assert places.is_near_me(text) is near
+
+
+def test_chat_names_the_area_from_live_location(monkeypatch):
+    async def fake_reverse(lat, lng):
+        return "Koramangala, Bengaluru"
+    monkeypatch.setattr(places, "reverse_geocode", fake_reverse)
+
+    async def run():
+        r = await intake.chat(None, "I need a plumber near me")
+        return await intake.chat(r["conversation_id"], "", lat=12.9352, lng=77.6245)
+    r = asyncio.run(run())
+    assert r["task"]["location"] == "Koramangala, Bengaluru" and r["task"]["lat"] == 12.9352
+
+
 # ---------------------------------------------------------------- appointment strategy
 
 def appt_req(**kw):
