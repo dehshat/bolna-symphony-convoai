@@ -442,6 +442,11 @@
     if (unit && leg.first_all_in !== leg.first_stated) flags.push(`<span class="flag unit">${inr(leg.first_stated)}/${unitLabel} → ${inr(leg.first_all_in)} total</span>`);
     if (saved) flags.push(`<span class="flag save">▼ ${inr(saved)} negotiated</span>`);
     if (r.has_budget && leg.best_all_in && leg.best_all_in > r.walkaway_ceiling) flags.push(`<span class="flag guard">🛡 above ceiling: blocked</span>`);
+    for (const x of leg.excluded || []) flags.push(`<span class="flag excl" title="Billed separately by the vendor: not in the price, outside your budget">➕ ${esc(x.item)} ${x.amount ? inr(x.amount) : "at actuals"}: not included</span>`);
+    const captured = [
+      ...(leg.extras || []).filter((x) => x.kind !== "excluded").map((x) => `${x.item}: ${x.status === "included" ? "included" : (x.amount ? inr(x.amount) + " " : "") + "extra"}`),
+      ...(leg.details || []),
+    ];
     const appt = r.goal === "appointment";
     const pv = leg.provider || {};
     const pmeta = [pv.rating != null ? `★ ${Number(pv.rating).toFixed(1)} (${Number(pv.reviews || 0).toLocaleString("en-IN")})` : "",
@@ -479,6 +484,7 @@
       <div class="prices">${priceBoxes}
       </div>
       <div class="flags">${flags.join("")}</div>
+      ${captured.length ? `<ul class="captured" title="Everything the vendor said that matters">${captured.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>` : ""}
       <div class="transcript">${bubbles || '<div class="bubble system">Waiting to dial…</div>'}</div>
       ${leg.recording_url ? `<audio controls preload="none" src="${esc(leg.recording_url)}"></audio>` : ""}
       ${leg.error ? `<div class="err">${esc(leg.error)}</div>` : ""}
@@ -559,6 +565,7 @@
         <div><b>${esc(leg?.vendor_name)}</b> · all-inclusive</div>
         <div class="big">${inr(leg?.best_all_in)}</div>
         <div class="small">UPI token advance: <b>${inr(p.amount)}</b> · saved <b class="good">${inr(session.savings_vs_worst_first_quote)}</b> vs highest first quote</div>
+        ${(leg?.excluded || []).length ? `<div class="small">Not included, pay separately (outside your budget): <b>${leg.excluded.map((x) => esc(x.item) + (x.amount ? " " + inr(x.amount) : " (at actuals)")).join(", ")}</b></div>` : ""}
         <div class="small muted">Runner-ups released politely · your number shared with 0 vendors</div>${confirmNote}
       </div>${mockUpi}`;
     const actions = [];
@@ -582,6 +589,9 @@
       ["Bolna API key", c.bolna_api_key_set ? "✓ set" : "✗ missing"],
       ["Bolna agents", Object.keys(c.bolna_agent_ids || {}).length ? JSON.stringify(c.bolna_agent_ids) : "none yet"],
       ["Telephony", c.bolna_telephony_provider],
+      ["Call LLM", (c.bolna_llm_active || c.bolna_llm_model) + (c.bolna_llm_active && c.bolna_llm_active !== c.bolna_llm_model
+        ? ` (wanted ${c.bolna_llm_model})` : "") + (c.bolna_llm_note ? ` · ${c.bolna_llm_note}` : "")],
+      ["Counter-offers per call", String(c.max_counter_rounds ?? 1)],
       ["Your test phone", c.live_test_phone_set ? "✓ set" : "enter in Hybrid form"],
       ["Gemini (brief parsing" + (c.sim_llm_rephrase ? " + sim wording)" : ")"),
         !c.gemini_enabled ? "off (rules fallback)" : Object.keys(c.gemini?.rate_limited_models || {}).length

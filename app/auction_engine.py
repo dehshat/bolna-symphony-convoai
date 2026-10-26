@@ -20,7 +20,10 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from app.negotiation import Competitor, Decision, LegNegotiationState, decide
-from app.pricing import NormalizedQuote, ServiceRequest, format_inr, merge_charges, normalize_quote, parse_inr
+from app.pricing import (NormalizedQuote, ServiceRequest, format_inr, merge_charges, normalize_quote, parse_extras,
+                         parse_inr)
+
+_EMPTY = {"", "none", "unknown", "na", "n/a", "null", "nothing", "no", "-"}
 
 log = logging.getLogger("auction")
 
@@ -87,6 +90,18 @@ class Leg:
     persona: dict = field(default_factory=dict)    # simulated-vendor behaviour (sim legs only; never public)
     call_ended: bool = False                      # Bolna says the phone call itself is over
     confirm_execution_id: Optional[str] = None    # follow-up confirmation call to the winner
+    extras: list = field(default_factory=list)    # every extra the vendor mentioned: {item, status, amount, kind}
+    details: list = field(default_factory=list)   # everything else useful they said (timing, warranty, terms…)
+
+    def excluded_items(self) -> list[dict]:
+        """Billed separately, outside the budget: what the vendor itemized, plus structured ones not covered."""
+        items = [{"item": e["item"], "amount": e.get("amount")} for e in self.extras
+                 if e.get("kind") == "excluded" and e.get("status") == "extra"]
+        amounts = {i["amount"] for i in items if i["amount"]}
+        for e in (self.last_quote.excluded if self.last_quote else []):
+            if not items or (e.get("amount") and e["amount"] not in amounts):
+                items.append({"item": e["label"], "amount": e.get("amount")})
+        return items
 
     def public(self) -> dict:
         phone = self.vendor_phone
@@ -117,6 +132,9 @@ class Leg:
             "recording_url": self.recording_url,
             "last_action": self.last_action,
             "error": self.error,
+            "excluded": self.excluded_items(),
+            "extras": self.extras[-12:],
+            "details": self.details[-12:],
         }
 
 
@@ -341,8 +359,14 @@ class AuctionEngine:
                 session.status = "RUNNING"
 
             slot = args.get("slot")
-            if isinstance(slot, str) and slot.strip().lower() not in {"", "unknown", "none", "na", "n/a", "null"}:
+            if isinstance(slot, str) and slot.strip().lower() not in _EMPTY:
                 leg.neg.slot = slot.strip()[:80]
+            # Capture everything: itemized extras (a later mention of the same item updates it) and other details
+            for extra in parse_extras(args.get("extras")):
+                leg.extras = [e for e in leg.extras if e["item"].lower() != extra["item"].lower()] + [extra]
+            note = str(args.get("notes") or "").strip()
+            if note.lower().strip(" .") not in _EMPTY and note not in leg.details:
+                leg.details.append(note[:200])
             new_charges = {k: args.get(k) for k in ("toll", "driver_bata", "other_charges") if k in args}
             leg.charges = merge_charges(leg.charges, new_charges)
             price = args.get("price")
@@ -380,7 +404,8 @@ class AuctionEngine:
             available = str(args.get("availability") or "").strip().lower() not in {"no", "false", "nahi", "illa"}
             decision = decide(req, leg.neg, quote, competitor, leg.language, session.locked_leg_id, leg_id,
                               previous_best=previous_best, raised_price=raised, available=available,
-                              explain_unit=bool(parse_inr(price)) and quote is not None)
+                              explain_unit=bool(parse_inr(price)) and quote is not None,
+                              excluded=[e["item"] for e in leg.excluded_items()])
             self._apply_decision(session, leg, decision)
             event.update(self._decision_event(session, leg, decision, quote))
             response = self._tool_response(session, leg, decision, quote, competitor)  # snapshot under the lock
@@ -449,6 +474,8 @@ class AuctionEngine:
             "instruction": decision.instruction,
             "vendor_all_in_estimate_inr": quote.all_in if quote else None,
             "heard": AuctionEngine._heard(quote),
+            "excluded_items": [f"{e['item']}" + (f" {format_inr(e['amount'])}" if e.get("amount") else "")
+                               for e in leg.excluded_items()],
             "best_competing_quote_inr": competitor.price if competitor else None,
             "state_version": session.state_version,
         }
@@ -465,6 +492,9 @@ class AuctionEngine:
         note = f"Vendor said {said}; total all-inclusive works out to about {format_inr(quote.all_in)}."
         if quote.unknown_items:
             note += " Some add-ons are still unclear."
+        if quote.excluded:
+            note += " Billed separately (outside the budget, don't negotiate these): " + \
+                    ", ".join(e["label"] for e in quote.excluded) + "."
         return note
 
     # ------------------------------------------------------------------ buyer actions
@@ -500,7 +530,8 @@ class AuctionEngine:
             session.state_version += 1
             result = {"leg_id": leg_id, "vendor_name": leg.vendor_name, "price": price, "released": released,
                       "slot": leg.neg.slot, "goal": req.goal,
-                      "unresolved_addons": list(leg.last_quote.unknown_items) if leg.last_quote else []}
+                      "unresolved_addons": list(leg.last_quote.unknown_items) if leg.last_quote else [],
+                      "excluded": leg.excluded_items(), "details": list(leg.details)}
         await self._emit(session, {"type": "locked", **result})
         return result
 

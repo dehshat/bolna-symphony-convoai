@@ -48,6 +48,12 @@ Everything is served by **one FastAPI process on one origin**, so there is no CO
    phone, website, address, opening hours and the Maps link.
 3. **Calls:** pick up to 5. Priced jobs (cook, plumber, cab…) are **negotiated** with truthful cross-call leverage
    and the hidden-extras check. Clinics, salons and lawyers get an **appointment** flow: slot + fee, no haggling.
+   On every call the agent **captures everything** the provider says (each extra charge, timing, warranty,
+   payment terms) and shows it on the call card. **Parts, material, gas refills, groceries or medicines "at
+   actuals"** are listed as *not included, pay separately* and kept **out of the price and the budget**; charges
+   for doing the job itself (visiting, labour, travel, GST, toll) still count. It makes **one fair counter-offer**
+   at most (`MAX_COUNTER_ROUNDS`), accepts quotes within small change of your target without haggling, and never
+   goes above your ceiling.
 4. **Finalize:** confirm the winner. You get a WhatsApp summary (plus a UPI token-advance link for priced jobs),
    the others are released, and on live calls **the winner gets a confirmation call**.
 

@@ -147,23 +147,37 @@ CATEGORIES = {
         "label": "Outstation cab",
         "required": ["toll", "driver_bata"],
         "optional": ["other_charges"],
+        "excluded": [],
         "labels": {"toll": "toll", "driver_bata": "driver bata", "other_charges": "parking / night charge"},
     },
     "mini_truck": {
         "label": "Mini-truck shifting",
         "required": ["other_charges"],
         "optional": ["toll"],
+        "excluded": [],
         "labels": {"toll": "toll", "driver_bata": "driver bata", "other_charges": "loading-unloading labour"},
     },
     "ac_repair": {
         "label": "AC repair",
         "required": ["other_charges"],
         "optional": ["driver_bata"],
+        "excluded": ["other_charges"],   # gas refill / parts depend on what's needed: billed at actuals
         "labels": {"toll": "toll", "driver_bata": "visiting charge", "other_charges": "gas refill / parts"},
     },
 }
 
 PRICING_MODELS = {"flat", "per_km", "per_hour", "per_day", "per_month", "per_visit"}
+
+# Things billed at actuals (materials, parts, groceries, medicines…). They aren't the price of the job, so they are
+# listed as "excluded, pay separately" and never added to the all-inclusive price or held against the budget.
+EXCLUDED_ITEM_RE = re.compile(r"\b(parts?|spares?|spare parts|material\w*|maal|saa?maa?n|gas|refill\w*|paint\w*|oil|"
+                              r"filters?|batter(?:y|ies)|compressor|pipes?|wires?|wiring|fittings?|cement|tiles?|"
+                              r"ingredients?|ration|grocer\w*|sabzi|vegetables?|medicines?|dawa\w*|tablets?|"
+                              r"injections?|lab tests?|tests?|x-?ray|consumables?|actuals?|bill ke hisaab)\b", re.I)
+# Charges for doing the job itself. These count: they are part of what the buyer really pays for the job.
+ADDON_RE = re.compile(r"\b(visit\w*|inspection|service charge|travel\w*|transport|conveyance|labou?r|loading|"
+                      r"unloading|toll|bata|gst|tax|night|parking|convenience|agency|commission|booking fee|"
+                      r"platform|delivery|installation|fixing|mazdoori|kooli|coolie)\b", re.I)
 
 
 def category_rules(category: str) -> dict:
@@ -173,9 +187,21 @@ def category_rules(category: str) -> dict:
         return CATEGORIES[category]
     from app import services  # local import: services has no dependency on pricing
     svc = services.get(category)
-    # Every negotiated job gets one "anything extra?" check, the hidden-charge trap is universal
-    return {"label": svc.label, "required": ["other_charges"], "optional": [],
+    # Every negotiated job gets one "anything extra?" check, the hidden-charge trap is universal. When that extra is
+    # materials/parts (plumber, electrician, painter…) it is excluded from the price rather than added to it.
+    excluded = ["other_charges"] if EXCLUDED_ITEM_RE.search(svc.addon_label) else []
+    return {"label": svc.label, "required": ["other_charges"], "optional": ["driver_bata"], "excluded": excluded,
             "labels": {"toll": "toll", "driver_bata": "visiting charge", "other_charges": svc.addon_label}}
+
+
+def charge_kind(key: str, item: "ChargeItem", rules: dict) -> str:
+    """'excluded' (billed at actuals, outside the budget) or 'addon' (part of the job's real price)."""
+    note = item.note or ""
+    if EXCLUDED_ITEM_RE.search(note) and not ADDON_RE.search(note):
+        return "excluded"
+    if ADDON_RE.search(note):
+        return "addon"
+    return "excluded" if key in rules.get("excluded", []) else "addon"
 
 
 @dataclass
@@ -257,6 +283,7 @@ _NA_RE = re.compile(r"^(na|n/a|not applicable|none|nil|zero|0|free|no charge)$",
 class ChargeItem:
     status: str = "unknown"  # included | extra | na | unknown
     amount: Optional[int] = None
+    note: str = ""           # what was said, e.g. "gas refill extra 1500"
 
     @property
     def resolved(self) -> bool:
@@ -270,7 +297,8 @@ def parse_charge(value: Any) -> ChargeItem:
     if isinstance(value, ChargeItem):
         return value
     if isinstance(value, dict):
-        return ChargeItem(status=str(value.get("status", "unknown")), amount=value.get("amount"))
+        return ChargeItem(status=str(value.get("status", "unknown")), amount=value.get("amount"),
+                          note=str(value.get("note") or ""))
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return ChargeItem("extra", int(value)) if value > 0 else ChargeItem("na")
     text = str(value).strip()
@@ -279,15 +307,47 @@ def parse_charge(value: Any) -> ChargeItem:
     if _NA_RE.match(text):
         return ChargeItem("na")
     amount = parse_inr(re.sub(r"\b(extra|alag|separate|plus)\b", " ", text, flags=re.I))
+    note = text[:80]
     if _NOTHING_EXTRA_RE.search(text):
-        return ChargeItem("included")
+        return ChargeItem("included", note=note)
     if _EXTRA_RE.search(text):
-        return ChargeItem("extra", amount)
+        return ChargeItem("extra", amount, note)
     if _INCLUDED_RE.search(text):
-        return ChargeItem("included")
+        return ChargeItem("included", note=note)
     if amount:
-        return ChargeItem("extra", amount)
-    return ChargeItem()
+        return ChargeItem("extra", amount, note)
+    return ChargeItem(note=note)
+
+
+_ITEM_NOISE_RE = re.compile(r"(₹|\brs\.?|\brupees?\b|\d[\d,.]*\s*k?\b|\b(?:is|are|will be|hoga|lagega|extra|alag|"
+                            r"separate\w*|included|include|incl|shamil|plus|at|actuals?|charges?|cost|only|be|"
+                            r"not|bhi|aur|and)\b)", re.I)
+
+
+def parse_extras(text: Any) -> list[dict]:
+    """Every extra the vendor mentioned, itemized.
+
+    'gas refill 1500 extra; visiting 200 included; parts at actuals' ->
+    [{item: 'gas refill', status: 'extra', amount: 1500, kind: 'excluded'}, ...]"""
+    if not text or not isinstance(text, str):
+        return []
+    if text.strip().lower() in {"none", "unknown", "na", "n/a", "no", "nothing", "null", "-"}:
+        return []
+    out = []
+    for part in re.split(r"[;\n]|,(?!\d)|\band\b|\baur\b", text):
+        part = part.strip(" .")
+        if len(part) < 3:
+            continue
+        charge = parse_charge(part)
+        pct = re.search(r"\d+(?:\.\d+)?\s*%", part)
+        name = re.sub(r"\s+", " ", _ITEM_NOISE_RE.sub(" ", part.replace(pct.group(0), "") if pct else part))
+        name = name.strip(" .:-%") or part
+        if pct:  # "GST 18% extra": a percentage, not ₹18
+            name, charge.amount = f"{name} {pct.group(0)}", None
+        kind = "excluded" if EXCLUDED_ITEM_RE.search(part) and not ADDON_RE.search(part) else "addon"
+        status = charge.status if charge.status != "unknown" else "extra"
+        out.append({"item": name[:40], "status": status, "amount": charge.amount, "kind": kind, "said": part[:80]})
+    return out
 
 
 def detect_pricing_model(value: Any, said: str = "") -> str:
@@ -320,6 +380,8 @@ class NormalizedQuote:
     padded_items: list = field(default_factory=list)
     charges: dict = field(default_factory=dict)
     clarify_reason: str = ""
+    excluded: list = field(default_factory=list)    # [{key, label, amount}] billed separately, outside the budget
+    ask_items: list = field(default_factory=list)   # add-ons/exclusions to ask about once ("included or extra?")
 
     @property
     def hidden_charges(self) -> int:
@@ -384,12 +446,19 @@ def normalize_quote(req: ServiceRequest, price: Any, pricing_model: Any = "flat"
 
     estimates = req.estimates()
     components = [{"label": base_label, "amount": base, "source": "stated"}]
-    unknown, padded = [], []
+    unknown, padded, excluded, ask = [], [], [], []
     all_in = base
     for key in items:
         item = charges[key]
         label = rules["labels"][key]
         if item.status in {"included", "na"}:
+            continue
+        if charge_kind(key, item, rules) == "excluded":
+            # Materials/parts/gas: noted, never padded, never added to the price or held against the budget
+            if item.status == "extra":
+                excluded.append({"key": key, "label": label, "amount": item.amount})
+            elif key in rules["required"]:
+                ask.append(key)
             continue
         if item.status == "extra" and item.amount is not None:
             amount = item.amount * (req.days if key == "driver_bata" and req.category == "cab_outstation"
@@ -406,9 +475,10 @@ def normalize_quote(req: ServiceRequest, price: Any, pricing_model: Any = "flat"
                 components.append({"label": f"{label} (est.)", "amount": estimate, "source": "estimate"})
                 all_in += estimate
 
-    status = "NEEDS_INCLUSIONS" if unknown else "VALID"
+    # Not verified while we still don't know what the price covers (it isn't cited as leverage until then)
+    status = "NEEDS_INCLUSIONS" if unknown or ask else "VALID"
     return NormalizedQuote(status, model, stated, base, int(all_in), components, unknown, padded,
-                           {k: asdict(v) for k, v in charges.items()})
+                           {k: asdict(v) for k, v in charges.items()}, excluded=excluded, ask_items=unknown + ask)
 
 
 def merge_charges(previous: dict, new: dict) -> dict:

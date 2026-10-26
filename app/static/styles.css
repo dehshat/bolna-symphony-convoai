@@ -176,6 +176,9 @@ textarea { resize: vertical; padding-right: 12px; min-height: 84px; }
 .flag.save { background: rgba(52, 211, 153, .16); color: var(--good); }
 .flag.unit { background: rgba(251, 191, 36, .16); color: var(--warn); }
 .flag.guard { background: rgba(124, 92, 255, .2); color: #c4b5fd; }
+.flag.excl { background: rgba(56, 189, 248, .14); color: #7dd3fc; }
+.captured { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: var(--muted); }
+.captured li { margin: 1px 0; }
 .transcript { flex: 1; overflow-y: auto; max-height: 340px; min-height: 160px; display: flex; flex-direction: column; gap: 6px; padding: 4px 2px; }
 .bubble { max-width: 88%; padding: 7px 10px; border-radius: 12px; font-size: 13px; line-height: 1.35; }
 .bubble.new { animation: pop .25s ease-out; }

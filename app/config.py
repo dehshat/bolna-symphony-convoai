@@ -37,6 +37,13 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+def _int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except ValueError:
+        return default
+
+
 def _json_map(name: str) -> dict:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -76,12 +83,19 @@ class Settings:
     bolna_telephony_provider: str = field(default_factory=lambda: os.getenv("BOLNA_TELEPHONY_PROVIDER", "plivo"))
     bolna_llm_provider: str = field(default_factory=lambda: os.getenv("BOLNA_LLM_PROVIDER", "openai"))
     # gpt-5.4-mini is Bolna's recommended voice model (fastest TTFT). reasoning_effort "none" skips thinking
-    # for the lowest latency; verbosity "low" keeps spoken turns short. Falls back to gpt-4.1-mini if rejected.
+    # for the lowest latency; verbosity "low" keeps spoken turns short. If Bolna rejects it, the sync first drops
+    # only the setting it names, then steps down BOLNA_LLM_FALLBACK_MODELS one model at a time.
     bolna_llm_model: str = field(default_factory=lambda: os.getenv("BOLNA_LLM_MODEL", "gpt-5.4-mini"))
     bolna_llm_reasoning_effort: str = field(default_factory=lambda: os.getenv("BOLNA_LLM_REASONING_EFFORT", "none"))
     bolna_llm_verbosity: str = field(default_factory=lambda: os.getenv("BOLNA_LLM_VERBOSITY", "low"))
     bolna_llm_fallback_model: str = field(default_factory=lambda: os.getenv("BOLNA_LLM_FALLBACK_MODEL",
                                                                             "gpt-4.1-mini"))
+    bolna_llm_fallback_models: str = field(default_factory=lambda: os.getenv("BOLNA_LLM_FALLBACK_MODELS", "gpt-4.1"))
+    # What the last agent sync actually ended up using, and why (shown in ⚙︎ Setup)
+    bolna_llm_active: str = ""
+    bolna_llm_note: str = ""
+    # Counter-offers per call before taking the vendor's best price (or walking away above the ceiling)
+    max_counter_rounds: int = field(default_factory=lambda: max(0, _int("MAX_COUNTER_ROUNDS", 1)))
     bolna_agent_languages: str = field(default_factory=lambda: os.getenv("BOLNA_AGENT_LANGUAGES", "hi,kn"))
     # Sarvam models/voice used by the Bolna agent (bulbul:v2 and saarika were retired by Sarvam)
     sarvam_tts_model: str = field(default_factory=lambda: os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"))
@@ -144,6 +158,9 @@ class Settings:
             "bolna_ready": self.bolna_ready,
             "bolna_telephony_provider": self.bolna_telephony_provider,
             "bolna_llm_model": self.bolna_llm_model,
+            "bolna_llm_active": self.bolna_llm_active or self.bolna_llm_model,
+            "bolna_llm_note": self.bolna_llm_note,
+            "max_counter_rounds": self.max_counter_rounds,
             "bolna_from_number_set": bool(self.bolna_from_number),
             "live_test_phone_set": bool(self.live_test_phone),
             "google_maps_enabled": bool(self.google_maps_api_key),
@@ -161,6 +178,13 @@ class Settings:
             "wave_stagger_seconds": self.wave_stagger_seconds,
             "sim_speed": self.sim_speed,
         }
+
+
+    @property
+    def llm_ladder(self) -> list[str]:
+        """Configured model first, then the fallbacks in order, without duplicates."""
+        models = [self.bolna_llm_model, *self.bolna_llm_fallback_models.split(","), self.bolna_llm_fallback_model]
+        return list(dict.fromkeys(m.strip() for m in models if m and m.strip()))
 
 
 settings = Settings()

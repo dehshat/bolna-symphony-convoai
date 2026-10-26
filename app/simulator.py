@@ -164,6 +164,8 @@ PER_DAY_BATA = {"hi": "driver bata roz ka", "kn": "driver bata dina ge", "ta": "
                 "en": "driver bata per day"}
 
 BATA_LABEL = {"cab_outstation": "driver bata", "mini_truck": "loading labour", "ac_repair": "gas refill"}
+PARTS_EXTRA = {"hi": " {parts} ka kharcha alag, jo lagega.", "kn": " {parts} bere, eshtu aagutto adu.",
+               "ta": " {parts} thaniya, aagura alavukku.", "en": " {parts} extra, at actuals."}
 
 
 @dataclass
@@ -179,6 +181,7 @@ class VendorBrain:
     injected: bool = False
     revealed: bool = False
     per_km_rate: Optional[int] = None
+    parts_label: str = ""          # "material / parts" etc. when this vendor bills them separately
 
     def __post_init__(self) -> None:
         p, r = self.persona, self.req
@@ -189,9 +192,13 @@ class VendorBrain:
         self.floor = round_to(r.target_price * p.get("floor_ratio_t", 1.05))
         if p.get("style") == "trap":
             est = r.estimates()
-            addon_key = "driver_bata" if r.category == "cab_outstation" else "other_charges"
+            rules = category_rules(r.category)
+            # Materials/parts are billed separately (excluded), so the hidden add-on is the visiting charge instead
+            parts_excluded = "other_charges" in rules.get("excluded", [])
+            addon_key = "driver_bata" if r.category == "cab_outstation" or parts_excluded else "other_charges"
             toll = est["toll"] if r.category == "cab_outstation" else 0
-            addon = est[addon_key] if r.category != "ac_repair" else round_to(r.target_price * 0.9)
+            addon = est[addon_key] or round_to(max(r.target_price * 0.15, 150))
+            self.parts_label = rules["labels"]["other_charges"] if parts_excluded else ""
             self.trap_stated = self.open_all_in
             self.trap_addons = {"toll": toll, addon_key: addon}
             self.open_all_in = self.trap_stated + toll + addon
@@ -264,10 +271,12 @@ class SimulatedLeg:
         except (asyncio.TimeoutError, Exception):
             return fallback
 
-    async def tool(self, said: str, price=None, model: str = "flat", slot: str = "unknown", **charges) -> dict:
+    async def tool(self, said: str, price=None, model: str = "flat", slot: str = "unknown", extras: str = "none",
+                   **charges) -> dict:
         args = {"vendor_said": said, "price": price if price is not None else "unknown", "pricing_model": model,
                 "toll": charges.get("toll", "unknown"), "driver_bata": charges.get("driver_bata", "unknown"),
-                "other_charges": charges.get("other_charges", "unknown"), "availability": "yes", "slot": slot}
+                "other_charges": charges.get("other_charges", "unknown"), "extras": extras, "notes": "none",
+                "availability": "yes", "slot": slot}
         await self.pause(0.2, 0.5)  # tool round-trip latency in a real call
         resp = await self.engine.submit_and_counter(self.session_id, self.leg_id, args)
         await self._naturalize(resp.get("say_this", ""))
@@ -412,7 +421,10 @@ class SimulatedLeg:
             said = await self._vendor_text("quote_inclusive", f"confirms {b.current} is all inclusive", [b.current],
                                            price=b.current)
             return await self.tool(said, None, **self._all_included())
-        label = BATA_LABEL.get(self.req.category) or category_rules(self.req.category)["labels"]["other_charges"]
+        labels = category_rules(self.req.category)["labels"]
+        label = BATA_LABEL.get(self.req.category) if addon_key != "driver_bata" or self.req.category == "cab_outstation" \
+            else labels["driver_bata"]
+        label = label or labels[addon_key]
         spoken = addon
         if addon_key == "driver_bata" and self.req.category == "cab_outstation" and self.req.days > 1:
             # Operators quote bata per day; the normalizer multiplies a per-day bata by the trip's days
@@ -426,7 +438,13 @@ class SimulatedLeg:
                                            bata_label=label)
         charges = {"toll": f"extra {toll}" if toll else "na", "driver_bata": "na", "other_charges": "na"}
         charges[addon_key] = f"extra {spoken}"
-        return await self.tool(said, None, **charges)
+        extras = [f"toll {toll} extra"] if toll else []
+        extras.append(f"{label} {spoken} extra")
+        if b.parts_label:
+            said += PARTS_EXTRA.get(self.lang, PARTS_EXTRA["en"]).format(parts=b.parts_label)
+            charges["other_charges"] = f"{b.parts_label} extra at actuals"
+            extras.append(f"{b.parts_label} extra at actuals")
+        return await self.tool(said, None, extras="; ".join(extras), **charges)
 
     async def _answer_counter(self, resp: dict) -> dict:
         b, p = self.brain, self.persona

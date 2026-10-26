@@ -50,7 +50,7 @@ async def create_payment_link(session_id: str, leg_id: str, vendor_name: str, pr
 
 
 def deal_summary(request: dict, vendor_name: str, price: int, payment: dict | None, savings: int | None,
-                 slot: str = "") -> str:
+                 slot: str = "", excluded: list | None = None, details: list | None = None) -> str:
     appointment = request.get("goal") == "appointment"
     lines = [
         "✅ Appointment booked by Swarm Negotiator" if appointment else "✅ Deal locked by Swarm Negotiator",
@@ -60,6 +60,12 @@ def deal_summary(request: dict, vendor_name: str, price: int, payment: dict | No
     ]
     if price:
         lines.append(f"{'Fee' if appointment else 'All-inclusive price'}: {format_inr(price)}")
+    if excluded:
+        items = ", ".join(e["item"] + (f" ({format_inr(e['amount'])})" if e.get("amount") else " (at actuals)")
+                          for e in excluded)
+        lines.append(f"Not included, pay separately (outside your budget): {items}")
+    for note in (details or [])[-4:]:
+        lines.append(f"• {note}")
     if payment:
         lines.append(f"UPI token advance: {format_inr(payment['amount'])}")
         if payment.get("provider") == "razorpay" and payment.get("url"):

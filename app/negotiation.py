@@ -11,12 +11,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
-from app import services
+from app import config, services
 from app.pricing import NormalizedQuote, ServiceRequest, category_rules, format_inr, round_down
 
-MAX_ROUNDS = 3
+MAX_ROUNDS = 3   # hard upper bound; the per-call limit is MAX_COUNTER_ROUNDS (default 1: one fair counter, then close)
 # Fraction of the gap between target and anchor we offer, per counter round (concede slowly)
 CONCESSION_CURVE = (0.25, 0.5, 0.75)
+CLOSE_ENOUGH = 0.05             # within 5% (min ₹50) of the target: accept, don't haggle over small change
 LEVERAGE_GAP = 50  # a leverage counter is always at least this much below the competitor quote
 
 LANGUAGE_NAMES = {"kn": "Kannada", "hi": "Hindi", "en": "English", "ta": "Tamil", "mr": "Marathi"}
@@ -62,6 +63,7 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "BOOKING_OVER_BUDGET": "{fee} is above the customer's budget. Thank you, we'll call back if needed.",
         "WON_BOOKING": "Good news, the customer confirms {slot}{fee_part}. Details are coming on WhatsApp.",
         "FEE_PART": ", fee {fee}",
+        "EXCLUDED_NOTE": " {items} separately, as you said.",
     },
     "hi": {
         "ASK_VENDOR_FIRST": "Customer teen jagah rate check kar rahe hain. Aapka best rate kya hoga, sab milake?",
@@ -92,6 +94,7 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "BOOKING_OVER_BUDGET": "{fee} budget se zyada hai. Shukriya, zarurat padi toh call karenge.",
         "WON_BOOKING": "Customer ne {slot} confirm kiya hai{fee_part}. Details WhatsApp pe aa rahe hain.",
         "FEE_PART": ", fees {fee}",
+        "EXCLUDED_NOTE": " {items} alag se, jaisa aapne bataya.",
     },
     "kn": {
         "ASK_VENDOR_FIRST": "Customer mooru kade rate nodtidare anna. Nimma best rate eshtu, ella serisi?",
@@ -122,6 +125,7 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "BOOKING_OVER_BUDGET": "{fee} budget ginta jaasti. Thanks, beku aadre call madtini.",
         "WON_BOOKING": "Customer {slot} confirm madidare{fee_part}. Details WhatsApp nalli bartide.",
         "FEE_PART": ", fees {fee}",
+        "EXCLUDED_NOTE": " {items} bere, neevu heliddu haage.",
     },
     "ta": {
         "ASK_VENDOR_FIRST": "Customer 3 options compare panraanga. Neenga mudhalla unga best all-inclusive rate sollunga.",
@@ -211,6 +215,10 @@ class Decision:
         return asdict(self)
 
 
+def max_rounds() -> int:
+    return min(MAX_ROUNDS, config.settings.max_counter_rounds)
+
+
 def counter_for_round(req: ServiceRequest, anchor: int, rounds: int, competitor: Optional[int]) -> int:
     """Buyer-favourable counter: concede a growing share of the target→anchor gap, never above ceiling."""
     fraction = CONCESSION_CURVE[min(rounds, len(CONCESSION_CURVE) - 1)]
@@ -223,8 +231,11 @@ def counter_for_round(req: ServiceRequest, anchor: int, rounds: int, competitor:
 def decide(req: ServiceRequest, state: LegNegotiationState, quote: Optional[NormalizedQuote],
            competitor: Optional[Competitor], language: str = "en", locked_leg_id: Optional[str] = None,
            leg_id: str = "", previous_best: Optional[int] = None, raised_price: bool = False,
-           available: bool = True, explain_unit: bool = False) -> Decision:
-    """Pick the next move for one call leg. Mutates `state` (rounds, stalls, counters)."""
+           available: bool = True, explain_unit: bool = False, excluded: Optional[list] = None) -> Decision:
+    """Pick the next move for one call leg. Mutates `state` (rounds, stalls, counters).
+
+    `excluded`: labels of things the vendor bills separately (parts, gas, material). They are outside the budget;
+    the closing line repeats them back so both sides agree on what the price covers."""
     who = services.get(req.category, req.service_label).who
 
     def line_(key: str, **kw) -> str:
@@ -277,14 +288,14 @@ def decide(req: ServiceRequest, state: LegNegotiationState, quote: Optional[Norm
         return done("CLARIFY", line_(key if key in TEMPLATES["en"] else "CLARIFY_no_price",
                                     quoted=quote.stated_price or 0), reason=quote.clarify_reason)
 
-    # 4. Hidden add-ons: ask once, then pad with conservative estimates
-    if quote.status == "NEEDS_INCLUSIONS" and state.inclusion_asks < 1:
+    # 4. Hidden add-ons (and parts/material we don't know about yet): ask once, then pad add-ons conservatively
+    ask = quote.ask_items or quote.unknown_items
+    if ask and state.inclusion_asks < 1:
         state.inclusion_asks += 1
         labels = category_rules(req.category)["labels"]
-        items = " aur ".join(labels[k] for k in quote.unknown_items) if language == "hi" else \
-            " and ".join(labels[k] for k in quote.unknown_items)
+        items = " aur ".join(labels[k] for k in ask) if language == "hi" else " and ".join(labels[k] for k in ask)
         return done("ASK_INCLUSIONS", line_("ASK_INCLUSIONS", quoted=quote.stated_price, items=items),
-                    reason="hidden_charges_unknown", notes=list(quote.unknown_items))
+                    reason="hidden_charges_unknown", notes=list(ask))
 
     q = state.best_all_in if state.best_all_in is not None else quote.all_in
     prefix = line_("REMINDER", previous=previous_best) if raised_price and previous_best else ""
@@ -295,16 +306,22 @@ def decide(req: ServiceRequest, state: LegNegotiationState, quote: Optional[Norm
         prefix += line_("UNIT_PREFIX", rate=quote.stated_price, unit=unit, total=quote.base_price)
     other = competitor.price if competitor is not None else None
 
+    names = list(dict.fromkeys(x for x in (excluded or []) if x))
+    joiner = " aur " if language == "hi" else " and "
+    excluded_note = line_("EXCLUDED_NOTE", items=joiner.join(names[:3])) if names else ""
+
     def hold(action: str, reason: str) -> Decision:
         if q > C:  # deterministic guardrail: never hold above the walk-away ceiling
             return done("WALK_AWAY", prefix + line_("WALK_AWAY", price=q), reason="above_ceiling")
-        return done(action, prefix + line_(action, price=q), binding_price=q, reason=reason)
+        return done(action, prefix + line_(action, price=q) + excluded_note, binding_price=q, reason=reason)
 
-    # 5. Vendor met (or beat) our last counter, or is already at target
+    # 5. Vendor met (or beat) our last counter, or is already at (or within small change of) the target
     if state.last_counter is not None and q <= state.last_counter:
         return hold("ACCEPT_HOLD", "vendor_met_counter")
     if q <= T:
         return hold("ACCEPT_HOLD", "at_or_below_target")
+    if q <= min(C, T + max(LEVERAGE_GAP, round(T * CLOSE_ENOUGH))) and (other is None or q <= other):
+        return hold("ACCEPT_HOLD", "close_enough_to_target")
 
     # 5b. A vendor who answers two counters without moving is at their floor: stop haggling, close politely
     if state.last_counter is not None and previous_best is not None and quote.status == "VALID":
@@ -313,7 +330,7 @@ def decide(req: ServiceRequest, state: LegNegotiationState, quote: Optional[Norm
             return hold("FINAL_HOLD", "vendor_firm")
 
     # 6. Out of rounds: hold if within ceiling, else walk away
-    if state.rounds >= MAX_ROUNDS:
+    if state.rounds >= max_rounds():
         return hold("FINAL_HOLD", "max_rounds")
 
     # 7. Counter

@@ -2,7 +2,7 @@
 
 import asyncio
 
-from app import briefs, llm
+from app import briefs, config, llm
 from app.negotiation import Competitor, LegNegotiationState, decide
 from app.pricing import ServiceRequest, normalize_quote
 
@@ -47,7 +47,8 @@ def test_agent_line_accepts_faithful_rewrite(monkeypatch):
     assert out.startswith("Achha bhaiya")
 
 
-def test_repeated_counter_uses_shorter_follow_up_line():
+def test_repeated_counter_uses_shorter_follow_up_line(monkeypatch):
+    monkeypatch.setattr(config.settings, "max_counter_rounds", 2)
     r, s = req(), LegNegotiationState()
     comp = Competitor("B", "Other", 2450)
     first = step(r, s, 2900, comp)

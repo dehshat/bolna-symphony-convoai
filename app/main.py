@@ -48,7 +48,8 @@ async def auto_provision_bolna() -> None:
         BOLNA_SYNC.update(state="ok" if not partial else "partial",
                           detail="Agents ready" if not partial else f"Some languages failed: {partial}",
                           agents=result["agents"])
-        log.info("Bolna agents ready: %s", result["agents"])
+        log.info("Bolna agents ready: %s (LLM %s%s)", result["agents"], result["llm"]["model"],
+                 f"; {'; '.join(result['llm']['notes'])}" if result["llm"]["notes"] else "")
     except Exception as exc:  # never block the app from booting
         BOLNA_SYNC.update(state="error", detail=str(exc)[:600])
         log.warning("Bolna auto-provisioning failed: %s", exc)
@@ -332,7 +333,8 @@ async def lock_winner(session_id: str, body: LockBody) -> dict:
         payment = await payments.create_payment_link(session_id, result["leg_id"], result["vendor_name"],
                                                      result["price"], session.request.summary)
     text = payments.deal_summary(session.request.to_dict(), result["vendor_name"], result["price"], payment,
-                                 session.public().get("savings_vs_worst_first_quote"), result.get("slot", ""))
+                                 session.public().get("savings_vs_worst_first_quote"), result.get("slot", ""),
+                                 result.get("excluded"), result.get("details"))
     whatsapp = await payments.whatsapp_summary(text)
     await state.engine.attach(session_id, payment=payment, whatsapp=whatsapp)
     await state.orchestrator.on_lock(session_id, result["leg_id"])

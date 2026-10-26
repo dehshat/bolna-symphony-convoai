@@ -365,7 +365,37 @@ def test_llm_falls_back_when_bolna_rejects_it(monkeypatch):
     monkeypatch.setattr(bolna_client.BolnaClient, "create_agent", fake_create)
     config.settings.bolna_api_key = "bn-test"
     result = asyncio.run(bolna_client.sync_agents(["hi"], "https://x.onrender.com"))
-    assert sent == ["gpt-5.4-mini", "gpt-4.1-mini"] and result["agents"] == {"hi": "agent-hi"}
+    # Steps down one model at a time (the full gpt-4.1 before the mini) and reports why
+    assert sent == ["gpt-5.4-mini", "gpt-4.1"] and result["agents"] == {"hi": "agent-hi"}
+    assert result["llm"]["model"] == "gpt-4.1" and "not enabled for this account" in result["llm"]["notes"][0]
+
+
+def test_reasoning_setting_rejection_keeps_the_better_model(monkeypatch):
+    sent = []
+
+    async def fake_list(self):
+        return []
+
+    async def fake_create(self, payload):
+        llm_cfg = payload["agent_config"]["tasks"][0]["tools_config"]["llm_agent"]["llm_config"]
+        sent.append(dict(llm_cfg))
+        if "reasoning_effort" in llm_cfg:
+            raise bolna_client.BolnaError("Bolna POST /v2/agent -> 422: reasoning_effort 'none' is not supported "
+                                          "for model 'gpt-5.4-mini'.")
+        return {"agent_id": "agent-hi"}
+
+    monkeypatch.setattr(bolna_client.BolnaClient, "list_agents", fake_list)
+    monkeypatch.setattr(bolna_client.BolnaClient, "create_agent", fake_create)
+    config.settings.bolna_api_key = "bn-test"
+    result = asyncio.run(bolna_client.sync_agents(["hi"], "https://x.onrender.com"))
+    assert [c["model"] for c in sent] == ["gpt-5.4-mini", "gpt-5.4-mini"]
+    assert result["llm"]["model"] == "gpt-5.4-mini" and "verbosity" not in sent[-1]
+
+
+def test_unrelated_bolna_errors_never_downgrade_the_llm():
+    payload = bolna_client.build_agent_payload("hi")
+    assert bolna_client._adapt_payload(payload, "Bolna PUT -> 400: synthesizer voice 'x' is invalid") is None
+    assert payload["agent_config"]["tasks"][0]["tools_config"]["llm_agent"]["llm_config"]["model"] == "gpt-5.4-mini"
 
 
 def test_language_errors_do_not_downgrade_the_llm(monkeypatch):
