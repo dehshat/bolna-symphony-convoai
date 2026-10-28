@@ -216,8 +216,9 @@ def llm_config(model: str) -> dict:
     cfg: dict = {"provider": s.bolna_llm_provider, "family": s.bolna_llm_provider, "model": model,
                  "max_tokens": 200, "temperature": 0.2, "request_json": False}
     if model.startswith(("gpt-5", "gpt-6")):
-        # Reasoning models fix temperature themselves; effort "none" = no thinking pause before speaking
-        cfg.pop("temperature")
+        # Bolna accepts only temperature 1 for GPT-5-series models and fills in 0.1 when it is left out, which
+        # fails agent creation with a 400. Effort "none" = no thinking pause before speaking.
+        cfg["temperature"] = 1
         if s.bolna_llm_reasoning_effort:
             cfg["reasoning_effort"] = s.bolna_llm_reasoning_effort
         if s.bolna_llm_verbosity:
@@ -371,8 +372,10 @@ class BolnaClient:
 
 _DEPRECATED_RE = re.compile(r"Model '([^']+)' is deprecated.*?Use '([^']+)' instead", re.S)
 # A complaint about one LLM setting, e.g. "reasoning_effort 'none' is not supported for model 'x'"
-_LLM_PARAM_RE = re.compile(r"(reasoning|verbosity)[^.\n]{0,80}(not|invalid|unsupported|extra|forbidden|permitted)|"
-                           r"(not|invalid|unsupported|extra)[^.\n]{0,80}(reasoning|verbosity)", re.I)
+_LLM_PARAM_RE = re.compile(r"(reasoning|verbosity)[^\n]{0,120}?(not|invalid|unsupported|extra|forbidden|permitted|"
+                           r"should be|must be|expected|enum)|(not|invalid|unsupported|extra)[^.\n]{0,80}"
+                           r"(reasoning|verbosity)", re.I)
+_TEMPERATURE_RE = re.compile(r"temperature", re.I)
 _LLM_ERROR_RE = re.compile(r"SimpleLlmAgent|llm_config|llm_agent|\bllm\b|invalid model|unsupported model|"
                            r"model[^.\n]{0,60}(not|unavailable|unsupported|access|allowed|plan)", re.I)
 _LANGUAGE_RE = re.compile(r"[Pp]rovided language:?\s*'?([A-Za-z-]+)'? is not available for the model:?\s*'?([\w:.\-]+)")
@@ -410,7 +413,13 @@ def _adapt_payload(payload: dict, error: str) -> Optional[str]:
             return f"{model} language {bad_lang} -> {slots[0]['language']}"
     llm = payload["agent_config"]["tasks"][0]["tools_config"]["llm_agent"]["llm_config"]
     model = str(llm.get("model", ""))
-    if _LLM_PARAM_RE.search(text):
+    if _TEMPERATURE_RE.search(text) and model.startswith(("gpt-5", "gpt-6")) and llm.get("temperature") != 1:
+        llm["temperature"] = 1   # GPT-5 models take only temperature 1 on Bolna
+        return f"{model} with temperature 1"
+    if _LLM_PARAM_RE.search(text) and llm.get("reasoning_effort") not in (None, "low") and \
+            re.search(r"reasoning", text, re.I):
+        llm["reasoning_effort"] = "low"   # every GPT-5.x model and every Bolna version accepts "low"
+        return f"{model} with reasoning_effort low"
         # Keep the better model; only drop the setting Bolna objected to (it then uses its own lowest-latency default)
         dropped = [k for k in ("reasoning_effort", "verbosity") if llm.pop(k, None) is not None]
         if dropped:

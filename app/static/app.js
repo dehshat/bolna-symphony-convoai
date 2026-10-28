@@ -558,7 +558,7 @@
     }
     const mockUpi = p.provider === "mock" ? `
       <div class="upi"><div class="qr" aria-hidden="true"></div>
-        <div><b>Razorpay Test Checkout (mock)</b><div style="font-size:12px">Test mode · no real money moves<br>Amount ${inr(p.amount)}${p.error ? `<br><span style="color:#b91c1c">${esc(p.error)}</span>` : ""}</div></div></div>` : "";
+        <div><b>Razorpay Test Checkout (mock)</b><div style="font-size:12px">Test mode · no real money moves<br>Amount ${inr(p.amount)}${p.error ? `<br><span style="color:#c2413a">${esc(p.error)}</span>` : ""}</div></div></div>` : "";
     $("#lmBody").innerHTML = `
       <div class="deal">
         <div class="muted small">${esc(session.request.summary)}</div>

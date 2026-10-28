@@ -343,7 +343,7 @@ def test_agent_uses_fast_modern_llm():
     llm_cfg = bolna_client.build_agent_payload("hi")["agent_config"]["tasks"][0]["tools_config"]["llm_agent"]["llm_config"]
     assert llm_cfg["model"] == "gpt-5.4-mini"
     assert llm_cfg["reasoning_effort"] == "none" and llm_cfg["verbosity"] == "low"
-    assert "temperature" not in llm_cfg  # reasoning models fix their own temperature
+    assert llm_cfg["temperature"] == 1  # Bolna takes only 1 for GPT-5 models; omitted means 0.1 and a 400
 
 
 def test_llm_falls_back_when_bolna_rejects_it(monkeypatch):
@@ -379,7 +379,7 @@ def test_reasoning_setting_rejection_keeps_the_better_model(monkeypatch):
     async def fake_create(self, payload):
         llm_cfg = payload["agent_config"]["tasks"][0]["tools_config"]["llm_agent"]["llm_config"]
         sent.append(dict(llm_cfg))
-        if "reasoning_effort" in llm_cfg:
+        if llm_cfg.get("reasoning_effort") == "none":
             raise bolna_client.BolnaError("Bolna POST /v2/agent -> 422: reasoning_effort 'none' is not supported "
                                           "for model 'gpt-5.4-mini'.")
         return {"agent_id": "agent-hi"}
@@ -388,8 +388,34 @@ def test_reasoning_setting_rejection_keeps_the_better_model(monkeypatch):
     monkeypatch.setattr(bolna_client.BolnaClient, "create_agent", fake_create)
     config.settings.bolna_api_key = "bn-test"
     result = asyncio.run(bolna_client.sync_agents(["hi"], "https://x.onrender.com"))
+    # Keeps the model and steps the effort to "low" (accepted everywhere) instead of downgrading the model
     assert [c["model"] for c in sent] == ["gpt-5.4-mini", "gpt-5.4-mini"]
-    assert result["llm"]["model"] == "gpt-5.4-mini" and "verbosity" not in sent[-1]
+    assert result["llm"]["model"] == "gpt-5.4-mini" and sent[-1]["reasoning_effort"] == "low"
+
+
+def test_temperature_rejection_is_repaired_without_downgrading(monkeypatch):
+    sent = []
+
+    async def fake_list(self):
+        return []
+
+    async def fake_create(self, payload):
+        llm_cfg = payload["agent_config"]["tasks"][0]["tools_config"]["llm_agent"]["llm_config"]
+        sent.append(dict(llm_cfg))
+        if llm_cfg.get("temperature") != 1:
+            raise bolna_client.BolnaError('Bolna POST /v2/agent -> 400: {"detail":"Unsupported value: '
+                                          "'temperature' does not support 0.1 with this model. Only the default (1) "
+                                          'value is supported."}')
+        return {"agent_id": "agent-hi"}
+
+    monkeypatch.setattr(bolna_client.BolnaClient, "list_agents", fake_list)
+    monkeypatch.setattr(bolna_client.BolnaClient, "create_agent", fake_create)
+    monkeypatch.setattr(bolna_client, "llm_config", lambda m, _orig=bolna_client.llm_config: {
+        **_orig(m), "temperature": 0.1})   # what the old payload effectively sent
+    config.settings.bolna_api_key = "bn-test"
+    result = asyncio.run(bolna_client.sync_agents(["hi"], "https://x.onrender.com"))
+    assert [c["model"] for c in sent] == ["gpt-5.4-mini", "gpt-5.4-mini"]
+    assert sent[-1]["temperature"] == 1 and result["llm"]["model"] == "gpt-5.4-mini"
 
 
 def test_unrelated_bolna_errors_never_downgrade_the_llm():
