@@ -94,6 +94,10 @@ class Settings:
     # What the last agent sync actually ended up using, and why (shown in ⚙︎ Setup)
     bolna_llm_active: str = ""
     bolna_llm_note: str = ""
+    # Per-device hourly limits on what costs money (0 = off): map searches, real-call sessions, chat messages
+    rate_limit_search: int = field(default_factory=lambda: _int("RATE_LIMIT_SEARCH_PER_HOUR", 60))
+    rate_limit_calls: int = field(default_factory=lambda: _int("RATE_LIMIT_CALLS_PER_HOUR", 20))
+    rate_limit_chat: int = field(default_factory=lambda: _int("RATE_LIMIT_CHAT_PER_HOUR", 300))
     # Counter-offers per call before taking the vendor's best price (or walking away above the ceiling)
     max_counter_rounds: int = field(default_factory=lambda: max(0, _int("MAX_COUNTER_ROUNDS", 1)))
     bolna_agent_languages: str = field(default_factory=lambda: os.getenv("BOLNA_AGENT_LANGUAGES", "hi,kn"))

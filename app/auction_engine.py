@@ -19,9 +19,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
-from app.negotiation import Competitor, Decision, LegNegotiationState, decide
-from app.pricing import (NormalizedQuote, ServiceRequest, format_inr, merge_charges, normalize_quote, parse_extras,
-                         parse_inr)
+from app.negotiation import Competitor, Decision, LegNegotiationState, classify_situation, decide
+from app.pricing import (NormalizedQuote, ServiceRequest, category_rules, charge_kind, format_inr, merge_charges,
+                         normalize_quote, parse_extras, parse_inr, parse_range)
 
 _EMPTY = {"", "none", "unknown", "na", "n/a", "null", "nothing", "no", "-"}
 
@@ -54,7 +54,15 @@ ACTION_TO_STATUS = {
     "HOLD_SLOT": LegStatus.HOLD,
     "BOOKING_OVER_BUDGET": LegStatus.ENDED,
     "WON_BOOKING": LegStatus.WON,
+    "CALL_BACK": LegStatus.ENDED,
+    "INSPECTION_HOLD": LegStatus.HOLD,
 }
+# The call is wrapped up after these; a later status check must not replay the closing line
+CLOSED_ACTIONS = {"ACCEPT_HOLD", "FINAL_HOLD", "WALK_AWAY", "NOT_AVAILABLE", "HOLD_SLOT", "BOOKING_OVER_BUDGET",
+                  "CALL_BACK", "INSPECTION_HOLD", "RELEASE", "WON", "WON_BOOKING"}
+RETRY_WINDOW = 20.0   # seconds: an identical tool call inside this window is Bolna retrying, not the vendor
+TOOL_KEYS = ("vendor_said", "price", "pricing_model", "toll", "driver_bata", "other_charges", "extras", "notes",
+             "availability", "slot", "situation")
 
 
 class GuardrailViolation(Exception):
@@ -92,6 +100,7 @@ class Leg:
     confirm_execution_id: Optional[str] = None    # follow-up confirmation call to the winner
     extras: list = field(default_factory=list)    # every extra the vendor mentioned: {item, status, amount, kind}
     details: list = field(default_factory=list)   # everything else useful they said (timing, warranty, terms…)
+    last_tool: Optional[tuple] = None             # (args key, monotonic time, response) to answer retries
 
     def excluded_items(self) -> list[dict]:
         """Billed separately, outside the budget: what the vendor itemized, plus structured ones not covered."""
@@ -135,6 +144,8 @@ class Leg:
             "excluded": self.excluded_items(),
             "extras": self.extras[-12:],
             "details": self.details[-12:],
+            "inspection": self.neg.inspection,
+            "inspection_fee": self.neg.inspection_fee,
         }
 
 
@@ -350,6 +361,9 @@ class AuctionEngine:
             leg = session.legs.get(leg_id)
             if leg is None:
                 raise KeyError(f"unknown leg {leg_id}")
+            key = tuple(str(args.get(k, "")).strip().lower() for k in TOOL_KEYS)
+            if leg.last_tool and leg.last_tool[0] == key and time.monotonic() - leg.last_tool[1] < RETRY_WINDOW:
+                return {**leg.last_tool[2], "duplicate": True}   # Bolna retried the call: same answer, no new round
             req = session.request
             said = str(args.get("vendor_said") or "").strip()
             self._say(session, leg, "vendor", said)
@@ -368,13 +382,53 @@ class AuctionEngine:
             if note.lower().strip(" .") not in _EMPTY and note not in leg.details:
                 leg.details.append(note[:200])
             new_charges = {k: args.get(k) for k in ("toll", "driver_bata", "other_charges") if k in args}
+            charges_before = dict(leg.charges)
             leg.charges = merge_charges(leg.charges, new_charges)
             price = args.get("price")
             model = args.get("pricing_model") or "flat"
+            # A range ("500 to 700, depends") is planned at its top end: the buyer must not be surprised upwards
+            said_range = parse_range(said)
+            rng = parse_range(price) or (said_range if said_range and parse_inr(price) in (None, said_range[0])
+                                         else None)
+            if rng:
+                price = rng[1]
+                note = f"Quoted a range {format_inr(rng[0])}–{format_inr(rng[1])} (planned at {format_inr(rng[1])})"
+                if note not in leg.details:
+                    leg.details.append(note)
+            situation = classify_situation(said, str(args.get("situation") or ""), bool(parse_inr(price)))
+            if leg.last_action in CLOSED_ACTIONS and not parse_inr(price) and session.locked_leg_id is None \
+                    and situation in {"accepts_offer", "other", "quoting"}:
+                # "Okay, WhatsApp kar dena" after we've wrapped up: nothing to decide, don't replay the closing line
+                session.state_version += 1
+                response = {"ok": True, "action": "NO_UPDATE", "say_this": "", "end_call": True,
+                            "instruction": "You have already wrapped up with this vendor. Thank them briefly and "
+                                           "end the call.", "state_version": session.state_version}
+                leg.last_tool = (key, time.monotonic(), response)
+                return response
+            bata = leg.charges.get("driver_bata")
+            if bata is not None and bata.status == "extra" and bata.amount and req.category != "cab_outstation":
+                leg.neg.inspection_fee = bata.amount   # the visiting/inspection charge they named
             quote: Optional[NormalizedQuote] = None
             if parse_inr(price):
                 quote = normalize_quote(req, price, model, leg.charges, said)
                 leg.last_stated, leg.last_pricing_model = price, quote.pricing_model
+            elif situation == "accepts_offer" and leg.neg.last_counter is not None and req.goal == "negotiate":
+                # "Okay, done" to our counter without repeating it: the deal is our counter, all-inclusive
+                # Charges known before our all-inclusive counter are inside it; one raised in this very reply
+                # ("okay, but visiting 100 extra") is added on top. Parts billed at actuals stay excluded.
+                rules = category_rules(req.category)
+
+                def raised_now(k: str, c) -> bool:
+                    old = charges_before.get(k)
+                    return c.status == "extra" and (old is None or (old.status, old.amount) != (c.status, c.amount))
+
+                agreed = {k: (c if charge_kind(k, c, rules) == "excluded" or raised_now(k, c)
+                              else "included" if c.status in {"unknown", "extra"} else c)
+                          for k, c in leg.charges.items()}
+                quote = normalize_quote(req, leg.neg.last_counter, "flat", agreed, said)
+                quote.ask_items, quote.unknown_items, quote.status = [], [], "VALID"
+                leg.neg.best_all_in = None   # the agreed counter replaces the earlier, higher number
+                leg.last_stated, leg.last_pricing_model = leg.neg.last_counter, "flat"
             elif leg.last_stated is not None:
                 # Vendor answered an inclusion question without repeating the price
                 quote = normalize_quote(req, leg.last_stated, leg.last_pricing_model, leg.charges, said)
@@ -405,10 +459,13 @@ class AuctionEngine:
             decision = decide(req, leg.neg, quote, competitor, leg.language, session.locked_leg_id, leg_id,
                               previous_best=previous_best, raised_price=raised, available=available,
                               explain_unit=bool(parse_inr(price)) and quote is not None,
-                              excluded=[e["item"] for e in leg.excluded_items()])
+                              excluded=[e["item"] for e in leg.excluded_items()], situation=situation)
+            if decision.action == "CALL_BACK" and "Asked to call back later" not in leg.details:
+                leg.details.append("Asked to call back later")
             self._apply_decision(session, leg, decision)
             event.update(self._decision_event(session, leg, decision, quote))
             response = self._tool_response(session, leg, decision, quote, competitor)  # snapshot under the lock
+            leg.last_tool = (key, time.monotonic(), response)
         await self._emit(session, event)
         return response
 
@@ -418,7 +475,13 @@ class AuctionEngine:
         async with self.lock_for(session_id):
             leg = session.legs[leg_id]
             competitor = session.current_best(exclude=leg_id)
-            if session.locked_leg_id is None and leg.last_quote is None and competitor is None:
+            closed = leg.last_action in CLOSED_ACTIONS and (
+                session.locked_leg_id is None or leg.last_action in {"RELEASE", "WON", "WON_BOOKING"})
+            if closed:
+                decision = Decision(action="NO_UPDATE", say="",
+                                    instruction="Nothing new: you have already wrapped up with this vendor. Do not "
+                                                "repeat the offer. Thank them briefly and end the call.")
+            elif session.locked_leg_id is None and leg.last_quote is None and competitor is None:
                 decision = Decision(action="NO_UPDATE", say="",
                                     instruction="No competing quotes yet. Ask the vendor for their best "
                                                 "all-inclusive price and call submit_and_counter when they say it.")
@@ -429,7 +492,7 @@ class AuctionEngine:
                                                 "call submit_and_counter with what they say.")
             else:
                 decision = decide(session.request, leg.neg, leg.last_quote, competitor, leg.language,
-                                  session.locked_leg_id, leg_id)
+                                  session.locked_leg_id, leg_id, excluded=[e["item"] for e in leg.excluded_items()])
             event = {"type": "status_check", **self._decision_event(session, leg, decision, leg.last_quote)}
             if decision.action != "NO_UPDATE":
                 self._apply_decision(session, leg, decision)
@@ -512,6 +575,8 @@ class AuctionEngine:
                 if not leg.neg.slot:
                     raise GuardrailViolation("this provider hasn't offered a slot yet")
                 price = price or 0
+            elif price is None and leg.neg.inspection_fee:
+                price = leg.neg.inspection_fee   # visit booked; the work is priced on site
             elif price is None:
                 raise GuardrailViolation("this vendor has not given a usable quote yet")
             if req.has_budget and price > req.walkaway_ceiling:

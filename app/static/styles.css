@@ -278,3 +278,8 @@ dialog::backdrop { background: rgba(3, 6, 12, .7); backdrop-filter: blur(3px); }
   .pbox .v { font-size: 20px; }
   .transcript { max-height: 460px; }
 }
+
+.tester { margin-top: 12px; }
+.tester summary { cursor: pointer; font-weight: 700; }
+.tester ol { padding-left: 18px; margin: 6px 0; }
+.tester li { margin: 4px 0; }

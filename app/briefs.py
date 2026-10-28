@@ -99,7 +99,19 @@ WHEN_WORDS = {
     "next": {"kn": "mundina", "hi": "agle", "ta": "adutha", "mr": "pudhchya"},
     "this": {"kn": "ee", "hi": "is", "ta": "indha", "mr": "ya"},
     "weekend": {"kn": "weekend", "hi": "weekend", "ta": "weekend", "mr": "weekend"},
+    "morning": {"kn": "beligge", "hi": "subah", "ta": "kaalaila", "mr": "sakali"},
+    "evening": {"kn": "sanje", "hi": "shaam", "ta": "saayangaalam", "mr": "sandhyakali"},
+    "afternoon": {"kn": "madhyaahna", "hi": "dopahar", "ta": "madhiyam", "mr": "dupari"},
+    "night": {"kn": "raatri", "hi": "raat", "ta": "raathiri", "mr": "raatri"},
 }
+# "from Monday" -> "somvaar se": the postposition goes after the day in Indian languages
+FROM_SUFFIX = {"kn": "inda", "hi": "se", "ta": "la irundhu", "mr": "pasun"}
+NATIVE_FROM_SUFFIX = {"hi": "से", "kn": "ಇಂದ"}
+
+
+def _split_from(text: str) -> tuple[str, bool]:
+    m = re.match(r"^\s*(?:starting\s+)?from\s+(.+)$", text or "", re.I)
+    return (m.group(1), True) if m else (text, False)
 
 
 def localize_when(when: str, language: str) -> str:
@@ -107,20 +119,24 @@ def localize_when(when: str, language: str) -> str:
     text = (when or "").strip() or "tomorrow"
     if language == "en":
         return text
+    text, starts = _split_from(text)
     text = re.sub(r"(\d{1,2}):00", r"\1", text)
     text = re.sub(r"\b(\d{1,2})\s*am\b", r"\1 AM", text, flags=re.I)
     text = re.sub(r"\b(\d{1,2})\s*pm\b", r"\1 PM", text, flags=re.I)
     out = []
     for word in re.split(r"(\s+|,)", text):
         out.append(WHEN_WORDS.get(word.lower(), {}).get(language, word))
-    return "".join(out).replace(",", "").strip()
+    text = "".join(out).replace(",", "").strip()
+    return f"{text} {FROM_SUFFIX.get(language, 'from')}" if starts else text
 
 
 NATIVE_WHEN = {
     "hi": {"tomorrow": "कल", "today": "आज", "tonight": "आज रात", "asap": "जल्दी", "saturday": "शनिवार",
+           "afternoon": "दोपहर", "night": "रात",
            "sunday": "रविवार", "morning": "सुबह", "evening": "शाम", "monday": "सोमवार", "tuesday": "मंगलवार",
            "wednesday": "बुधवार", "thursday": "गुरुवार", "friday": "शुक्रवार", "next": "अगले", "this": "इस"},
     "kn": {"tomorrow": "ನಾಳೆ", "today": "ಇವತ್ತು", "tonight": "ಇವತ್ತು ರಾತ್ರಿ", "asap": "ಬೇಗ", "saturday": "ಶನಿವಾರ",
+           "afternoon": "ಮಧ್ಯಾಹ್ನ", "night": "ರಾತ್ರಿ",
            "sunday": "ಭಾನುವಾರ", "morning": "ಬೆಳಿಗ್ಗೆ", "evening": "ಸಂಜೆ", "monday": "ಸೋಮವಾರ", "tuesday": "ಮಂಗಳವಾರ",
            "wednesday": "ಬುಧವಾರ", "thursday": "ಗುರುವಾರ", "friday": "ಶುಕ್ರವಾರ", "next": "ಮುಂದಿನ", "this": "ಈ"},
 }
@@ -129,7 +145,7 @@ NATIVE_WHEN = {
 def native_when(when: str, language: str) -> str:
     """'Tomorrow 6:00 AM' -> 'कल सुबह 6 बजे' / 'ನಾಳೆ ಬೆಳಿಗ್ಗೆ 6 ಗಂಟೆಗೆ' so Sarvam's TTS reads it naturally."""
     words = NATIVE_WHEN[language]
-    text = (when or "tomorrow").strip()
+    text, starts = _split_from((when or "tomorrow").strip())
 
     def clock(m: re.Match) -> str:
         hour, ampm = int(m.group(1)), (m.group(3) or "").lower()
@@ -139,7 +155,8 @@ def native_when(when: str, language: str) -> str:
 
     text = re.sub(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", clock, text, flags=re.I)
     out = [words.get(w.lower(), w) for w in re.split(r"(\s+|,)", text)]
-    return "".join(out).replace(",", "").strip()
+    text = "".join(out).replace(",", "").strip()
+    return f"{text} {NATIVE_FROM_SUFFIX[language]}" if starts else text
 
 
 def opening_line(req: ServiceRequest, language: str, native: bool = False) -> str:
@@ -147,7 +164,8 @@ def opening_line(req: ServiceRequest, language: str, native: bool = False) -> st
 
     native=True gives Devanagari/Kannada script for live calls (Sarvam pronounces it far better than
     romanized text); the romanized version stays for the on-screen simulation."""
-    if req.category not in LEGACY_OPENINGS:
+    route_missing = req.category in {"cab_outstation", "mini_truck"} and not (req.pickup and req.drop)
+    if req.category not in LEGACY_OPENINGS or req.details or route_missing:
         return generic_opening(req, language, native)
     if native and language in NATIVE_WHEN:
         return _native_opening(req, language)
@@ -177,6 +195,16 @@ def opening_line(req: ServiceRequest, language: str, native: bool = False) -> st
 LEGACY_OPENINGS = ("cab_outstation", "mini_truck", "ac_repair")
 
 
+OR_WORD = {"hi": "ya", "kn": "athava", "ta": "illa", "mr": "kinva", "en": "or"}
+AND_WORD = {"hi": "aur", "kn": "mattu", "ta": "matrum", "mr": "ani", "en": "and"}
+
+
+def spoken(label: str, language: str) -> str:
+    """'AC repair / service' -> 'AC repair ya service': the opening is read verbatim by the TTS."""
+    label = re.sub(r"\s*&\s*", f" {AND_WORD.get(language, 'and')} ", label or "")
+    return re.sub(r"\s*/\s*", f" {OR_WORD.get(language, 'or')} ", label).strip()
+
+
 def _short(text: str, limit: int = 70) -> str:
     text = re.sub(r"\s+", " ", text or "").strip(" .")
     return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0]
@@ -184,9 +212,13 @@ def _short(text: str, limit: int = 70) -> str:
 
 def generic_opening(req: ServiceRequest, language: str, native: bool = False) -> str:
     """Any service: lead with the concrete job, the place and the time. Appointments ask for a slot."""
-    service = req.service_label or "service"
+    service = spoken(req.service_label or "service", language)
     place = (req.location or req.pickup or "").split(",")[0] or "Bengaluru"
     detail = _short(req.details)
+    pickup, drop = (req.pickup or "").split(",")[0].strip(), (req.drop or "").split(",")[0].strip()
+    if pickup and drop:
+        # Cabs, movers, courier: the route is the job ("JP Nagar se Mysuru")
+        return _route_opening(service, pickup, drop, detail, req, language, native)
     if native and language in NATIVE_WHEN:
         when = native_when(req.when, language)
         if language == "hi":
@@ -209,6 +241,22 @@ def generic_opening(req: ServiceRequest, language: str, native: bool = False) ->
         "kn": f"Namaskara, {when} {place} alli {service} bekittu{d}. Neevu madtira?",
         "ta": f"Vanakkam, {when} {place} la {service} venum{d}. Neenga panna mudiyuma?",
     }.get(language, f"Hello, I need a {service} in {place} {when}{d}. Can you take it up?")
+
+
+def _route_opening(service: str, pickup: str, drop: str, detail: str, req: ServiceRequest, language: str,
+                   native: bool) -> str:
+    if native and language in NATIVE_WHEN:
+        when = native_when(req.when, language)
+        if language == "hi":
+            return f"नमस्ते भैया, {when} {pickup} से {drop} के लिए {service} चाहिए{', ' + detail if detail else ''}। मिल जाएगा?"
+        return f"ನಮಸ್ಕಾರ ಅಣ್ಣ, {when} {pickup} ಇಂದ {drop} ಗೆ {service} ಬೇಕಿತ್ತು{', ' + detail if detail else ''}. ಸಿಗುತ್ತಾ?"
+    when = localize_when(req.when, language)
+    d = f", {detail}" if detail else ""
+    return {
+        "hi": f"Namaste bhaiya, {when} {pickup} se {drop} ke liye {service} chahiye{d}. Mil jayega?",
+        "kn": f"Namaskara anna, {when} {pickup} inda {drop} ge {service} bekittu{d}. Sigutta?",
+        "ta": f"Vanakkam anna, {when} {pickup} la irundhu {drop} ku {service} venum{d}. Kidaikuma?",
+    }.get(language, f"Hello, I need a {service} {when} from {pickup} to {drop}{d}. Is one available?")
 
 
 GENERIC_STYLES = (

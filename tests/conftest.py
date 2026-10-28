@@ -20,6 +20,8 @@ from app import config  # noqa: E402
 @pytest.fixture(autouse=True)
 def fresh_state(monkeypatch):
     config.reload_settings()
-    from app import state
+    from app import places, ratelimit, state
     state.reset(":memory:")
+    places._cache.clear()
+    ratelimit.reset()
     yield state

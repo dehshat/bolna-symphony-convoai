@@ -60,6 +60,21 @@ _K_RE = re.compile(r"(\d+(?:\.\d+)?)\s*k\b", re.I)
 _DIGIT_RE = re.compile(r"\d+(?:\.\d+)?")
 
 
+def parse_range(value: Any) -> Optional[tuple[int, int]]:
+    """'500-700', '500 to 700', '5 se 7 sau'... -> (500, 700). None when it's a single amount."""
+    if value is None or isinstance(value, (int, float)):
+        return None
+    m = _RANGE_RE.search(_CURRENCY_RE.sub(" ", str(value)))
+    if not m:
+        return None
+    low, high = parse_inr(m.group(1)), parse_inr(m.group(2))
+    if not low or not high or high <= low:
+        return None
+    if high >= 100 and low < 20 and high / low >= 50:
+        return None  # "18 to 2000" is not a range anyone quotes
+    return low, high
+
+
 def parse_inr(value: Any) -> Optional[int]:
     """Parse a rupee amount from a number or a multilingual spoken phrase. Returns None if no amount.
 
@@ -167,6 +182,7 @@ CATEGORIES = {
 }
 
 PRICING_MODELS = {"flat", "per_km", "per_hour", "per_day", "per_month", "per_visit"}
+WORKING_DAYS = 26   # a month of daily domestic work (cook, maid) with weekly offs
 
 # Things billed at actuals (materials, parts, groceries, medicines…). They aren't the price of the job, so they are
 # listed as "excluded, pay separately" and never added to the all-inclusive price or held against the budget.
@@ -276,6 +292,8 @@ _INCLUDED_RE = re.compile(r"\b(incl\w*|shamil|sahit|serisi|sersi|yes|haan|han|al
                           r"include)\b", re.I)
 _EXTRA_RE = re.compile(r"(not\s+incl\w*|exclud\w*|\bextra\b|\balag\b|\bseparate\w*\b|\bno\b|\bnahi\b|"
                        r"\bnahin\b|\bbere\b|\billa\b|\bactuals?\b)", re.I)
+_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:%|percent|per\s*cent|pratishat)", re.I)
+_RANGE_RE = re.compile(r"(\d[\d,.]*\s*k?)\s*(?:-|–|to|se|till|tak|ya|or|inda|ilinda)\s*(\d[\d,.]*\s*k?)\b", re.I)
 _NA_RE = re.compile(r"^(na|n/a|not applicable|none|nil|zero|0|free|no charge)$", re.I)
 
 
@@ -284,6 +302,7 @@ class ChargeItem:
     status: str = "unknown"  # included | extra | na | unknown
     amount: Optional[int] = None
     note: str = ""           # what was said, e.g. "gas refill extra 1500"
+    pct: Optional[float] = None   # "GST 18% extra": a share of the job price, worked out in normalize_quote
 
     @property
     def resolved(self) -> bool:
@@ -298,7 +317,7 @@ def parse_charge(value: Any) -> ChargeItem:
         return value
     if isinstance(value, dict):
         return ChargeItem(status=str(value.get("status", "unknown")), amount=value.get("amount"),
-                          note=str(value.get("note") or ""))
+                          note=str(value.get("note") or ""), pct=value.get("pct"))
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return ChargeItem("extra", int(value)) if value > 0 else ChargeItem("na")
     text = str(value).strip()
@@ -306,8 +325,11 @@ def parse_charge(value: Any) -> ChargeItem:
         return ChargeItem()
     if _NA_RE.match(text):
         return ChargeItem("na")
-    amount = parse_inr(re.sub(r"\b(extra|alag|separate|plus)\b", " ", text, flags=re.I))
     note = text[:80]
+    pct = _PCT_RE.search(text)
+    if pct and not _NOTHING_EXTRA_RE.search(text) and not (_INCLUDED_RE.search(text) and not _EXTRA_RE.search(text)):
+        return ChargeItem("extra", None, note, float(pct.group(1)))
+    amount = parse_inr(re.sub(r"\b(extra|alag|separate|plus)\b", " ", text, flags=re.I))
     if _NOTHING_EXTRA_RE.search(text):
         return ChargeItem("included", note=note)
     if _EXTRA_RE.search(text):
@@ -322,6 +344,18 @@ def parse_charge(value: Any) -> ChargeItem:
 _ITEM_NOISE_RE = re.compile(r"(₹|\brs\.?|\brupees?\b|\d[\d,.]*\s*k?\b|\b(?:is|are|will be|hoga|lagega|extra|alag|"
                             r"separate\w*|included|include|incl|shamil|plus|at|actuals?|charges?|cost|only|be|"
                             r"not|bhi|aur|and)\b)", re.I)
+
+
+def _item_name(note: str, fallback: str) -> str:
+    """'GST 18% extra' -> 'GST 18%'; 'extra 400' -> fallback (the slot's own label)."""
+    if not note or not (EXCLUDED_ITEM_RE.search(note) or ADDON_RE.search(note)):
+        return fallback
+    pct = _PCT_RE.search(note)
+    name = _ITEM_NOISE_RE.sub(" ", note.replace(pct.group(0), "") if pct else note)
+    name = re.sub(r"\s+", " ", name).strip(" .:-%")
+    if not name:
+        return fallback
+    return f"{name} {pct.group(1)}%" if pct else name[:40]
 
 
 def parse_extras(text: Any) -> list[dict]:
@@ -352,7 +386,11 @@ def parse_extras(text: Any) -> list[dict]:
 
 def detect_pricing_model(value: Any, said: str = "") -> str:
     text = f"{value or ''} {said or ''}".lower()
-    v = str(value or "").strip().lower()
+    v = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    v = {"total": "flat", "fixed": "flat", "lumpsum": "flat", "lump_sum": "flat", "one_time": "flat",
+         "monthly": "per_month", "month": "per_month", "daily": "per_day", "day": "per_day", "hourly": "per_hour",
+         "hour": "per_hour", "km": "per_km", "per_kilometre": "per_km", "per_kilometer": "per_km",
+         "visit": "per_visit", "per_session": "per_visit", "per_class": "per_visit"}.get(v, v)
     if v in PRICING_MODELS:
         return v
     if re.search(r"(per\s*km|/\s*km|km\s*ka|kilomet|ondu km|km ge|kilo meter)", text):
@@ -398,7 +436,10 @@ class NormalizedQuote:
 def normalize_quote(req: ServiceRequest, price: Any, pricing_model: Any = "flat",
                     charges: Optional[dict] = None, said: str = "") -> NormalizedQuote:
     """Turn a raw spoken quote into an all-inclusive trip price with explicit components."""
+    from app import services  # local import: services has no dependency on pricing
     rules = category_rules(req.category)
+    svc = services.get(req.category)
+    service_unit = svc.unit
     model = detect_pricing_model(pricing_model, said)
     stated = parse_inr(price)
     charges = {k: parse_charge(v) for k, v in (charges or {}).items()}
@@ -418,6 +459,9 @@ def normalize_quote(req: ServiceRequest, price: Any, pricing_model: Any = "flat"
     elif model == "per_hour":
         base = stated * req.est_hours
         base_label = f"{format_inr(stated)}/hr × {req.est_hours:g} hr"
+    elif model == "per_day" and service_unit == "per_month":
+        base = stated * WORKING_DAYS * req.months   # daily rate for a monthly job (cook, maid): a month's work
+        base_label = f"{format_inr(stated)}/day × {WORKING_DAYS * req.months} days"
     elif model == "per_day":
         base = stated * req.days
         base_label = f"{format_inr(stated)}/day × {req.days} day"
@@ -434,10 +478,16 @@ def normalize_quote(req: ServiceRequest, price: Any, pricing_model: Any = "flat"
 
     # Plausibility: catch ASR / unit confusion before it reaches the negotiation math
     reason = ""
-    if model == "per_km" and stated > 200:
+    if service_unit == "per_month" and model in {"per_hour", "per_visit"}:
+        reason = "ask_monthly_total"   # "150 per hour" for a monthly maid: ask what the month comes to
+    elif service_unit == "flat" and model == "per_hour" and not svc.transport and req.category != "cab_outstation":
+        reason = "ask_job_total"       # "300 per hour" for a plumber: ask what the whole job comes to
+    elif model == "per_km" and stated > 200:
         reason = "per_km_rate_too_high"
-    elif req.has_budget and model == "flat" and stated < 0.3 * req.target_price:
+    elif req.has_budget and model == "flat" and stated < 0.3 * req.target_price and req.category == "cab_outstation":
         reason = "price_too_low_maybe_unit_rate"
+    elif req.has_budget and base < 0.3 * req.target_price:
+        reason = "price_too_low"   # "12" for a monthly cook: misheard, ask again
     elif req.has_budget and base > 5 * req.walkaway_ceiling:
         reason = "price_too_high_maybe_misheard"
     if reason:
@@ -450,7 +500,7 @@ def normalize_quote(req: ServiceRequest, price: Any, pricing_model: Any = "flat"
     all_in = base
     for key in items:
         item = charges[key]
-        label = rules["labels"][key]
+        label = _item_name(item.note, rules["labels"][key])
         if item.status in {"included", "na"}:
             continue
         if charge_kind(key, item, rules) == "excluded":
@@ -460,6 +510,9 @@ def normalize_quote(req: ServiceRequest, price: Any, pricing_model: Any = "flat"
             elif key in rules["required"]:
                 ask.append(key)
             continue
+        if item.status == "extra" and item.amount is None and item.pct:
+            item.amount = round_to(base * item.pct / 100, 1)
+            label = label if "%" in label else f"{label} {item.pct:g}%"
         if item.status == "extra" and item.amount is not None:
             amount = item.amount * (req.days if key == "driver_bata" and req.category == "cab_outstation"
                                     and item.amount <= 1000 else 1)

@@ -8,10 +8,13 @@ Leverage is truthful-only: a competitor price is cited only if another leg reall
 
 from __future__ import annotations
 
+import re
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 from app import config, services
+from app.briefs import localize_when, spoken
 from app.pricing import NormalizedQuote, ServiceRequest, category_rules, format_inr, round_down
 
 MAX_ROUNDS = 3   # hard upper bound; the per-call limit is MAX_COUNTER_ROUNDS (default 1: one fair counter, then close)
@@ -20,6 +23,7 @@ CONCESSION_CURVE = (0.25, 0.5, 0.75)
 CLOSE_ENOUGH = 0.05             # within 5% (min ₹50) of the target: accept, don't haggle over small change
 LEVERAGE_GAP = 50  # a leverage counter is always at least this much below the competitor quote
 
+JOINER = {"hi": " aur ", "kn": " mattu ", "ta": " matrum ", "mr": " ani "}
 LANGUAGE_NAMES = {"kn": "Kannada", "hi": "Hindi", "en": "English", "ta": "Tamil", "mr": "Marathi"}
 
 # Sarvam's TTS pronounces native script far better than romanized text ("ठीक है" vs "theek hai").
@@ -55,7 +59,7 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "RELEASE": "The customer has gone with another option. Thank you so much for your time!",
         "WON": "Good news, the customer confirmed you at {price}. Details and the UPI advance are coming on WhatsApp.",
         "REMINDER": "You had said {previous} earlier. ",
-        "UNIT_PREFIX": "{rate} per {unit} comes to about {total} for the full job. ",
+        "UNIT_PREFIX": "{rate} per {unit} comes to about {total} in all. ",
         "NOT_AVAILABLE": "No problem, thank you for your time!",
         "ASK_SLOT": "Do you have a slot {when}? If not, what's the earliest you can do?",
         "ASK_FEE": "{slot} works. What would the fee be, all-inclusive?",
@@ -64,6 +68,16 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "WON_BOOKING": "Good news, the customer confirms {slot}{fee_part}. Details are coming on WhatsApp.",
         "FEE_PART": ", fee {fee}",
         "EXCLUDED_NOTE": " {items} separately, as you said.",
+        "CLARIFY_price_too_low": "Sorry, {quoted}? Could you tell me the full amount once more?",
+        "ASK_ROUGH_ESTIMATE": "Understood. Roughly how much does a job like this usually cost, and what is the visiting charge?",
+        "INSPECTION_HOLD": "Okay, visiting charge {fee}, and the work price after you see it. I'll confirm with the customer and WhatsApp you in five minutes.",
+        "INSPECTION_HOLD_NOFEE": "Okay, you'll quote after seeing the work. I'll check with the customer and WhatsApp you in five minutes.",
+        "ESTIMATE_HOLD": "Okay, about {price} all together, final after you see the work. I'll confirm with the customer and WhatsApp you in five minutes.",
+        "CLARIFY_ask_monthly_total": "{quoted}, okay. What would the total per month come to?",
+        "CLARIFY_ask_job_total": "{quoted} per hour, okay. Roughly what would the whole job come to?",
+        "UNIT_PREFIX_MONTH": "{rate} per {unit} comes to about {total} a month. ",
+        "COUNTER_AT_BUDGET": "The customer's budget is {target}, all-inclusive. Can you do it within that?",
+        "CALL_BACK": "No problem, we'll call you back a little later. Thank you!",
     },
     "hi": {
         "ASK_VENDOR_FIRST": "Customer teen jagah rate check kar rahe hain. Aapka best rate kya hoga, sab milake?",
@@ -86,7 +100,7 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "RELEASE": "Customer ne doosra option le liya hai. Aapka time dene ke liye bahut shukriya!",
         "WON": "Badhai ho, customer ne aapko {price} pe confirm kiya hai. Details aur UPI advance WhatsApp pe aa rahe hain.",
         "REMINDER": "Aapne pehle {previous} bola tha. ",
-        "UNIT_PREFIX": "{rate} per {unit} matlab poore trip ka lagbhag {total}. ",
+        "UNIT_PREFIX": "{rate} per {unit} matlab kul milake lagbhag {total}. ",
         "NOT_AVAILABLE": "Koi baat nahi ji, shukriya!",
         "ASK_SLOT": "{when} ka koi slot milega? Nahi toh sabse jaldi kab ho sakta hai?",
         "ASK_FEE": "{slot} theek hai. Fees kitni hogi, sab milake?",
@@ -95,6 +109,16 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "WON_BOOKING": "Customer ne {slot} confirm kiya hai{fee_part}. Details WhatsApp pe aa rahe hain.",
         "FEE_PART": ", fees {fee}",
         "EXCLUDED_NOTE": " {items} alag se, jaisa aapne bataya.",
+        "CLARIFY_price_too_low": "Maaf kijiye, {quoted}? Poora amount ek baar phir bata dijiye.",
+        "ASK_ROUGH_ESTIMATE": "Samajh gaya ji. Is tarah ke kaam ka roughly kitna lagta hai, aur visiting charge kitna hai?",
+        "INSPECTION_HOLD": "Theek hai, visiting {fee}, aur kaam ka rate dekh ke. Customer se confirm karke paanch minute mein WhatsApp karta hoon.",
+        "INSPECTION_HOLD_NOFEE": "Theek hai, aap kaam dekh ke rate bataoge. Customer se baat karke paanch minute mein WhatsApp karta hoon.",
+        "ESTIMATE_HOLD": "Theek hai, lagbhag {price} sab milake, final kaam dekh ke. Customer se confirm karke paanch minute mein WhatsApp karta hoon.",
+        "CLARIFY_ask_monthly_total": "{quoted} theek hai. Toh mahine ka total kitna banega?",
+        "CLARIFY_ask_job_total": "{quoted} per hour theek hai. Poore kaam ka roughly kitna banega?",
+        "UNIT_PREFIX_MONTH": "{rate} per {unit} matlab mahine ka lagbhag {total}. ",
+        "COUNTER_AT_BUDGET": "Customer ka budget {target} hai, sab milake. Utne mein ho jayega?",
+        "CALL_BACK": "Koi baat nahi ji, thodi der baad call karte hain. Shukriya!",
     },
     "kn": {
         "ASK_VENDOR_FIRST": "Customer mooru kade rate nodtidare anna. Nimma best rate eshtu, ella serisi?",
@@ -117,7 +141,7 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "RELEASE": "Customer bere option aaykondidare anna. Nimma time ge tumba thanks!",
         "WON": "Olle suddi anna, customer nimmanna {price} ge confirm madidare. Details mattu UPI advance WhatsApp nalli bartide.",
         "REMINDER": "Neevu modlu {previous} helidri anna. ",
-        "UNIT_PREFIX": "{rate} per {unit} andre full trip ge sumaaru {total}. ",
+        "UNIT_PREFIX": "{rate} per {unit} andre ottu sumaaru {total}. ",
         "NOT_AVAILABLE": "Paravagilla anna, thanks!",
         "ASK_SLOT": "{when} slot sigutta? Illa andre bega yavaga aagutte?",
         "ASK_FEE": "{slot} sari. Fees eshtu aagutte, ella serisi?",
@@ -126,6 +150,16 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "WON_BOOKING": "Customer {slot} confirm madidare{fee_part}. Details WhatsApp nalli bartide.",
         "FEE_PART": ", fees {fee}",
         "EXCLUDED_NOTE": " {items} bere, neevu heliddu haage.",
+        "CLARIFY_price_too_low": "Sorry anna, {quoted}? Poorti amount innondsala heli.",
+        "ASK_ROUGH_ESTIMATE": "Gottaytu anna. Ee tara kelasakke sumaaru eshtu aagutte, visiting charge eshtu?",
+        "INSPECTION_HOLD": "Sari anna, visiting {fee}, kelasada rate nodi heltira. Customer hatra confirm maadi aidu nimishadalli WhatsApp madtini.",
+        "INSPECTION_HOLD_NOFEE": "Sari anna, kelasa nodi rate heltira. Customer hatra maataadi aidu nimishadalli WhatsApp madtini.",
+        "ESTIMATE_HOLD": "Sari anna, sumaaru {price} ella serisi, final kelasa nodi. Customer hatra confirm maadi aidu nimishadalli WhatsApp madtini.",
+        "CLARIFY_ask_monthly_total": "{quoted} sari. Tingalige total eshtu aagutte?",
+        "CLARIFY_ask_job_total": "{quoted} per hour sari. Poorti kelasakke sumaaru eshtu aagutte?",
+        "UNIT_PREFIX_MONTH": "{rate} per {unit} andre tingalige sumaaru {total}. ",
+        "COUNTER_AT_BUDGET": "Customer budget {target} ide anna, ella serisi. Adralli aagutta?",
+        "CALL_BACK": "Paravagilla anna, swalpa hottu bittu call madtivi. Thanks!",
     },
     "ta": {
         "ASK_VENDOR_FIRST": "Customer 3 options compare panraanga. Neenga mudhalla unga best all-inclusive rate sollunga.",
@@ -143,10 +177,20 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "RELEASE": "Customer vera option final pannitaanga. Romba nandri anna!",
         "WON": "Nalla seidhi anna, customer ungalai {price}-ku confirm pannitaanga. Details WhatsApp-la varum.",
         "REMINDER": "Neenga mudhalla {previous} sonneenga anna. ",
-        "UNIT_PREFIX": "{rate} per {unit} na motham trip-ku {total} aagum. ",
+        "UNIT_PREFIX": "{rate} per {unit} na motham {total} aagum. ",
         "NOT_AVAILABLE": "Paravaayilla anna, nandri!",
         "COUNTER_LEVERAGE_AGAIN": "Anna, {competitor} offer en kitta irukku. {counter} final panna mudiyuma?",
         "COUNTER_LEADER_AGAIN": "Innum konjam anna. {counter} panna mudiyuma?",
+        "CLARIFY_price_too_low": "Sorry anna, {quoted}? Motha amount innoru thadava sollunga.",
+        "ASK_ROUGH_ESTIMATE": "Puriyudhu anna. Indha maadhiri velaikku thoraayama evvalavu aagum, visiting charge evvalavu?",
+        "INSPECTION_HOLD": "Sari anna, visiting {fee}, velai paathu rate solluveenga. Customer kitta confirm panni 5 nimishathula WhatsApp panren.",
+        "INSPECTION_HOLD_NOFEE": "Sari anna, velai paathu rate solluveenga. Customer kitta pesi 5 nimishathula WhatsApp panren.",
+        "ESTIMATE_HOLD": "Sari anna, thoraayama {price} motham, final velai paathu. Customer kitta confirm panni 5 nimishathula WhatsApp panren.",
+        "CLARIFY_ask_monthly_total": "{quoted} sari. Maasathukku motham evvalavu aagum?",
+        "CLARIFY_ask_job_total": "{quoted} per hour sari. Motha velaikku thoraayama evvalavu?",
+        "UNIT_PREFIX_MONTH": "{rate} per {unit} na maasathukku {total} aagum. ",
+        "COUNTER_AT_BUDGET": "Customer budget {target} anna, all-inclusive. Adhukkulla mudiyuma?",
+        "CALL_BACK": "Paravaayilla anna, konjam neram kazhichu call panrom. Nandri!",
     },
     "mr": {
         "ASK_VENDOR_FIRST": "Customer 3 options compare kartayt. Tumhi aadhi tumcha best all-inclusive rate saanga.",
@@ -167,7 +211,43 @@ FOLLOW_UP = {
     "HOLD_SLOT": "Do NOT say 'booked' or 'confirmed'. Thank them and end the call politely.",
     "BOOKING_OVER_BUDGET": "Thank them and end the call politely.",
     "WON_BOOKING": "Answer any quick question, thank them and end the call politely.",
+    "CALL_BACK": "Then end the call politely. Do not ask for a price.",
+    "INSPECTION_HOLD": "Do NOT say 'booked' or 'confirmed'. Thank them and end the call politely.",
 }
+
+# What the vendor is doing this turn. Bolna's LLM sends it as `situation`; if it doesn't, it is inferred from
+# vendor_said (an English paraphrase, so English patterns plus the commonest Hindi/Kannada ones).
+SITUATIONS = {"quoting", "accepts_offer", "asks_budget", "needs_inspection", "busy_call_later", "not_available",
+              "other"}
+_BUSY_RE = re.compile(r"\b(call (me )?(back|later|after|tomorrow|in)|busy|driving|in a meeting|not now|baad mein|"
+                      r"abhi nahi|free nahi|aamele call)\b", re.I)
+_INSPECT_RE = re.compile(r"(after (seeing|inspection|checking|visiting|looking)|have to see|need to see|must see|"
+                         r"\binspect\w*|depends on (the )?(work|job|problem|damage)|can'?t (say|tell) (without|before|"
+                         r"until)|cannot (say|tell)|only (after|once)|on site|(visit|come) (and|then|first)|"
+                         r"dekh(ke| kar| ke)|nodi heltini|nodbeku)", re.I)
+_ASKS_BUDGET_RE = re.compile(r"(\byour budget|what('s| is) (the |your )?budget|how much (can|will|do) you "
+                             r"(pay|give|want)|budget (kitna|eshtu)|kitna doge)", re.I)
+_AGREE_RE = re.compile(r"\b(ok(ay)?|fine|agreed?|deal|done|accept\w*|will do|can do|no problem|alright|sure|"
+                       r"theek hai|thik hai|chalo|ho jayega|sari|aagutte|confirm)\b", re.I)
+_REFUSE_RE = re.compile(r"\b(not|no|can'?t|cannot|won'?t|nahi|nahin|illa|last|minimum|lowest|final is|more)\b",
+                        re.I)
+
+
+def classify_situation(said: str, given: str = "", has_price: bool = False) -> str:
+    given = (given or "").strip().lower()
+    if given in SITUATIONS and given != "other":
+        return given
+    said = said or ""
+    if _BUSY_RE.search(said) and not has_price:
+        return "busy_call_later"
+    if _INSPECT_RE.search(said):
+        return "needs_inspection"
+    if _ASKS_BUDGET_RE.search(said) and not has_price:
+        return "asks_budget"
+    plain = re.sub(r"\bno problem\b", "", said, flags=re.I)
+    if _AGREE_RE.search(said) and not _REFUSE_RE.search(plain) and not has_price:
+        return "accepts_offer"
+    return "quoting" if has_price else "other"
 
 
 def line(language: str, key: str, **kwargs) -> str:
@@ -197,6 +277,9 @@ class LegNegotiationState:
     slot: str = ""            # appointment slot the provider offered
     slot_asks: int = 0
     fee_asks: int = 0
+    inspection: bool = False  # vendor prices only after seeing the job
+    inspection_asks: int = 0
+    inspection_fee: Optional[int] = None   # visiting / inspection charge they did state
 
 
 @dataclass
@@ -215,8 +298,13 @@ class Decision:
         return asdict(self)
 
 
+# The self-test pins the counter policy for its own task only, never for calls running alongside it
+ROUNDS_OVERRIDE: ContextVar[Optional[int]] = ContextVar("rounds_override", default=None)
+
+
 def max_rounds() -> int:
-    return min(MAX_ROUNDS, config.settings.max_counter_rounds)
+    override = ROUNDS_OVERRIDE.get()
+    return min(MAX_ROUNDS, config.settings.max_counter_rounds if override is None else override)
 
 
 def counter_for_round(req: ServiceRequest, anchor: int, rounds: int, competitor: Optional[int]) -> int:
@@ -231,7 +319,8 @@ def counter_for_round(req: ServiceRequest, anchor: int, rounds: int, competitor:
 def decide(req: ServiceRequest, state: LegNegotiationState, quote: Optional[NormalizedQuote],
            competitor: Optional[Competitor], language: str = "en", locked_leg_id: Optional[str] = None,
            leg_id: str = "", previous_best: Optional[int] = None, raised_price: bool = False,
-           available: bool = True, explain_unit: bool = False, excluded: Optional[list] = None) -> Decision:
+           available: bool = True, explain_unit: bool = False, excluded: Optional[list] = None,
+           situation: str = "") -> Decision:
     """Pick the next move for one call leg. Mutates `state` (rounds, stalls, counters).
 
     `excluded`: labels of things the vendor bills separately (parts, gas, material). They are outside the budget;
@@ -245,6 +334,7 @@ def decide(req: ServiceRequest, state: LegNegotiationState, quote: Optional[Norm
     T, C = req.target_price, req.walkaway_ceiling
 
     def done(action: str, say: str, **kw) -> Decision:
+        say = say[:1].upper() + say[1:]
         d = Decision(action=action, say=say, **kw)
         follow = FOLLOW_UP.get(action, "Then stop and listen. Call submit_and_counter again as soon as the vendor "
                                        "states any price or charge.")
@@ -263,8 +353,23 @@ def decide(req: ServiceRequest, state: LegNegotiationState, quote: Optional[Norm
         if locked_leg_id == leg_id and state.best_all_in:
             return done("WON", line_("WON", price=state.best_all_in), binding_price=state.best_all_in)
         return done("RELEASE", line_("RELEASE"), reason="buyer_locked_other_vendor")
-    if not available and (quote is None or quote.clarify_reason == "no_price"):
+    no_price = quote is None or quote.clarify_reason == "no_price"
+    if (not available or situation == "not_available") and no_price:
         return done("NOT_AVAILABLE", line_("NOT_AVAILABLE"), reason="vendor_not_available")
+    if situation == "busy_call_later" and no_price:
+        return done("CALL_BACK", line_("CALL_BACK"), reason="vendor_busy")
+
+    # 1b. "I'll tell you after seeing the work": get a rough figure and the visiting charge, never haggle on it
+    if situation == "needs_inspection":
+        state.inspection = True
+    if state.inspection and no_price:
+        if state.inspection_asks < 1:
+            state.inspection_asks += 1
+            return done("ASK_ROUGH_ESTIMATE", line_("ASK_ROUGH_ESTIMATE"), reason="price_after_inspection")
+        if state.inspection_fee:
+            return done("INSPECTION_HOLD", line_("INSPECTION_HOLD", fee=state.inspection_fee),
+                        reason="visit_fee_only", notes=["work price after inspection"])
+        return done("INSPECTION_HOLD", line_("INSPECTION_HOLD_NOFEE"), reason="price_after_inspection")
 
     # 2. No price yet: never reveal budget first, and never invent a competitor
     if quote is None or quote.clarify_reason == "no_price":
@@ -285,15 +390,18 @@ def decide(req: ServiceRequest, state: LegNegotiationState, quote: Optional[Norm
     if quote.status == "CLARIFY":
         state.clarifies += 1
         key = f"CLARIFY_{quote.clarify_reason}"
+        if state.clarifies > 2:   # asked three times and still unclear: don't loop, close politely
+            return done("INSPECTION_HOLD", line_("INSPECTION_HOLD_NOFEE"), reason="price_unclear")
         return done("CLARIFY", line_(key if key in TEMPLATES["en"] else "CLARIFY_no_price",
                                     quoted=quote.stated_price or 0), reason=quote.clarify_reason)
 
-    # 4. Hidden add-ons (and parts/material we don't know about yet): ask once, then pad add-ons conservatively
+    # 4. Hidden add-ons (and parts/material we don't know about yet): ask once, then pad add-ons conservatively.
+    #    Not for an inspection-priced job: its number is only an estimate, held as such below.
     ask = quote.ask_items or quote.unknown_items
-    if ask and state.inclusion_asks < 1:
+    if ask and state.inclusion_asks < 1 and not state.inspection:
         state.inclusion_asks += 1
         labels = category_rules(req.category)["labels"]
-        items = " aur ".join(labels[k] for k in ask) if language == "hi" else " and ".join(labels[k] for k in ask)
+        items = JOINER.get(language, " and ").join(spoken(labels[k], language) for k in ask)
         return done("ASK_INCLUSIONS", line_("ASK_INCLUSIONS", quoted=quote.stated_price, items=items),
                     reason="hidden_charges_unknown", notes=list(ask))
 
@@ -303,17 +411,27 @@ def decide(req: ServiceRequest, state: LegNegotiationState, quote: Optional[Norm
     if explain_unit and quote.pricing_model in unit_names and quote.base_price and \
             quote.base_price != quote.stated_price:
         unit = unit_names[quote.pricing_model]
-        prefix += line_("UNIT_PREFIX", rate=quote.stated_price, unit=unit, total=quote.base_price)
+        monthly = services.get(req.category, req.service_label).unit == "per_month"
+        prefix += line_("UNIT_PREFIX_MONTH" if monthly else "UNIT_PREFIX", rate=quote.stated_price, unit=unit,
+                        total=quote.base_price)
     other = competitor.price if competitor is not None else None
 
-    names = list(dict.fromkeys(x for x in (excluded or []) if x))
-    joiner = " aur " if language == "hi" else " and "
-    excluded_note = line_("EXCLUDED_NOTE", items=joiner.join(names[:3])) if names else ""
+    names = list(dict.fromkeys(spoken(x, language) for x in (excluded or []) if x))
+    excluded_note = line_("EXCLUDED_NOTE", items=JOINER.get(language, " and ").join(names[:3])) if names else ""
+    if excluded_note:
+        excluded_note = " " + excluded_note.strip()[0].upper() + excluded_note.strip()[1:]
 
     def hold(action: str, reason: str) -> Decision:
         if q > C:  # deterministic guardrail: never hold above the walk-away ceiling
             return done("WALK_AWAY", prefix + line_("WALK_AWAY", price=q), reason="above_ceiling")
         return done(action, prefix + line_(action, price=q) + excluded_note, binding_price=q, reason=reason)
+
+    # 4b. A price for an inspection-priced job is an estimate: hold it if it fits the budget, never haggle on it
+    if state.inspection:
+        if q > C:
+            return done("WALK_AWAY", prefix + line_("WALK_AWAY", price=q), reason="estimate_above_ceiling")
+        return done("INSPECTION_HOLD", prefix + line_("ESTIMATE_HOLD", price=q) + excluded_note, binding_price=q,
+                    reason="estimate_after_inspection")
 
     # 5. Vendor met (or beat) our last counter, or is already at (or within small change of) the target
     if state.last_counter is not None and q <= state.last_counter:
@@ -365,8 +483,8 @@ def decide(req: ServiceRequest, state: LegNegotiationState, quote: Optional[Norm
         return done("COUNTER", counter_line("COUNTER_LEADER"), counter_price=counter,
                     reason="vendor_is_current_leader")
     if first_counter:
-        return done("COUNTER", counter_line("COUNTER_BUDGET", target=T), counter_price=counter,
-                    reason="budget_frame")
+        kind = "COUNTER_AT_BUDGET" if counter == T else "COUNTER_BUDGET"
+        return done("COUNTER", counter_line(kind, target=T), counter_price=counter, reason="budget_frame")
     return done("COUNTER", counter_line("COUNTER_PUSH"), counter_price=counter, reason="push_no_competitor")
 
 
@@ -378,7 +496,7 @@ def _decide_booking(req: ServiceRequest, state: LegNegotiationState, quote: Opti
     when = req.when or ("today" if language == "en" else "aaj" if language == "hi" else "ivattu")
     if locked_leg_id:
         if locked_leg_id == leg_id and state.slot:
-            return done("WON_BOOKING", line_("WON_BOOKING", slot=state.slot, fee_part=fee_part), binding_price=fee)
+            return done("WON_BOOKING", line_("WON_BOOKING", slot=localize_when(state.slot, language), fee_part=fee_part), binding_price=fee)
         return done("RELEASE", line_("RELEASE"), reason="buyer_locked_other_vendor")
     if not available and not state.slot:
         return done("NOT_AVAILABLE", line_("NOT_AVAILABLE"), reason="vendor_not_available")
@@ -389,8 +507,8 @@ def _decide_booking(req: ServiceRequest, state: LegNegotiationState, quote: Opti
         return done("ASK_SLOT", line_("ASK_SLOT", when=when), reason="need_slot")
     if fee is None and state.fee_asks < 1:
         state.fee_asks += 1
-        return done("ASK_FEE", line_("ASK_FEE", slot=state.slot), reason="need_fee")
+        return done("ASK_FEE", line_("ASK_FEE", slot=localize_when(state.slot, language)), reason="need_fee")
     if fee and req.has_budget and fee > req.walkaway_ceiling:
         return done("BOOKING_OVER_BUDGET", line_("BOOKING_OVER_BUDGET", fee=fee), reason="fee_above_ceiling")
-    return done("HOLD_SLOT", line_("HOLD_SLOT", slot=state.slot, fee_part=fee_part), binding_price=fee,
+    return done("HOLD_SLOT", line_("HOLD_SLOT", slot=localize_when(state.slot, language), fee_part=fee_part), binding_price=fee,
                 reason="slot_held")

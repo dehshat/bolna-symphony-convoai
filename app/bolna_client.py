@@ -40,7 +40,7 @@ STILL_THERE = {
 }
 
 TOOL_FIELDS = ["session_id", "leg_id", "vendor_said", "price", "pricing_model", "toll", "driver_bata",
-               "other_charges", "extras", "notes", "availability", "slot"]
+               "other_charges", "extras", "notes", "availability", "slot", "situation"]
 CHARGE_DESC = ("'included', 'extra', 'extra <amount in digits>', 'na' (not applicable) or 'unknown' "
                "(vendor has not said)")
 
@@ -108,7 +108,9 @@ CALL FLOW (follow YOUR GOAL ON THIS CALL)
    with price "unknown" and say its line.
 3. Every time they say a price, a rate (per km / hour / month / visit), any extra charge, a condition, or an
    appointment slot, IMMEDIATELY call submit_and_counter with what they said, then say its "say_this" line naturally.
-4. If they ask you to wait or say they'll check, call check_auction_status and follow it.
+4. If they agree to your offer ("ok", "done", "theek hai") call submit_and_counter with situation accepts_offer.
+   If they say they can price only after seeing the job, or ask you to call later, call it with that situation.
+   If they ask you to wait or say they'll check, call check_auction_status and follow it.
 5. When a tool result has end_call = true, say the line, thank them warmly and end the call.
 
 CAPTURE EVERYTHING (the customer reads it later)
@@ -186,6 +188,14 @@ def _tools(language: str) -> list[dict]:
                     "availability": {"type": "string", "enum": ["yes", "no", "unknown"]},
                     "slot": {"type": "string", "description": "Appointment/visit time the vendor offered, as said "
                                                               "(e.g. 'tomorrow 11 AM'); 'unknown' if none"},
+                    "situation": {"type": "string",
+                                  "enum": ["quoting", "accepts_offer", "asks_budget", "needs_inspection",
+                                           "busy_call_later", "not_available", "other"],
+                                  "description": ("What the vendor is doing: quoting a price; accepts_offer = agrees "
+                                                  "to the offer you just made (even without repeating it); "
+                                                  "asks_budget = asks your budget; needs_inspection = will price only "
+                                                  "after seeing the job; busy_call_later = asks you to call later; "
+                                                  "not_available = can't do it")},
                 },
                 "required": TOOL_FIELDS,
             },

@@ -7,6 +7,7 @@ body back into the LLM as the tool result, so every response here is short, expl
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 from typing import Any, Optional
 
@@ -19,6 +20,13 @@ from app.orchestrator import apply_execution_update
 
 log = logging.getLogger("webhooks")
 router = APIRouter()
+
+# Our own bug must never leave the voice LLM improvising prices: it gets a safe, non-committal line instead
+SAFE_FALLBACK = {
+    "ok": False, "action": "SAFE_FALLBACK", "say_this": "",
+    "instruction": ("Something went wrong noting this down. Do not agree to or suggest any price. Say you have noted "
+                    "it and will WhatsApp them in five minutes, thank them and end the call politely."),
+}
 
 UNRESOLVED = {
     "ok": False, "action": "UNKNOWN_CALL", "say_this": "",
@@ -37,31 +45,59 @@ def _authorized(request: Request) -> bool:
     return hmac.compare_digest(supplied.encode(), secret.encode())
 
 
+def _normalize_args(data: Any) -> dict:
+    """Unwrap what an LLM tool call can look like: {"arguments": {...}}, {"arguments": "<json string>"},
+    {"params": ...}; tidy ids ("{abc}", "a" -> "A") and drop template placeholders the LLM left unfilled."""
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except ValueError:
+            data = {}
+    data = dict(data) if isinstance(data, dict) else {}
+    for key in ("arguments", "args", "params", "parameters", "data", "input"):
+        inner = data.get(key)
+        if isinstance(inner, str) and inner.strip().startswith("{"):
+            try:
+                inner = json.loads(inner)
+            except ValueError:
+                inner = None
+        if isinstance(inner, dict) and not data.get("session_id"):
+            data = {**data, **inner}
+    for key, value in list(data.items()):
+        if isinstance(value, str):
+            value = value.strip()
+            if value.startswith(("%(", "{$", "{{")) and key not in ("session_id", "leg_id"):
+                value = "unknown"   # Bolna left the template marker in: the LLM didn't fill this field
+            data[key] = value
+    for key in ("session_id", "leg_id"):
+        data[key] = str(data.get(key) or "").strip().strip("{}$ ").replace("$", "")
+    data["leg_id"] = data["leg_id"].upper()
+    return data
+
+
 async def _payload(request: Request) -> dict:
-    """Accept JSON, form or query params, and unwrap common nesting ({"arguments": {...}}, {"params": ...})."""
-    data: dict[str, Any] = {}
+    """Accept JSON, form or query params, and unwrap common nesting."""
+    data: Any = {}
     try:
-        body = await request.json()
-        if isinstance(body, dict):
-            data = body
+        data = await request.json()
     except Exception:
         try:
             data = dict(await request.form())
         except Exception:
             data = {}
-    for key in ("arguments", "args", "params", "parameters", "data"):
-        if isinstance(data.get(key), dict) and not data.get("session_id"):
-            data = {**data, **data[key]}
+    data = data if isinstance(data, (dict, str)) else {}
+    data = _normalize_args(data)
     for key, value in request.query_params.items():
-        data.setdefault(key, value)
+        if key != "secret":
+            data.setdefault(key, value)
     return data
 
 
-def _resolve(args: dict) -> Optional[tuple[str, str]]:
+def _resolve(args: dict, engine=None) -> Optional[tuple[str, str]]:
     """Find (session_id, leg_id). Falls back gracefully if the LLM mangled the ids."""
-    engine = state.engine
-    session_id = str(args.get("session_id") or "").strip().strip("{}")
-    leg_id = str(args.get("leg_id") or "").strip().strip("{}").upper()
+    engine = engine or state.engine
+    session_id = str(args.get("session_id") or "").strip().strip("{}$ ")
+    leg_id = str(args.get("leg_id") or "").strip().strip("{}$ ").upper()
     if session_id in engine.sessions and leg_id in engine.get(session_id).legs:
         return session_id, leg_id
     execution_id = args.get("execution_id") or args.get("call_id")
@@ -90,7 +126,11 @@ async def submit_and_counter(request: Request) -> dict:
         log.warning("unresolved tool call: %s", {k: args.get(k) for k in ("session_id", "leg_id")})
         return UNRESOLVED
     session_id, leg_id = resolved
-    return await state.engine.submit_and_counter(session_id, leg_id, args)
+    try:
+        return await state.engine.submit_and_counter(session_id, leg_id, args)
+    except Exception:
+        log.exception("submit_and_counter failed for %s/%s with %s", session_id, leg_id, args)
+        return SAFE_FALLBACK
 
 
 @router.post("/api/tools/check_auction_status")
@@ -101,7 +141,11 @@ async def check_auction_status(request: Request) -> dict:
     resolved = _resolve(args)
     if not resolved:
         return UNRESOLVED
-    return await state.engine.check_auction_status(*resolved)
+    try:
+        return await state.engine.check_auction_status(*resolved)
+    except Exception:
+        log.exception("check_auction_status failed for %s", resolved)
+        return SAFE_FALLBACK
 
 
 @router.post("/api/webhooks/bolna_execution")

@@ -66,6 +66,21 @@ console.cloud.google.com → create/select a project → enable **Places API (Ne
 Credentials → *Create credentials → API key* → add it as `GOOGLE_MAPS_API_KEY`. Google requires a billing
 account but gives a free monthly usage allowance.
 
+## Prototype testing
+
+* **⚙︎ Setup → Run call self-test** (or `GET /api/selftest?format=text`) replays 43 scripted call scenarios through
+  the live negotiation code on a private in-memory engine: honest quotes, one-counter deals, "okay done" to a
+  counter, hidden visiting charges, parts/gas/medicines at actuals, GST %, price ranges, per-day and per-hour rates
+  for monthly jobs, garbled numbers, "I'll price after seeing it", busy/call-back, budget-first, prompt injection,
+  appointments (slot, fee, full, over budget), leverage across calls, Kannada, malformed and retried tool calls.
+  Each checks the outcome and that the call makes sense (never above your max, the max never spoken, the budget
+  never revealed first, no repeated lines, no English templates on Hindi/Kannada calls). `pytest` runs the same set.
+* **Real calls:** the same Setup dialog lists lines to say when you answer as provider #1 in Hybrid mode.
+* **Version check:** `GET /api/health` and Setup → *Deployed version* show the commit that is live.
+* **Guards:** per-device hourly limits on map searches, real calls and chat (`RATE_LIMIT_*`), searches cached for 15
+  minutes, and if the server ever errors mid-call the agent gets a safe "I'll WhatsApp you" line instead of
+  improvising a price. Calls ring only your test phone unless `CALL_REAL_NUMBERS=true`.
+
 ## Which model does what
 
 | Where | Component | Job | Decides prices? |

@@ -18,6 +18,7 @@ import logging
 import math
 import random
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
@@ -313,6 +314,12 @@ async def demo(svc: ServiceType, location: str, lat=None, lng=None, limit: int =
 
 BACKENDS = (("google_places", google_places), ("gemini_maps", gemini_maps), ("openstreetmap", openstreetmap),
             ("demo", demo))
+CACHE_SECONDS = 900   # the same search within 15 minutes reuses the listings: no repeat Places/Gemini cost
+_cache: dict[tuple, tuple[float, str, list]] = {}
+
+
+async def _async(value):
+    return value
 
 
 async def search(service_key: str, service_label: str, location: str, lat: Optional[float] = None,
@@ -322,14 +329,25 @@ async def search(service_key: str, service_label: str, location: str, lat: Optio
         svc = services.get("other", service_label)
     if is_near_me(location) and (lat is None or lng is None):
         location = "Bengaluru"      # "near me" but the browser gave no position
+    key = (svc.key, svc.label.lower(), location.strip().lower(), None if lat is None else round(lat, 3),
+           None if lng is None else round(lng, 3), limit)
+    hit = _cache.get(key)
+    fresh = bool(hit) and time.time() - hit[0] < CACHE_SECONDS
+    if fresh:
+        cached = [Provider(**p) for p in hit[2]]
+        backends = [(hit[1], lambda *_args: _async(cached))]
+    else:
+        backends = list(BACKENDS)
     tried = []
-    for name, backend in BACKENDS:
+    for name, backend in backends:
         try:
             found = await backend(svc, location, lat, lng, limit)
         except Exception as exc:  # one broken source must never break the search
             log.warning("provider backend %s crashed: %s", name, exc)
             found = []
-        tried.append({"source": name, "results": len(found)})
+        tried.append({"source": name, "results": len(found), **({"cached": True} if fresh else {})})
+        if found and name != "demo" and not fresh:
+            _cache[key] = (time.time(), name, [p.to_dict() for p in found])
         if found:
             for p in found:
                 if p.distance_km is None:

@@ -7,17 +7,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app import bolna_client, briefs, config, intake, llm, payments, places, services, state
+from app import bolna_client, briefs, config, intake, llm, payments, places, ratelimit, scenarios, services, state
 from app.auction_engine import GuardrailViolation
 from app.pricing import ServiceRequest
 from app.webhooks import router as webhook_router
@@ -163,7 +164,9 @@ async def index() -> FileResponse:
 
 @app.get("/api/health")
 async def health() -> dict:
-    return {"ok": True, "sessions": len(state.engine.sessions)}
+    # Render and Railway expose the deployed commit; it tells you which version is live
+    commit = os.getenv("RENDER_GIT_COMMIT") or os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("GIT_COMMIT", "")
+    return {"ok": True, "sessions": len(state.engine.sessions), "commit": commit[:7] or "unknown"}
 
 
 @app.get("/api/config")
@@ -189,7 +192,8 @@ async def parse_brief(body: BriefText) -> dict:
 # ----------------------------------------------------------------------------- sessions
 
 @app.post("/api/chat")
-async def chat(body: ChatBody) -> dict:
+async def chat(body: ChatBody, request: Request) -> dict:
+    ratelimit.check(request, "chat", config.settings.rate_limit_chat)
     return await intake.chat(body.conversation_id, body.message, body.lat, body.lng)
 
 
@@ -203,7 +207,8 @@ def _task_from(conversation_id: Optional[str], task: Optional[dict]) -> dict:
 
 
 @app.post("/api/providers/search")
-async def search_providers(body: ProviderSearch) -> dict:
+async def search_providers(body: ProviderSearch, request: Request) -> dict:
+    ratelimit.check(request, "map search", config.settings.rate_limit_search)
     task = _task_from(body.conversation_id, body.task)
     if not task.get("service_key") and not task.get("service_label"):
         raise HTTPException(422, "tell me what service you need first")
@@ -244,11 +249,13 @@ async def _create_task_session(body: CreateSession, mode: str) -> dict:
 
 
 @app.post("/api/session")
-async def create_session(body: CreateSession) -> dict:
+async def create_session(body: CreateSession, request: Request) -> dict:
     s = config.settings
     mode = (body.mode or s.default_mode or "simulation").lower()
     if mode not in {"simulation", "hybrid", "live"}:
         raise HTTPException(422, "mode must be simulation, hybrid or live")
+    if mode != "simulation":   # real phone calls cost Bolna credit
+        ratelimit.check(request, "call", s.rate_limit_calls)
     if body.task:
         return await _create_task_session(body, mode)
     overrides = body.request.model_dump(exclude_none=True) if body.request else {}
@@ -356,6 +363,18 @@ async def mock_pay(session_id: str) -> dict:
 
 
 # ----------------------------------------------------------------------------- admin (Bolna agent provisioning)
+
+@app.get("/api/selftest")
+async def selftest(format: str = "json"):
+    """Replays every scripted call scenario through the live tool code on a private, in-memory engine.
+    No calls are placed and nothing touches real sessions, so it is safe to run on a deployed instance."""
+    report = await scenarios.run_all()
+    if format == "text":
+        return PlainTextResponse(scenarios.render(report))
+    return {"passed": report["passed"], "total": report["total"],
+            "failures": [{"name": r["name"], "problems": r["problems"]} for r in report["results"] if not r["ok"]],
+            "scenarios": [{"name": r["name"], "about": r["about"], "ok": r["ok"]} for r in report["results"]]}
+
 
 @app.get("/api/admin/agent_payload")
 async def agent_payload(request: Request, lang: str = "hi") -> dict:

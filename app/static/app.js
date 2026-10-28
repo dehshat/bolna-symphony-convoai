@@ -601,6 +601,7 @@
       ["Tool auth secret", c.tool_auth_enabled ? "✓" : "off"],
       ["Bolna auto-setup", `${c.bolna_sync?.state || "?"}: ${c.bolna_sync?.detail || ""}`],
     ];
+    try { rows.unshift(["Deployed version", (await api("/api/health")).commit]); } catch { /* offline */ }
     $("#cfgList").innerHTML = rows.map(([k, v]) => `<div><span class="muted">${esc(k)}</span><span>${esc(v)}</span></div>`).join("");
     $("#adminToken").value = store.get("adminToken", "");
     $("#adminModal").showModal();
@@ -665,6 +666,15 @@
       catch (e) { out.textContent = "✗ " + e.message; }
     });
     $("#syncBtn").addEventListener("click", () => adminCall(false));
+    $("#selftestBtn").addEventListener("click", async () => {
+      const out = $("#adminOut");
+      out.hidden = false;
+      out.textContent = "Replaying every call scenario through the live negotiation code…";
+      try {
+        const r = await fetch("/api/selftest?format=text");
+        out.textContent = await r.text();
+      } catch (e) { out.textContent = "✗ " + e.message; }
+    });
     const m = location.hash.match(/s=([a-f0-9]+)/);
     if (m) { try { startWarRoom(await api(`/api/session/${m[1]}`)); } catch { /* expired */ } }
   }

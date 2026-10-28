@@ -19,7 +19,9 @@ def plumber(**kw):
 def test_parts_billed_separately_are_excluded_not_added_to_the_price():
     q = normalize_quote(plumber(), 600, "flat", {"other_charges": "parts extra at actuals"})
     assert q.all_in == 600 and q.status == "VALID"
-    assert q.excluded == [{"key": "other_charges", "label": "material / parts", "amount": None}]
+    assert q.excluded == [{"key": "other_charges", "label": "parts", "amount": None}]  # named as said
+    q = normalize_quote(plumber(), 600, "flat", {"other_charges": "extra"})
+    assert q.excluded == [{"key": "other_charges", "label": "material / parts", "amount": None}]  # slot label
 
 
 def test_job_addons_still_count_towards_the_real_price():
@@ -40,7 +42,7 @@ def test_unknown_parts_are_asked_about_once_but_never_padded():
     q = normalize_quote(r, 600, "flat", {})
     assert q.all_in == 600 and q.ask_items == ["other_charges"] and q.status == "NEEDS_INCLUSIONS"
     first = decide(r, s, q, None, "en")
-    assert first.action == "ASK_INCLUSIONS" and "material / parts" in first.say
+    assert first.action == "ASK_INCLUSIONS" and "material or parts" in first.say  # spoken, no slash
     second = decide(r, s, q, None, "en")
     assert second.action != "ASK_INCLUSIONS"
 
@@ -88,7 +90,7 @@ def test_closing_line_repeats_what_is_billed_separately():
     q = normalize_quote(r, 500, "flat", {"other_charges": "parts extra"})
     s.best_all_in = q.all_in
     d = decide(r, s, q, None, "en", excluded=["parts"])
-    assert d.action == "ACCEPT_HOLD" and "parts separately" in d.say
+    assert d.action == "ACCEPT_HOLD" and "Parts separately" in d.say
 
 
 # ---------------------------------------------------------------- capture, end to end through the engine

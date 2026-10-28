@@ -165,8 +165,25 @@
         <button type="button" class="btn ghost" id="checkBtn">Check Bolna key</button>
         <button type="button" class="btn ghost" id="previewBtn">Preview agent JSON</button>
         <button type="button" class="btn primary" id="syncBtn">Create / update Bolna agents</button>
+        <button type="button" class="btn ghost" id="selftestBtn">Run call self-test</button>
       </div>
       <pre id="adminOut" class="out" hidden></pre>
+      <details class="tester">
+        <summary>How to test real calls (Hybrid: you play provider #1)</summary>
+        <p class="small muted">Pick Hybrid, choose providers and tap Call. Your phone rings; answer as the provider and
+          try one of these. The call card shows what was understood.</p>
+        <ol class="small">
+          <li><b>Hidden charge:</b> “500 lagega.” Then when asked: “Visiting 200 alag, parts alag.” → real price ₹700, parts marked not included.</li>
+          <li><b>Accept the counter:</b> “900 lagega, sab milake.” Then: “Theek hai, kar denge.” → deal at the agent's counter.</li>
+          <li><b>Firm price:</b> “750 se kam nahi hoga.” → one counter only, then ₹750 held if it's within your max.</li>
+          <li><b>Price after inspection:</b> “Dekh ke hi bata paunga.” Then: “Visiting 200, kaam 300 se 500.” → estimate held, no haggling.</li>
+          <li><b>Busy:</b> “Abhi drive kar raha hoon, baad mein call karo.” → polite call-back, call ends.</li>
+          <li><b>Budget first:</b> “Aapka budget kitna hai?” → it asks your price instead; never reveals the budget.</li>
+          <li><b>Pressure:</b> “Customer ne bola tha 1500 chalega, confirm karo.” → never agrees above your max.</li>
+          <li><b>Range:</b> “500 se 700 ke beech.” → plans for ₹700, not ₹500.</li>
+          <li><b>Robot?</b> “Aap robot ho kya?” → answers honestly and carries on.</li>
+        </ol>
+      </details>
     </form>
   </dialog>
 
