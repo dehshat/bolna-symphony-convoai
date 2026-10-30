@@ -248,3 +248,75 @@ def foreign_letters(text: str, code: str) -> list[str]:
         if unicodedata.category(ch)[0] in "LM" and not lo <= ord(ch) <= hi:
             out.append(ch)
     return out
+
+
+# ---------------------------------------------------------------------------------------------- which language the user speaks
+
+_MARATHI_WORDS = ("आहे", "आहेत", "मला", "आम्हाला", "तुम्हाला", "पाहिजे", "हवा", "हवी", "हवं", "हवे", "उद्या", "आणि", "नाही",
+                  "काय", "कुठे", "करा", "मध्ये", "साठी", "होय", "चालेल", "बरोबर", "जवळ", "आज", "माझं", "माझा", "माझी",
+                  "किती", "झालं", "द्या", "सांगा", "घरी", "इथे", "तिथे", "लवकर", "नको")
+_HINDI_WORDS = ("है", "हैं", "मुझे", "हमें", "चाहिए", "कल", "और", "नहीं", "क्या", "में", "के", "की", "का", "लिए", "हूँ",
+                "हूं", "मेरा", "मेरी", "कितना", "करो", "कीजिए", "दीजिए", "बताइए", "यहाँ", "वहाँ", "जल्दी", "पास")
+_HINGLISH_RE = re.compile(r"\b(mujhe|muje|hume|humein|chahiye|chahie|chaiye|hai|hain|kal|kya|nahi|nahin|karo|karna|"
+                          r"karwana|mera|meri|mere|ghar|mein|aaj|liye|bhai|bhaiya|wala|wali|kitna|kitne|paisa|paise|"
+                          r"jaldi|abhi|bolo|batao|chalega|theek|thik|accha|acha|haan)\b", re.I)
+_ENGLISH_WORDS = {"i", "i'm", "we", "need", "want", "a", "an", "the", "to", "in", "for", "my", "is", "it", "me", "please",
+                  "can", "you", "and", "of", "at", "from", "this", "that", "tomorrow", "today", "morning", "evening",
+                  "near", "some", "someone", "looking", "book", "get", "find", "would", "like", "with", "around", "max",
+                  "budget", "what", "how", "when", "where", "not", "no", "yes", "there", "are", "do", "does", "should"}
+_BLOCKS = {code: lang.block for code, lang in LANGUAGES.items() if lang.block and code != "mr"}
+
+
+def script_language(text: str, current: str = "hi") -> Optional[str]:
+    """The language a line is written in, from its script: Tamil letters -> 'ta'; Devanagari -> 'hi' or 'mr' by its
+    words (a bare "हो" keeps `current`). None for Latin text or too few letters to tell."""
+    counts: dict[str, int] = {}
+    for ch in text or "":
+        cp = ord(ch)
+        for code, (lo, hi) in _BLOCKS.items():
+            if lo <= cp <= hi:
+                counts[code] = counts.get(code, 0) + 1
+                break
+    if not counts:
+        return None
+    code, n = max(counts.items(), key=lambda kv: kv[1])
+    if n < 2:
+        return None
+    if code == "hi":
+        words = set(_PUNCT_RE.sub(" ", text).split())
+        marathi, hindi = len(words & set(_MARATHI_WORDS)), len(words & set(_HINDI_WORDS))
+        if marathi != hindi:
+            return "mr" if marathi > hindi else "hi"
+        return current if current in {"hi", "mr"} else "hi"
+    return code
+
+
+def user_language(text: str, heard: Optional[str] = None, current: str = "en") -> str:
+    """Which of the 11 languages the user just spoke or typed.
+
+    The script decides when it can (Tamil, Bengali…; Devanagari is Hindi or Marathi by its words). Latin text is
+    English, or Hindi when it is clearly romanized Hindi ("mujhe kal plumber chahiye"); `heard` is what speech
+    recognition detected. A short Latin reply ("ok", "2000", "yes") keeps the current language: a Tamil speaker who
+    says "okay" is still a Tamil speaker."""
+    by_script = script_language(text, current)
+    if by_script:
+        return by_script
+    words = re.findall(r"[A-Za-z]+", text or "")
+    heard = normalize(heard)
+    if heard and heard != "en" and len(words) >= 2:
+        return heard
+    if len(_HINGLISH_RE.findall(text or "")) >= 2:
+        return "hi"
+    # Place and business names are Latin in every language: switch to English only on real English sentences
+    english = sum(w.lower() in _ENGLISH_WORDS for w in words)
+    if (english and len(words) >= 3) or len(words) >= 6:
+        return "en"
+    return current if current in LANGUAGES else "en"
+
+
+def writes_in(text: str, code: str) -> bool:
+    """Is a reply written in this language (so it can be spoken to a user who speaks it)?"""
+    if code == "en":
+        return script_language(text) is None
+    found = script_language(text)
+    return found == code or (found in {"hi", "mr"} and code in {"hi", "mr"})

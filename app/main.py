@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app import (bolna_client, briefs, config, intake, languages, llm, payments, places, ratelimit, scenarios, services,
-                 state)
+                 state, userlex)
 from app.auction_engine import GuardrailViolation
 from app.pricing import ServiceRequest
 from app.webhooks import router as webhook_router
@@ -160,7 +160,8 @@ class ChatBody(BaseModel):
     message: str = Field(default="", max_length=600)
     lat: Optional[float] = None
     lng: Optional[float] = None
-    user_lang: Optional[str] = None            # the language the user talks to the app in
+    user_lang: Optional[str] = None            # the language picked in the settings; "auto" (or none): detect it
+    heard_lang: Optional[str] = None           # what speech recognition heard (before the first message: the browser's)
     call_language: Optional[str] = None        # set when the user picks the call language on screen
 
 
@@ -257,7 +258,14 @@ async def get_config(request: Request) -> dict:
         "vendors": briefs.VENDOR_PERSONAS,
         "languages": languages.public_list(),
         "voice_commands": languages.voice_commands(),
+        "user_lines": {"en": userlex.browser_lines("en")},
     }
+
+
+@app.get("/api/lines/{language}")
+async def user_lines(language: str) -> dict:
+    """What the browser says and shows during the calls, in the user's language (narration, verdict, deal)."""
+    return userlex.browser_lines(languages.normalize(language) or "en")
 
 
 @app.get("/api/languages")
@@ -319,7 +327,7 @@ async def parse_brief(body: BriefText) -> dict:
 async def chat(body: ChatBody, request: Request) -> dict:
     ratelimit.check(request, "chat", config.settings.rate_limit_chat)
     return await intake.chat(body.conversation_id, body.message, body.lat, body.lng, body.user_lang,
-                             body.call_language)
+                             body.call_language, body.heard_lang)
 
 
 def _task_from(conversation_id: Optional[str], task: Optional[dict]) -> dict:

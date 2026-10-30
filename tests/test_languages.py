@@ -157,9 +157,16 @@ def test_bolna_agent_for_every_language(lang):
     if lang != "en":
         name = languages.name(lang)
         assert f"Speak ONLY {name}" in prompt and "Never say an English word" in prompt
-        for line in (cfg["check_user_online_message"],
-                     tools["api_tools"]["tools_params"]["submit_and_counter"]["pre_call_message"]):
-            assert not languages.latin_words(line), line
+        for message in (cfg["check_user_online_message"],
+                        tools["api_tools"]["tools_params"]["submit_and_counter"]["pre_call_message"],
+                        tools["api_tools"]["tools_params"]["check_auction_status"]["pre_call_message"],
+                        tools["api_tools"]["tools"][0]["pre_call_message"]):
+            # Bolna looks the line up by the language it detects and falls back to "en", then to its own English
+            # "Just give me a moment, I'll be back with you." Every tag must carry the call language's line.
+            assert {"en", lang, languages.get(lang).sarvam} <= set(message), message
+            for line in message.values():
+                assert not languages.latin_words(line), line
+        assert lexicon.word(lang, "pre_call") in prompt and "never \"give me a moment\"" in prompt
     assert payload["agent_config"]["agent_name"] == f"Swarm Negotiator ({lang.upper()})"
 
 

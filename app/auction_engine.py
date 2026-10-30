@@ -202,7 +202,9 @@ class Session:
             "t": self.t(),
             "current_best_quote": asdict(best) if best else None,
             "savings_vs_worst_first_quote": savings,
-            "legs": [leg.public() for leg in self.legs.values()],
+            "legs": [{**leg.public(), "slot_user": advisor.user_slot(leg.neg.slot, self.request),
+                      "excluded_user": advisor.user_items([e["item"] for e in leg.excluded_items()], self.request)}
+                     for leg in self.legs.values()],
             "arbitrage_log": self.arbitrage_log[-30:],
             "payment": self.payment,
             "whatsapp": self.whatsapp,

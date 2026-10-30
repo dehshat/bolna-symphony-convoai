@@ -202,11 +202,14 @@ async def speak(text: str) -> Optional[bytes]:
 async def transcribe(audio: bytes, mime: str, language_hint: str = "") -> Optional[dict]:
     """Speech -> {text, language} for browsers without speech recognition (Firefox, some iPhones)."""
     from app import languages
-    hint = languages.get(language_hint).name if language_hint else "an Indian language or English"
-    prompt = (f"Transcribe this short voice message exactly as spoken. The speaker is in India, most likely speaking "
-              f"{hint}. Write each language in its own script (Hindi and Marathi in Devanagari, English in Latin "
-              f"letters, and so on); keep English words the speaker used in English. Return ONLY JSON: "
-              f'{{"text": "<transcript>", "language": "<ISO 639-1 code>"}}. If there is no speech, text is "".')
+    names = ", ".join(f"{l.name} ({l.code})" for l in languages.LANGUAGES.values())
+    hint = (f"most likely speaking {languages.get(language_hint).name} (languages: {names})" if language_hint else
+            f"speaking one of: {names}; work out which from the audio itself")
+    prompt = (f"Transcribe this short voice message exactly as spoken. The speaker is in India, {hint}. Write each "
+              f"language in its own script (Hindi and Marathi in Devanagari, Tamil in Tamil script, English in Latin "
+              f"letters, and so on), never romanized; keep English words the speaker used in English. \"language\" "
+              f"is the main language of the message (not of the English words in it), as one of the codes above. "
+              f'Return ONLY JSON: {{"text": "<transcript>", "language": "<code>"}}. If there is no speech, text is "".')
     body = {"contents": [{"role": "user", "parts": [
         {"inlineData": {"mimeType": mime, "data": base64.b64encode(audio).decode()}}, {"text": prompt}]}],
         "generationConfig": {"maxOutputTokens": 400, "temperature": 0, "responseMimeType": "application/json"}}

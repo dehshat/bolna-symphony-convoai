@@ -2,14 +2,15 @@
 
 Deterministic and explainable: price (or fee) matters most, then how well-rated and how proven the provider is, then
 whether they actually agreed on the call. Only options the user could lock are considered (never above the ceiling).
+The summary and the reasons are written in the language the user talks to the app in (`app.userlex`).
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
+from app import lexicon, userlex
 from app.places import popularity_score
-from app.pricing import format_inr
 
 TERMINAL = {"WON", "RELEASED", "ENDED", "FAILED"}
 
@@ -29,12 +30,34 @@ def lockable_price(session, leg) -> Optional[int]:
     return price
 
 
-def _rating(leg) -> tuple[float, str]:
+def _rating(leg, lang: str = "en") -> tuple[float, str]:
     p = leg.provider or {}
     if p.get("rating") is None:
         return 0.75, ""
     reviews = int(p.get("reviews") or 0)
-    return popularity_score(p["rating"], reviews) / 5, f"rated ★{float(p['rating']):.1f} from {reviews:,} reviews"
+    return popularity_score(p["rating"], reviews) / 5, userlex.line(lang, "rated", rating=f"{float(p['rating']):.1f}",
+                                                                     reviews=f"{reviews:,}")
+
+
+def _when(slot: str, lang: str) -> str:
+    return lexicon.localize_when(slot, lang) if lang != "en" else slot
+
+
+def user_slot(slot: str, request) -> str:
+    """A vendor's slot ('tomorrow 11 AM') as the user's language says it, for narration."""
+    return _when(slot, userlex.code(getattr(request, "user_language", "en"))) if slot else ""
+
+
+def user_items(items: list[str], request) -> list[str]:
+    """Charge names ('material / parts') as the user's language says them, for the screen."""
+    lang = userlex.code(getattr(request, "user_language", "en"))
+    return [_items([item], lang) for item in items]
+
+
+def _items(items: list[str], lang: str) -> str:
+    if lang == "en":
+        return ", ".join(items)
+    return lexicon.charge_words(" / ".join(items), lang, joiner="and")
 
 
 def recommend(session) -> Optional[dict]:
@@ -42,18 +65,18 @@ def recommend(session) -> Optional[dict]:
     if not legs:
         return None
     all_done = all(l.status in TERMINAL or l.status == "HOLD" for l in legs)
+    lang = userlex.code(getattr(session.request, "user_language", "en"))
+    say = lambda key, **kw: userlex.line(lang, key, **kw)  # noqa: E731
     candidates = [(leg, price) for leg in legs if (price := lockable_price(session, leg)) is not None]
     if not candidates:
         if not all_done:
             return None
-        return {"leg_id": None, "all_done": True, "reasons": [],
-                "summary": "No provider came in within your budget or had a slot. Try raising the max, another time, "
-                           "or more providers."}
+        return {"leg_id": None, "all_done": True, "reasons": [], "language": lang, "summary": say("no_fit")}
     appointment = session.request.goal == "appointment"
     cheapest = min(p for _, p in candidates) or 0
     scored = []
     for leg, price in candidates:
-        rating, rating_text = _rating(leg)
+        rating, rating_text = _rating(leg, lang)
         price_score = (cheapest / price) if price and cheapest else (0.8 if appointment else 1.0)
         distance = (leg.provider or {}).get("distance_km")
         score = (0.4 if appointment else 0.62) * price_score + (0.5 if appointment else 0.26) * rating
@@ -67,37 +90,37 @@ def recommend(session) -> Optional[dict]:
     if session.locked_leg_id and session.locked_leg_id in session.legs:
         best = session.legs[session.locked_leg_id]
         price = lockable_price(session, best) or best.neg.best_all_in or 0
-        rating_text = _rating(best)[1]
+        rating_text = _rating(best, lang)[1]
 
     reasons = []
     if appointment:
         if best.neg.slot:
-            reasons.append(f"slot {best.neg.slot}")
+            reasons.append(say("slot_r", slot=_when(best.neg.slot, lang)))
         if price:
-            reasons.append(f"fee {format_inr(price)}")
+            reasons.append(say("fee_r", fee=price))
     else:
-        reasons.append(f"{format_inr(price)} all-inclusive" + (" (lowest)" if price == cheapest and
-                                                                len(candidates) > 1 else ""))
+        reasons.append(say("lowest" if price == cheapest and len(candidates) > 1 else "all_in", price=price))
         others = sorted(p for leg, p in candidates if leg is not best)
         if others and others[0] > price:
-            reasons.append(f"{format_inr(others[0] - price)} below the next best")
+            reasons.append(say("below", amount=others[0] - price))
     if rating_text:
         reasons.append(rating_text)
     if best.status in {"HOLD", "WON"}:
-        reasons.append("agreed on the call")
+        reasons.append(say("agreed"))
     if best.neg.inspection:
-        reasons.append("final price after they see the job")
+        reasons.append(say("inspection"))
     excluded = [e["item"] for e in best.excluded_items()]
     if excluded:
-        reasons.append(f"{', '.join(excluded[:2])} billed separately")
+        reasons.append(say("separately", items=_items(excluded[:2], lang)))
     runner = next(((leg, p) for _, leg, p, _ in scored if leg is not best), None)
-    what = (f"{best.neg.slot}" + (f", fee {format_inr(price)}" if price else "")) if appointment \
-        else f"{format_inr(price)} all-inclusive"
+    what = (_when(best.neg.slot or "", lang) + (", " + say("fee_r", fee=price) if price else "")).strip(", ") \
+        if appointment else say("all_in", price=price)
     return {
         "leg_id": best.leg_id, "vendor_name": best.vendor_name, "price": price or None, "slot": best.neg.slot,
         "rating": (best.provider or {}).get("rating"), "reasons": reasons, "all_done": all_done,
         "confirmed": session.locked_leg_id == best.leg_id,
         "runner_up": {"leg_id": runner[0].leg_id, "vendor_name": runner[0].vendor_name, "price": runner[1]}
         if runner else None,
+        "what": what, "language": lang,
         "summary": f"{best.vendor_name}: {what}" + (f", {rating_text}" if rating_text else "") + ".",
     }
