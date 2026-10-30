@@ -114,6 +114,15 @@ app.include_router(webhook_router)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
+@app.middleware("http")
+async def revalidate_static(request: Request, call_next):
+    """Static files are always revalidated (cheap 304s via ETag), so a stale copy is never used."""
+    response = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 # ----------------------------------------------------------------------------- models
 
 class RequestFields(BaseModel):
@@ -216,8 +225,14 @@ def _require_admin(request: Request) -> None:
 # ----------------------------------------------------------------------------- pages + config
 
 @app.get("/", include_in_schema=False)
-async def index() -> FileResponse:
-    return FileResponse(STATIC / "index.html")
+async def index() -> Response:
+    """The page, with its script and stylesheet URLs stamped with a content hash: after a deploy every browser (and
+    Render's edge cache) fetches the new files instead of running an old app.js against the new page."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    for name in ("app.js", "styles.css"):
+        digest = hashlib.sha1((STATIC / name).read_bytes()).hexdigest()[:10]
+        html = html.replace(f"/static/{name}", f"/static/{name}?v={digest}")
+    return Response(html, media_type="text/html", headers={"Cache-Control": "no-cache, must-revalidate"})
 
 
 @app.get("/api/health")
