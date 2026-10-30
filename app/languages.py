@@ -166,8 +166,29 @@ NAME_TO_CODE = {
     "punjabi": "pa", "ਪੰਜਾਬੀ": "pa", "पंजाबी": "pa",
     "odia": "od", "oriya": "od", "ଓଡ଼ିଆ": "od", "ଓଡିଆ": "od", "ओड़िया": "od", "उड़िया": "od",
 }
+_ORDER = ("en", "hi", "kn", "ta", "te", "mr", "bn", "gu", "ml", "pa", "od")
+# What each language calls the 11 languages (for "Shall I call them in Marathi?" said in Tamil)
+LANGUAGE_NAMES: dict[str, dict[str, str]] = {lang: dict(zip(_ORDER, row.split())) for lang, row in {
+    "en": "English Hindi Kannada Tamil Telugu Marathi Bengali Gujarati Malayalam Punjabi Odia",
+    "hi": "अंग्रेज़ी हिंदी कन्नड़ तमिल तेलुगु मराठी बांग्ला गुजराती मलयालम पंजाबी ओड़िया",
+    "mr": "इंग्रजी हिंदी कन्नड तमिळ तेलुगू मराठी बंगाली गुजराती मल्याळम पंजाबी ओडिया",
+    "gu": "અંગ્રેજી હિન્દી કન્નડ તમિલ તેલુગુ મરાઠી બંગાળી ગુજરાતી મલયાલમ પંજાબી ઓડિયા",
+    "bn": "ইংরেজি হিন্দি কন্নড় তামিল তেলুগু মারাঠি বাংলা গুজরাটি মালয়ালম পাঞ্জাবি ওড়িয়া",
+    "pa": "ਅੰਗਰੇਜ਼ੀ ਹਿੰਦੀ ਕੰਨੜ ਤਮਿਲ ਤੇਲਗੂ ਮਰਾਠੀ ਬੰਗਾਲੀ ਗੁਜਰਾਤੀ ਮਲਿਆਲਮ ਪੰਜਾਬੀ ਉੜੀਆ",
+    "od": "ଇଂରାଜୀ ହିନ୍ଦୀ କନ୍ନଡ଼ ତାମିଲ ତେଲୁଗୁ ମରାଠୀ ବଙ୍ଗଳା ଗୁଜୁରାଟୀ ମାଲାୟାଲମ ପଞ୍ଜାବୀ ଓଡ଼ିଆ",
+    "kn": "ಇಂಗ್ಲಿಷ್ ಹಿಂದಿ ಕನ್ನಡ ತಮಿಳು ತೆಲುಗು ಮರಾಠಿ ಬಂಗಾಳಿ ಗುಜರಾತಿ ಮಲಯಾಳಂ ಪಂಜಾಬಿ ಒಡಿಯಾ",
+    "ta": "ஆங்கிலம் இந்தி கன்னடம் தமிழ் தெலுங்கு மராத்தி வங்காளம் குஜராத்தி மலையாளம் பஞ்சாபி ஒடியா",
+    "te": "ఇంగ్లీష్ హిందీ కన్నడ తమిళం తెలుగు మరాఠీ బెంగాలీ గుజరాతీ మలయాళం పంజాబీ ఒడియా",
+    "ml": "ഇംഗ്ലീഷ് ഹിന്ദി കന്നഡ തമിഴ് തെലുങ്ക് മറാഠി ബംഗാളി ഗുജറാത്തി മലയാളം പഞ്ചാബി ഒഡിയ",
+}.items()}
+
+# Every language's name for every language counts when the user asks for a call language ("மராத்தியில் அழையுங்கள்")
+for _names in LANGUAGE_NAMES.values():
+    for _code, _name in _names.items():
+        NAME_TO_CODE.setdefault(_name.lower(), _code)
 _LANG_NAME_RE = re.compile("|".join(sorted(map(re.escape, NAME_TO_CODE), key=len, reverse=True)), re.I)
 _LANG_CUE_RE = re.compile(r"(language|bhasha|bhasa|speak|talk|call|bolo|baat|mein|me\b|in\b|madhe|la\b|bhashe|"
+                          r"भाष|ভাষ|ભાષ|ಭಾಷ|భాష|ഭാഷ|ਭਾਸ਼|ଭାଷ|மொழி|फोन|फ़ोन|ফোন|ફોન|ਫ਼ੋਨ|ଫୋନ|ಫೋನ್|ఫోన్|ഫോൺ|அழை|"
                           r"भाषा|में|बात|बोल|मध्ये|ಭಾಷೆ|ಲ್ಲಿ|மொழி|ல\b|భాష|లో|ভাষা|ভাষায়|ભાષા|માં|ഭാഷ|യിൽ|ਭਾਸ਼ਾ|ਵਿੱਚ|ଭାଷା|ରେ)",
                           re.I)
 
@@ -291,27 +312,39 @@ def script_language(text: str, current: str = "hi") -> Optional[str]:
     return code
 
 
-def user_language(text: str, heard: Optional[str] = None, current: str = "en") -> str:
-    """Which of the 11 languages the user just spoke or typed.
+def confident_language(text: str, heard: Optional[str] = None, current: str = "hi") -> Optional[str]:
+    """Which of the 11 languages a message is in, or None when it can't be told.
 
     The script decides when it can (Tamil, Bengali…; Devanagari is Hindi or Marathi by its words). Latin text is
     English, or Hindi when it is clearly romanized Hindi ("mujhe kal plumber chahiye"); `heard` is what speech
-    recognition detected. A short Latin reply ("ok", "2000", "yes") keeps the current language: a Tamil speaker who
-    says "okay" is still a Tamil speaker."""
+    recognition detected. Short Latin replies ("ok", "2000") and place names ("Koramangala, Bengaluru") are Latin in
+    every language, so they tell nothing."""
     by_script = script_language(text, current)
     if by_script:
         return by_script
     words = re.findall(r"[A-Za-z]+", text or "")
     heard = normalize(heard)
-    if heard and heard != "en" and len(words) >= 2:
+    # Speech recognition writes Indian languages in their own script, so Latin text it labelled "Kannada" is mostly
+    # names and English words: trust the label only for a real sentence
+    if heard and heard != "en" and len(words) >= 4:
         return heard
     if len(_HINGLISH_RE.findall(text or "")) >= 2:
         return "hi"
-    # Place and business names are Latin in every language: switch to English only on real English sentences
     english = sum(w.lower() in _ENGLISH_WORDS for w in words)
     if (english and len(words) >= 3) or len(words) >= 6:
         return "en"
-    return current if current in LANGUAGES else "en"
+    return None
+
+
+def user_language(text: str, heard: Optional[str] = None, current: str = "en") -> str:
+    """The language of a message, or `current` when the message doesn't show it."""
+    found = confident_language(text, heard, current)
+    return found or (current if current in LANGUAGES else "en")
+
+
+def mentions_language(text: str) -> bool:
+    """Does the message name a language at all ('in Hindi', 'தமிழ்ல', 'मराठी')?"""
+    return bool(_LANG_NAME_RE.search(text or ""))
 
 
 def writes_in(text: str, code: str) -> bool:

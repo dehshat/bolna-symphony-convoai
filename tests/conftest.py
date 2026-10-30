@@ -12,6 +12,7 @@ os.environ.update({
     "HYBRID_LIVE_DELAY_SECONDS": "0", "TOOL_SHARED_SECRET": "", "ADMIN_TOKEN": "", "BOLNA_API_KEY": "",
     "BOLNA_AGENT_ID": "", "BOLNA_AGENT_IDS": "", "RAZORPAY_KEY_ID": "", "RAZORPAY_KEY_SECRET": "",
     "WHATSAPP_TOKEN": "", "GEMINI_API_KEY": "", "PUBLIC_BASE_URL": "https://swarm.example.com",
+    "GEOCODE_PLACES": "false",
 })
 
 from app import config  # noqa: E402
@@ -24,6 +25,7 @@ def fresh_state(monkeypatch):
     state.reset(":memory:")
     places._cache.clear()
     places._geo_state.clear()
+    places._place_state.clear()
     intake.CONVERSATIONS.clear()
     localizer._cache.clear()
     bolna_client._ensure_failed.clear()

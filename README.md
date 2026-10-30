@@ -101,6 +101,16 @@ voice and Gemini works out which language it is (the browser's own speech recogn
 language it's told); typed text is told apart by its script (Tamil, Bengali…; Devanagari is Hindi or Marathi by its
 words; romanized Hindi counts as Hindi). Place names in English letters don't switch you to English.
 
+**The first message that shows your language fixes it for the whole conversation.** After that, saying "okay",
+reading out an English address or switching languages doesn't change it, and the mic transcribes in that language
+only. Messages that show no language ("2000", "Koramangala, Bengaluru") decide nothing. A new request detects afresh.
+
+**The call language is the local language of the place you give**, not the language you speak: the area/city list,
+the state of your GPS position, or for places not on the list, the state OpenStreetMap puts them in (`GEOCODE_PLACES`).
+It changes only if you give another place, or name a language for the calls ("call them in Hindi", "தமிழ் மொழியில்
+அழையுங்கள்"); a named language then stays even if the place changes. The model's own guess never changes it, and
+each call agent has one fixed-language transcriber and is told to stay in its language even if asked to switch.
+
 Every question, the one-line summary you confirm, the narration of the calls, the recommendation and its reasons, and
 the deal sheet come back in your language (`app/userlex.py`, also used when Gemini is off). The calls still use the
 call language: a Tamil speaker in Pune hears the Marathi calls narrated in Tamil. A time you say in your language

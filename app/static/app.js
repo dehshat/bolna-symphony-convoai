@@ -20,6 +20,7 @@
     glossOn: store.get("glossOn", "1") === "1",
     userLang: store.get("userLang", "auto"),   // "auto": detect the language of every message; or a code picked in ⋯
     spokenLang: "en",                          // the language Swarm answers in (detected, or the one picked)
+    langLocked: false,                         // fixed for this conversation once detected (or picked)
     lines: {}, sttDown: false,
     conv: { id: null, task: {}, ready: false, trace: [] },
     callLang: "hi", callLangReason: "", callLangLocked: false,
@@ -237,9 +238,11 @@
     setOrb("listening");
     showUser("");
     // Auto: record and let the server work out which of the 11 languages it is (browser speech recognition only
-    // understands the one language it is told). A fixed language, or no Gemini, uses the browser's recognition.
+    // understands the one language it is told). Once the conversation's language is fixed, it is transcribed in
+    // that language only. A language picked in ⋯, or no Gemini, uses the browser's recognition.
     const detect = S.userLang === "auto" && S.config?.gemini_enabled && !S.sttDown && Voice.canRecord();
-    const { text, error, language, failed } = detect ? await Voice.listenRecorder("") : await Voice.listen(S.spokenLang);
+    const { text, error, language, failed } = detect ? await Voice.listenRecorder(S.langLocked ? S.spokenLang : "")
+      : await Voice.listen(S.spokenLang);
     if (error === "not-allowed" || error === "service-not-allowed") {
       setOrb("idle"); toast("Microphone is blocked. Allow it in the browser, or type instead."); return;
     }
@@ -273,6 +276,7 @@
       setOrb("idle"); showBot("Sorry, I couldn't reach the server: " + e.message); return;
     }
     S.conv = { id: r.conversation_id, task: r.task || {}, ready: r.ready, trace: r.trace || [], service: r.service_name };
+    S.langLocked = !!r.user_lang_locked;
     await setSpokenLang(r.user_lang);
     if (r.call_language) {
       S.callLang = r.call_language.code; S.callLangReason = r.call_language.reason || ""; S.callLangLocked = !!r.call_language.locked;
@@ -748,7 +752,8 @@
   function newRequest() {
     if (S.ws) { S.ws.onclose = null; S.ws.close(); }
     clearInterval(S.poll); stopCountdown(); Voice.stopSpeaking(); Narrator.queue = [];
-    Object.assign(S, { session: null, phase: "intake", providers: [], sel: new Set(), dealShown: null, log: [], conv: { id: null, task: {}, ready: false, trace: [] } });
+    Object.assign(S, { session: null, phase: "intake", providers: [], sel: new Set(), dealShown: null, log: [], conv: { id: null, task: {}, ready: false, trace: [] },
+      langLocked: S.userLang !== "auto" });   // a new request detects the language afresh
     $("#calls").hidden = true; $("#shortlist").hidden = true; $("#task").hidden = true; $("#callList").innerHTML = "";
     dock(false);
     history.replaceState(null, "", location.pathname);

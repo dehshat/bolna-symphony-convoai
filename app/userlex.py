@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 
-from app import lexicon
+from app import languages, lexicon
 
 ALL = lexicon.ALL
 MONEY = {"price", "said", "target", "high", "ceiling", "amount", "fee"}
@@ -795,20 +795,7 @@ LINES: dict[str, dict[str, str]] = {
 }
 
 # What each language calls the 11 languages (for "Shall I call them in Marathi?" said in Tamil)
-LANGUAGE_NAMES: dict[str, dict[str, str]] = {lang: dict(zip(ALL, row.split())) for lang, row in {
-    # order: en hi kn ta te mr bn gu ml pa od  (= lexicon.ALL)
-    "en": "English Hindi Kannada Tamil Telugu Marathi Bengali Gujarati Malayalam Punjabi Odia",
-    "hi": "अंग्रेज़ी हिंदी कन्नड़ तमिल तेलुगु मराठी बांग्ला गुजराती मलयालम पंजाबी ओड़िया",
-    "mr": "इंग्रजी हिंदी कन्नड तमिळ तेलुगू मराठी बंगाली गुजराती मल्याळम पंजाबी ओडिया",
-    "gu": "અંગ્રેજી હિન્દી કન્નડ તમિલ તેલુગુ મરાઠી બંગાળી ગુજરાતી મલયાલમ પંજાબી ઓડિયા",
-    "bn": "ইংরেজি হিন্দি কন্নড় তামিল তেলুগু মারাঠি বাংলা গুজরাটি মালয়ালম পাঞ্জাবি ওড়িয়া",
-    "pa": "ਅੰਗਰੇਜ਼ੀ ਹਿੰਦੀ ਕੰਨੜ ਤਮਿਲ ਤੇਲਗੂ ਮਰਾਠੀ ਬੰਗਾਲੀ ਗੁਜਰਾਤੀ ਮਲਿਆਲਮ ਪੰਜਾਬੀ ਉੜੀਆ",
-    "od": "ଇଂରାଜୀ ହିନ୍ଦୀ କନ୍ନଡ଼ ତାମିଲ ତେଲୁଗୁ ମରାଠୀ ବଙ୍ଗଳା ଗୁଜୁରାଟୀ ମାଲାୟାଲମ ପଞ୍ଜାବୀ ଓଡ଼ିଆ",
-    "kn": "ಇಂಗ್ಲಿಷ್ ಹಿಂದಿ ಕನ್ನಡ ತಮಿಳು ತೆಲುಗು ಮರಾಠಿ ಬಂಗಾಳಿ ಗುಜರಾತಿ ಮಲಯಾಳಂ ಪಂಜಾಬಿ ಒಡಿಯಾ",
-    "ta": "ஆங்கிலம் இந்தி கன்னடம் தமிழ் தெலுங்கு மராத்தி வங்காளம் குஜராத்தி மலையாளம் பஞ்சாபி ஒடியா",
-    "te": "ఇంగ్లీష్ హిందీ కన్నడ తమిళం తెలుగు మరాఠీ బెంగాలీ గుజరాతీ మలయాళం పంజాబీ ఒడియా",
-    "ml": "ഇംഗ്ലീഷ് ഹിന്ദി കന്നഡ തമിഴ് തെലുങ്ക് മറാഠി ബംഗാളി ഗുജറാത്തി മലയാളം പഞ്ചാബി ഒഡിയ",
-}.items()}
+LANGUAGE_NAMES = languages.LANGUAGE_NAMES
 
 BROWSER_KEYS = ("searching", "found", "none", "calling", "quoted", "hidden", "hold", "slot", "walk", "failed",
                 "nodeal", "recommend", "nobody", "confirmed", "pick", "unknown", "stopped", "no_location", "choose",
