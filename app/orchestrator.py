@@ -7,10 +7,11 @@ import logging
 import time
 from typing import Optional
 
-from app import config
+from app import config, languages, lexicon, localizer
 from app.auction_engine import AuctionEngine, LegStatus
-from app.bolna_client import BolnaClient, BolnaError, parse_execution
-from app.briefs import opening_line, persona_by_name
+from app.bolna_client import BolnaClient, BolnaError, ensure_agent, parse_execution
+from app.briefs import localize_when, opening_line, persona_by_name
+from app.pricing import format_inr
 from app.simulator import SimulatedLeg, release_message
 
 log = logging.getLogger("orchestrator")
@@ -20,6 +21,31 @@ class Orchestrator:
     def __init__(self, engine: AuctionEngine):
         self.engine = engine
         self.tasks: dict[str, list[asyncio.Task]] = {}
+        self.prep: dict[str, asyncio.Task] = {}
+
+    async def _prepare(self, session_id: str) -> None:
+        """Linguist agent: phrase the job in each call language before anyone is dialled (Gemini, if available)."""
+        session = self.engine.get(session_id)
+        for language in dict.fromkeys(l.language for l in session.legs.values()):
+            if language not in lexicon.NATIVE or language in session.localized:
+                continue
+            try:
+                local = await asyncio.wait_for(localizer.localize_job(session.request, language), timeout=8)
+            except Exception as exc:  # never hold up the calls
+                log.info("localize %s failed: %s", language, exc)
+                local = {}
+            session.localized[language] = local
+            how = (f"phrased the job in {languages.name(language)} with Gemini ({', '.join(sorted(local))})" if local
+                   else f"using built-in {languages.name(language)} phrasing")
+            await self.engine.trace(session_id, "linguist", how)
+
+    async def _ready(self, session_id: str) -> None:
+        task = self.prep.get(session_id)
+        if task is not None:
+            try:
+                await asyncio.shield(task)
+            except Exception:
+                pass
 
     def plan(self, session_id: str) -> list[tuple[str, float]]:
         """Dial schedule. Waves are staggered so the first quote exists before later legs need leverage.
@@ -51,6 +77,11 @@ class Orchestrator:
     async def start(self, session_id: str) -> None:
         session = self.engine.get(session_id)
         session.status = "RUNNING"
+        self.prep[session_id] = asyncio.create_task(self._prepare(session_id))
+        lang = next(iter(session.legs.values())).language if session.legs else "hi"
+        await self.engine.trace(session_id, "dialer", f"{len(session.legs)} call(s) in {languages.name(lang)}, "
+                                f"{session.mode} mode" + (", one after another (same test phone)"
+                                                          if self.sequential(session_id) else ""))
         tasks = []
         plan = self.plan(session_id)
         if self.sequential(session_id):
@@ -67,6 +98,7 @@ class Orchestrator:
 
     async def _run_live_chain(self, session_id: str, leg_ids: list[str], delay: float) -> None:
         await asyncio.sleep(delay)
+        await self._ready(session_id)
         for i, leg_id in enumerate(leg_ids):
             if self.engine.get(session_id).locked_leg_id:
                 break  # the buyer already chose: don't ring anyone else
@@ -87,6 +119,7 @@ class Orchestrator:
         leg = self.engine.get(session_id).legs[leg_id]
         speed = max(config.settings.sim_speed, 0.05)
         await asyncio.sleep(delay / speed if leg.mode == "sim" else delay)
+        await self._ready(session_id)
         if leg.mode == "sim":
             session = self.engine.get(session_id)
             persona = leg.persona or persona_by_name(session.request.category, leg.vendor_name) or \
@@ -99,17 +132,22 @@ class Orchestrator:
         s = config.settings
         session = self.engine.get(session_id)
         leg = session.legs[leg_id]
-        agent_id = s.agent_id_for(leg.language)
-        if not (s.bolna_api_key and agent_id):
+        if not s.bolna_api_key:
             await self.engine.set_leg_status(session_id, leg_id, LegStatus.FAILED,
-                                             error="Bolna not configured: set BOLNA_API_KEY and sync the agent")
+                                             error="Bolna not configured: set BOLNA_API_KEY")
+            return
+        agent_id = await self._agent(session_id, leg_id, leg.language)
+        if not agent_id:
             return
         if not leg.vendor_phone:
             await self.engine.set_leg_status(session_id, leg_id, LegStatus.FAILED, error="No phone number for leg")
             return
         req = session.request
-        user_data = call_user_data(session_id, leg_id, req, leg.vendor_name, leg.language)
+        user_data = call_user_data(session_id, leg_id, req, leg.vendor_name, leg.language,
+                                   local=session.localized.get(leg.language))
         await self.engine.set_leg_status(session_id, leg_id, LegStatus.DIALING)
+        await self.engine.trace(session_id, "dialer", f"calling {leg.vendor_name} in {languages.name(leg.language)}",
+                                leg_id)
         await self.engine.add_transcript(session_id, leg_id, "system", f"Dialing {leg.vendor_phone[:3]}•••• via Bolna")
         try:
             resp = await BolnaClient().place_call(agent_id, leg.vendor_phone, user_data, s.bolna_from_number or None)
@@ -124,6 +162,20 @@ class Orchestrator:
             # Background safety net: the dial chain must not wait on polling (it only waits for the call to end)
             task = asyncio.create_task(self._poll_execution(session_id, leg_id, execution_id))
             self.tasks.setdefault(session_id, []).append(task)
+
+    async def _agent(self, session_id: str, leg_id: str, language: str) -> str:
+        """The Bolna voice agent for this language, created on first use. Fails the leg with a clear reason."""
+        s = config.settings
+        if not s.bolna_agent_ids.get(language):
+            await self.engine.trace(session_id, "dialer", f"setting up the {languages.name(language)} voice agent",
+                                    leg_id)
+        try:
+            return await ensure_agent(language)
+        except BolnaError as exc:
+            await self.engine.set_leg_status(session_id, leg_id, LegStatus.FAILED,
+                                             error=f"Couldn't set up the {languages.name(language)} voice agent: "
+                                                   f"{str(exc)[:240]}")
+            return ""
 
     async def _poll_execution(self, session_id: str, leg_id: str, execution_id: str) -> None:
         """Safety net for when the execution webhook can't reach us (wrong PUBLIC_BASE_URL, etc.)."""
@@ -162,12 +214,17 @@ class Orchestrator:
         s = config.settings
         session = self.engine.get(session_id)
         leg = session.legs[leg_id]
-        agent_id = s.agent_id_for(leg.language)
-        if leg.mode != "live" or not (s.bolna_api_key and agent_id and leg.vendor_phone):
+        if leg.mode != "live" or not (s.bolna_api_key and leg.vendor_phone):
+            return None
+        try:
+            agent_id = await ensure_agent(leg.language)
+        except BolnaError as exc:
+            await self.engine.add_transcript(session_id, leg_id, "system", f"Confirmation call not placed: {exc}")
             return None
         req = session.request
-        deal = deal_text(req, leg.neg.best_all_in, leg.neg.slot)
-        user_data = call_user_data(session_id, leg_id, req, leg.vendor_name, leg.language, confirm_deal=deal)
+        deal = deal_text(req, leg.neg.best_all_in, leg.neg.slot, leg.language)
+        user_data = call_user_data(session_id, leg_id, req, leg.vendor_name, leg.language, confirm_deal=deal,
+                                   local=session.localized.get(leg.language))
         if self.sequential(session_id):
             await self._wait_call_over(session_id, leg_id, timeout=90)
             for other in session.legs.values():
@@ -184,11 +241,15 @@ class Orchestrator:
             leg.confirm_execution_id = execution_id
             self.engine._execution_index[execution_id] = (session_id, leg_id)
         await self.engine.add_transcript(session_id, leg_id, "system", f"📞 Confirmation call placed: {deal}")
+        await self.engine.trace(session_id, "dialer", f"confirmation call to {leg.vendor_name}: {deal}", leg_id)
         return execution_id
 
     def cancel(self, session_id: str) -> None:
         for task in self.tasks.pop(session_id, []):
             task.cancel()
+        prep = self.prep.pop(session_id, None)
+        if prep is not None:
+            prep.cancel()
 
 
 NEGOTIATE_GOAL = ("Find out if they can do the job, get their best all-inclusive price, then bargain using only the "
@@ -199,40 +260,37 @@ APPOINTMENT_GOAL = ("Book an appointment. Ask for a slot at the customer's prefe
 CONFIRM_GOAL = ("This is a CONFIRMATION call: the customer has chosen this provider ({deal}). Say so clearly, ask them "
                 "to note it, answer simple questions from THE JOB, say the details will come on WhatsApp, then thank "
                 "them and end the call. Do not renegotiate or change anything; no tool call is needed.")
-CONFIRM_OPENING = {
-    "hi": "नमस्ते जी, मैं {service} के बारे में दोबारा call कर रहा हूँ। Customer ने आपको confirm कर दिया है: {deal}।",
-    "kn": "ನಮಸ್ಕಾರ, {service} ಬಗ್ಗೆ ಮತ್ತೆ call ಮಾಡ್ತಿದ್ದೀನಿ. Customer ನಿಮ್ಮನ್ನ confirm ಮಾಡಿದ್ದಾರೆ: {deal}.",
-    "en": "Hello, calling back about the {service}. The customer has confirmed you: {deal}.",
-}
 
 
-def deal_text(req, price: Optional[int], slot: str) -> str:
-    from app.pricing import format_inr
+def deal_text(req, price: Optional[int], slot: str, language: str = "en") -> str:
+    """'tomorrow 11 AM, fee ₹500' / 'कल सुबह 11 बजे, सब मिलाकर ₹2,300' in the call's language."""
     parts = []
-    if slot:
-        parts.append(slot)
-    elif req.when:
-        parts.append(req.when)
+    if slot or req.when:
+        parts.append(localize_when(slot or req.when, language))
     if price:
-        parts.append(f"{format_inr(price)} all-inclusive" if req.goal == "negotiate" else f"fee {format_inr(price)}")
-    return ", ".join(parts) or req.service_label
+        key = "all_in" if req.goal == "negotiate" else "fee"
+        word = lexicon.word(language, key)
+        parts.append(f"{format_inr(price)} {word}" if key == "all_in" else f"{word} {format_inr(price)}")
+    return ", ".join(parts) or lexicon.service_name(req.category, req.service_label, language)
 
 
 def call_user_data(session_id: str, leg_id: str, req, vendor_name: str, language: str,
-                   confirm_deal: str = "") -> dict:
+                   confirm_deal: str = "", local: Optional[dict] = None) -> dict:
     """Variables substituted into the Bolna agent's prompt and welcome message for one call."""
     where = f"from {req.pickup} to {req.drop}" if req.drop else (req.location or req.pickup)
     brief = f"{req.service_label}" + (f" ({req.details})" if req.details else "") + \
         f". Where: {where}. When: {req.when or 'flexible'}."
+    job_native = opening_line(req, language, local=local)
     if confirm_deal:
         goal = CONFIRM_GOAL.format(deal=confirm_deal)
-        opening = CONFIRM_OPENING.get(language, CONFIRM_OPENING["en"]).format(service=req.service_label,
-                                                                              deal=confirm_deal)
+        service = (local or {}).get("service") or lexicon.service_name(req.category, req.service_label, language)
+        opening = (lexicon.OPENINGS.get(language) or lexicon.OPENINGS["en"])["confirm"].format(service=service,
+                                                                                               deal=confirm_deal)
     else:
         goal = (APPOINTMENT_GOAL if req.goal == "appointment" else NEGOTIATE_GOAL).format(when=req.when or "flexible")
-        opening = opening_line(req, language, native=True)
+        opening = job_native
     return {"session_id": session_id, "leg_id": leg_id, "vendor_name": vendor_name, "service_brief": brief,
-            "opening_line": opening, "call_goal": goal, "language": language}
+            "job_native": job_native, "opening_line": opening, "call_goal": goal, "language": language}
 
 
 def explain_call_error(message: str, phone: str) -> str:

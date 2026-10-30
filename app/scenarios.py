@@ -6,9 +6,12 @@ charges) into `submit_and_counter` / `check_auction_status`, and checks two thin
   * the outcome (accepted / countered / walked away / slot held, at what price, what was captured), and
   * that the conversation makes sense: no hold above the walk-away ceiling, the ceiling never spoken, the budget
     never revealed before the vendor quotes, no line repeated back to back, at most the allowed counter-offers,
-    and every line in the call's language.
+    and every line purely in the call's language (not one English word on a Marathi or Tamil call).
 
-Used by tests/test_conversation_scenarios.py and by ⚙︎ Setup → "Run self-test" on a deployed instance.
+`run_all(languages=...)` replays every scenario in each of the 11 call languages. Expectations about wording are
+matched against the line or its English meaning, so they hold in every language.
+
+Used by tests/test_conversation_scenarios.py and by Setup → "Run call self-test" on a deployed instance.
 """
 
 from __future__ import annotations
@@ -18,15 +21,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from app import briefs
+from app import briefs, languages, lexicon
 from app.auction_engine import AuctionEngine, Store
 from app.negotiation import ROUNDS_OVERRIDE
 from app.pricing import ServiceRequest, format_inr
 
 HOLDS = {"ACCEPT_HOLD", "FINAL_HOLD", "HOLD_SLOT", "INSPECTION_HOLD"}
-# Words that only appear in the English templates: a Hindi/Kannada call must never fall back to them
-ENGLISH_ONLY = re.compile(r"\b(The customer|Great,|Could you|What's your|Please note|Thank you so much|"
-                          r"I'll confirm|as your final)\b")
 
 
 @dataclass
@@ -129,7 +129,7 @@ SCENARIOS: list[Scenario] = [
              plumber(), [Turn("500 for labour, parts extra whatever is needed.", 500,
                               driver_bata="included", other_charges="parts extra at actuals",
                               extras="parts at actuals")],
-             {"final": "ACCEPT_HOLD", "price": 500, "excluded": ["parts"], "say": r"parts.*(alag|separately)"}),
+             {"final": "ACCEPT_HOLD", "price": 500, "excluded": ["parts"], "say": r"parts.*separately"}),
     Scenario("ac_gas_refill_excluded", "AC: ₹600 + ₹299 visiting, gas refill ₹2,500 extra: gas is excluded.", ac(),
              [Turn("600 service charge, 299 visiting, gas refill 2500 extra if needed.", 600,
                    driver_bata="visiting 299 extra", other_charges="gas refill extra 2500",
@@ -195,7 +195,7 @@ SCENARIOS: list[Scenario] = [
     # ---------------------------------------------------------------- other services and units
     Scenario("cook_daily_rate", "Cook says ₹500/day for a monthly job: 26 working days = ₹13,000/month.", cook(),
              [Turn("500 rupees per day.", 500, "per_day", other_charges="included")],
-             {"all_in_seen": 13000, "say": r"mahine"}),
+             {"all_in_seen": 13000, "say": r"a month"}),
     Scenario("maid_hourly_rate", "Monthly maid quotes ₹150/hour: ask the monthly total, then decide on it.",
              {"category": "maid", "service_label": "maid", "target_price": 5000, "walkaway_ceiling": 7000,
               "when": "from Monday", "location": "BTM Layout", "details": "sweeping, mopping, 2 hours a day"},
@@ -317,16 +317,18 @@ SCENARIOS: list[Scenario] = [
 
 # ---------------------------------------------------------------------------- runner
 
-async def run_scenario(sc: Scenario) -> dict:
+async def run_scenario(sc: Scenario, language: Optional[str] = None) -> dict:
+    language = language or sc.language
     engine = AuctionEngine(Store(":memory:"))
     req = ServiceRequest(**sc.request)
     session = await engine.create_session(
-        req, [{"name": n, "language": sc.language, "mode": "live"} for n in sc.legs], mode="live")
+        req, [{"name": n, "language": language, "mode": "live"} for n in sc.legs], mode="live")
     sid = session.session_id
-    transcript: list[dict] = [{"leg": "A", "role": "agent", "text": briefs.opening_line(req, sc.language),
-                               "action": "OPENING"}]
+    opening = briefs.opening_line(req, language)
+    transcript: list[dict] = [{"leg": "A", "role": "agent", "text": opening, "action": "OPENING"}]
     replies: list[dict] = []
-    problems: list[str] = []
+    problems: list[str] = _purity(opening, language, places=(req.location, req.pickup, req.drop),
+                                  what="opening")
     vendor_amounts: set[int] = set()
     for turn in sc.turns:
         args = turn.args(sid)
@@ -347,9 +349,9 @@ async def run_scenario(sc: Scenario) -> dict:
             transcript.append({"leg": leg, "role": "vendor", "text": turn.said or str(turn.raw.get("vendor_said"))})
         transcript.append({"leg": leg, "role": "agent", "text": resp.get("say_this", ""), "action": resp["action"],
                            "end_call": resp.get("end_call"), "price": resp.get("agreed_price_inr"),
-                           "all_in": resp.get("vendor_all_in_estimate_inr")})
+                           "all_in": resp.get("vendor_all_in_estimate_inr"), "meaning": resp.get("meaning")})
         replies.append({**resp, "leg": leg})
-        problems += _sanity(req, sc.language, resp, replies, vendor_amounts)
+        problems += _sanity(req, language, resp, replies, vendor_amounts)
 
     if sc.lock:
         await engine.lock_winner(sid, sc.lock)
@@ -361,7 +363,22 @@ async def run_scenario(sc: Scenario) -> dict:
             replies.append({**resp, "leg": leg_id, "after_lock": True})
     problems += _expectations(sc, session, replies)
     return {"name": sc.name, "about": sc.about, "ok": not problems, "problems": problems,
-            "transcript": transcript, "language": sc.language}
+            "transcript": transcript, "language": language}
+
+
+def _purity(text: str, language: str, places: tuple = (), what: str = "line") -> list[str]:
+    """A line on a non-English call must contain no English (Latin) word, apart from place names, and no letters
+    from another Indian script."""
+    if language not in lexicon.NATIVE or not text:
+        return []
+    out = []
+    english = languages.latin_words(text, allow=tuple(p.split(",")[0].strip() for p in places if p))
+    if english:
+        out.append(f"English words {english} in a {languages.name(language)} {what}: {text}")
+    foreign = languages.foreign_letters(text, language)
+    if foreign:
+        out.append(f"letters from another script {foreign[:5]} in a {languages.name(language)} {what}: {text}")
+    return out
 
 
 def _sanity(req: ServiceRequest, language: str, resp: dict, replies: list, vendor_amounts: set) -> list[str]:
@@ -382,8 +399,7 @@ def _sanity(req: ServiceRequest, language: str, resp: dict, replies: list, vendo
             same_leg[-1].get("state_version") != same_leg[-2].get("state_version") and \
             not same_leg[-1].get("duplicate"):
         out.append(f"repeated the same line: {say}")
-    if language in {"hi", "kn"} and ENGLISH_ONLY.search(say):
-        out.append(f"English template on a {language} call: {say}")
+    out += _purity(say, language)
     return out
 
 
@@ -419,10 +435,13 @@ def _expectations(sc: Scenario, session, replies: list) -> list[str]:
             out.append(f"not listed as excluded: {missing} (got {got!r})")
     if "details" in e and not re.search(e["details"], " ".join(leg.details), re.I):
         out.append(f"details not captured: {leg.details}")
-    if "say" in e and not any(re.search(e["say"], r.get("say_this", ""), re.I) for r in main):
+    def said(r: dict) -> str:   # the line as spoken and its English meaning
+        return f"{r.get('say_this', '')} || {r.get('meaning', '')}"
+
+    if "say" in e and not any(re.search(e["say"], said(r), re.I) for r in main):
         out.append(f"no line matched /{e['say']}/")
     if "not_say" in e:
-        bad = [r["say_this"] for r in main if re.search(e["not_say"], r.get("say_this", ""), re.I)]
+        bad = [r["say_this"] for r in main if re.search(e["not_say"], said(r), re.I)]
         if bad:
             out.append(f"said something it must not: {bad}")
     if e.get("same_reply_twice") and len(main) >= 2 and main[-1]["say_this"] != main[-2]["say_this"]:
@@ -430,7 +449,7 @@ def _expectations(sc: Scenario, session, replies: list) -> list[str]:
     b = [r for r in replies if r["leg"] == "B" and not r.get("after_lock")]
     if "leg_B_action" in e and (not b or b[-1]["action"] != e["leg_B_action"]):
         out.append(f"leg B {b[-1]['action'] if b else None}, expected {e['leg_B_action']}")
-    if "leg_B_say" in e and (not b or not re.search(e["leg_B_say"], b[-1]["say_this"])):
+    if "leg_B_say" in e and (not b or not re.search(e["leg_B_say"], said(b[-1]))):
         out.append(f"leg B line didn't cite the real competitor quote: {b[-1]['say_this'] if b else ''}")
     after = [r for r in replies if r.get("after_lock")]
     if "after_lock_B" in e and (not after or after[0]["action"] != e["after_lock_B"]):
@@ -438,14 +457,30 @@ def _expectations(sc: Scenario, session, replies: list) -> list[str]:
     return out
 
 
-async def run_all(names: Optional[list[str]] = None) -> dict:
+async def run_all(names: Optional[list[str]] = None, languages_: Optional[list[str]] = None) -> dict:
+    """Every scenario in its own language, or (languages_=[...]) every scenario in each of those languages."""
     chosen = [s for s in SCENARIOS if not names or s.name in names]
     token = ROUNDS_OVERRIDE.set(1)    # scenarios are written for the default one-counter policy
     try:
-        results = [await run_scenario(s) for s in chosen]
+        if languages_:
+            results = [await run_scenario(s, lang) for lang in languages_ for s in chosen]
+        else:
+            results = [await run_scenario(s) for s in chosen]
     finally:
         ROUNDS_OVERRIDE.reset(token)
     return {"passed": sum(r["ok"] for r in results), "total": len(results), "results": results}
+
+
+async def language_sweep() -> dict:
+    """All scenarios × all 11 call languages: the summary shown by the self-test."""
+    report = await run_all(languages_=list(languages.CODES))
+    by_lang: dict[str, list] = {}
+    for r in report["results"]:
+        by_lang.setdefault(r["language"], []).append(r)
+    return {"passed": report["passed"], "total": report["total"],
+            "languages": {code: {"name": languages.name(code), "passed": sum(x["ok"] for x in rs), "total": len(rs),
+                                 "failures": [{"name": x["name"], "problems": x["problems"]} for x in rs if not x["ok"]]}
+                          for code, rs in by_lang.items()}}
 
 
 def render(report: dict) -> str:
@@ -457,6 +492,8 @@ def render(report: dict) -> str:
             who = "AGENT " if t["role"] == "agent" else "VENDOR"
             tag = f" [{t['action']}]" if t.get("action") else ""
             lines.append(f"    {t['leg']} {who}{tag}: {t['text']}")
+            if t.get("meaning") and t["meaning"] != t["text"]:
+                lines.append(f"           ({t['meaning']})")
         for p in r["problems"]:
             lines.append(f"    !! {p}")
         lines.append("")

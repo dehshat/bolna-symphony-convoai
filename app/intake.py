@@ -1,21 +1,20 @@
-"""Chat intake: talk to the user until we know exactly what to arrange.
+"""Intake: talk to the user (by voice or text) until we know exactly what to arrange, then hand over to the calls.
 
-Each user message is understood by Gemini when it's available (one request per message), with a rule-based
-extractor as the always-on fallback. The questions themselves are deterministic, so the conversation is
-predictable even when the LLM quota is used up.
-
-Order of questions: service → where → when → details → budget (negotiated services only) → ready.
+The dialogue state is deterministic: order of questions service → where → when → details → budget (negotiated
+services only) → confirm. Each message is understood by rules and, when available, by the concierge agent (a Gemini
+chat model, see app.concierge), which also words the replies in the user's own language. The call language follows
+the place ("Kothrud, Pune" → Marathi) unless the user picks one.
 """
 
 from __future__ import annotations
 
-import json
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-from app import llm, places, services
+from app import concierge, languages, llm, places, services
 from app.pricing import ServiceRequest, format_inr, parse_inr
 
 BENGALURU_AREAS = (
@@ -27,8 +26,15 @@ BENGALURU_AREAS = (
     "Kammanahalli", "Basaveshwaranagar", "Wilson Garden", "Richmond Town", "Shivajinagar", "Majestic",
     "Kempegowda Airport", "Airport",
 )
-CITIES = ("Bengaluru", "Bangalore", "Mumbai", "Delhi", "Pune", "Hyderabad", "Chennai", "Kolkata", "Mysuru", "Mysore",
-          "Gurgaon", "Gurugram", "Noida", "Ahmedabad", "Jaipur", "Kochi", "Coorg", "Madikeri")
+CITIES = ("Bengaluru", "Bangalore", "Mumbai", "Delhi", "New Delhi", "Pune", "Hyderabad", "Secunderabad", "Chennai",
+          "Kolkata", "Mysuru", "Mysore", "Gurgaon", "Gurugram", "Noida", "Ghaziabad", "Faridabad", "Ahmedabad", "Surat",
+          "Vadodara", "Rajkot", "Jaipur", "Kochi", "Ernakulam", "Thiruvananthapuram", "Trivandrum", "Kozhikode",
+          "Thrissur", "Coorg", "Madikeri", "Mangaluru", "Mangalore", "Hubli", "Nagpur", "Nashik", "Thane",
+          "Navi Mumbai", "Kolhapur", "Coimbatore", "Madurai", "Tiruchirappalli", "Visakhapatnam", "Vizag",
+          "Vijayawada", "Warangal", "Howrah", "Siliguri", "Amritsar", "Ludhiana", "Jalandhar", "Chandigarh", "Mohali",
+          "Patiala", "Bhubaneswar", "Cuttack", "Lucknow", "Kanpur", "Patna", "Bhopal", "Indore", "Varanasi", "Agra",
+          "Dehradun", "Ranchi", "Raipur", "Guwahati")
+_CITY_SET = {c.lower() for c in CITIES}
 
 WHEN_RE = re.compile(
     r"\b(right now|now|asap|urgent(?:ly)?|today|tonight|tomorrow|day after tomorrow|this (?:week(?:end)?|evening|"
@@ -52,11 +58,19 @@ class Intake:
     task: dict = field(default_factory=dict)
     asked: list = field(default_factory=list)
     last_question: str = ""
+    user_lang: str = "en"           # the language the user talks to the app in
+    trace: list = field(default_factory=list)
+    touched: float = field(default_factory=time.time)
 
     def public(self) -> dict:
         missing = missing_fields(self.task, self.asked)
+        code = self.task.get("call_language") or languages.DEFAULT
         return {"conversation_id": self.id, "messages": self.messages[-30:], "task": self.task,
-                "ready": not missing, "missing": missing}
+                "ready": not missing, "missing": missing, "user_lang": self.user_lang,
+                "call_language": {**languages.get(code).public(),
+                                  "reason": self.task.get("call_language_reason", ""),
+                                  "locked": bool(self.task.get("call_language_locked"))},
+                "trace": self.trace[-20:]}
 
 
 CONVERSATIONS: dict[str, Intake] = {}
@@ -70,9 +84,15 @@ def _find_location(text: str) -> str:
             city = next((c for c in CITIES if re.search(rf"\b{c}\b", text, re.I)), "Bengaluru")
             return f"{area}, {city}"
     m = re.search(r"\b(?:in|at|near|around|nearby)\s+([A-Za-z][\w .'-]{2,40}?)(?=[,.!?]|\s+(?:for|by|on|at|tomorrow|"
-                  r"today|tonight|this|next|around|under|with|budget)\b|$)", text, re.I)
-    if m and not WHEN_RE.fullmatch(m.group(1).strip()):
-        return _proper(m.group(1).strip())
+                  r"today|tonight|this|next|around|under|with|budget|from)\b|$)", text, re.I)
+    if m and not WHEN_RE.fullmatch(m.group(1).strip()) and \
+            m.group(1).strip().split()[0].lower() not in languages.NAME_TO_CODE:   # "call them in Hindi" isn't a place
+        place = _proper(m.group(1).strip())
+        # "in Kothrud, Pune": keep the city too (it decides the call language)
+        tail = re.match(r"\s*,\s*([A-Za-z][A-Za-z .'-]{2,30}?)(?=[,.!?]|\s+\w|$)", text[m.end():])
+        if tail and tail.group(1).strip().lower() in _CITY_SET and tail.group(1).strip().lower() != place.lower():
+            place += ", " + _proper(tail.group(1).strip())
+        return place
     city = next((c for c in CITIES if re.search(rf"\b{c}\b", text, re.I)), "")
     return city
 
@@ -150,6 +170,8 @@ def extract_rules(text: str, task: dict, asking: str) -> dict:
     if pickup:
         out.update(pickup=pickup, drop=drop, location=task.get("location") or pickup)
     loc = _find_location(text)
+    if asking == "location" and not pickup and "," in text and len(text.split()) <= 6 and not re.search(r"\d", text):
+        loc = ", ".join(_proper(p.strip()) for p in text.strip(" .!?").split(",") if p.strip())  # "Kothrud, Pune"
     if loc and not pickup:
         out["location"] = loc
     elif not pickup and re.search(r"\bnear\s*(?:me|by)\b|\bnearby\b|\b(?:my|current|live) location\b", text, re.I):
@@ -173,46 +195,6 @@ def extract_rules(text: str, task: dict, asking: str) -> dict:
     return out
 
 
-async def extract_llm(intake: Intake, text: str) -> dict:
-    """One Gemini call per message; anything it can't fill stays empty."""
-    keys = ", ".join(s.key for s in services.SERVICES)
-    convo = "\n".join(f"{m['role']}: {m['text']}" for m in intake.messages[-8:])
-    prompt = (f"You help a user in India arrange a local service. Conversation so far:\n{convo}\nuser: {text}\n\n"
-              f"Current draft (JSON): {json.dumps(intake.task)}\n\n"
-              "Update the draft from the conversation. Return ONLY JSON with these keys (use \"\" or 0 when unknown):\n"
-              f'service_key: one of [{keys}, other]; service_label: short name of what they need (e.g. "home cook"); '
-              'goal: "negotiate" (price-based job) or "appointment" (clinic/doctor/salon/lawyer slot booking); '
-              "location: area and city; pickup and drop (only for cabs/movers/courier); when: date/time as said; "
-              "details: concrete requirements in one short line; target_price and walkaway_ceiling: integers in rupees "
-              "(only if the user stated a budget); est_km: total km for trips (0 if not a trip).")
-    raw = await llm.generate(prompt, max_tokens=300, temperature=0.1, json_mode=True, timeout=6)
-    if not raw:
-        return {}
-    try:
-        data = json.loads(re.sub(r"^```(json)?|```$", "", raw.strip()))
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    out = {}
-    for key in ("service_key", "service_label", "goal", "location", "pickup", "drop", "when", "details"):
-        value = data.get(key)
-        if isinstance(value, str) and value.strip():
-            out[key] = value.strip()[:240]
-    if out.get("service_key") and out["service_key"] not in services.BY_KEY:
-        out["service_key"] = "other"
-    for key in ("target_price", "walkaway_ceiling"):
-        value = parse_inr(data.get(key))
-        if value and value >= 100:
-            out[key] = value
-    try:
-        if float(data.get("est_km") or 0) > 0:
-            out["est_km"] = float(data["est_km"])
-    except (TypeError, ValueError):
-        pass
-    return out
-
-
 # ---------------------------------------------------------------------------- dialogue
 
 def missing_fields(task: dict, asked: list) -> list[str]:
@@ -231,29 +213,41 @@ def missing_fields(task: dict, asked: list) -> list[str]:
     return missing
 
 
-def question(field_name: str, task: dict) -> tuple[str, list[str]]:
+def question(field_name: str, task: dict, user_lang: str = "en") -> tuple[str, list[str]]:
+    """The built-in question for a field (used when the concierge model is unavailable). English, or Hindi."""
     svc = services.get(task.get("service_key"), task.get("service_label", ""))
     label = task.get("service_label") or svc.label
     generic = svc.key == "other"
+    hi = user_lang == "hi"
     if field_name == "service":
-        return ("Hi! Tell me what you need and I'll find nearby providers, call them, and fix the best deal or "
-                "appointment. A cook, plumber, doctor's visit, movers, a cab: anything.",
+        return (concierge.HINDI["greet"] if hi else
+                "Hi! Tell me what you need, and I'll find the best-rated people nearby, call them in the local "
+                "language, and fix the best deal or appointment.",
                 ["Home cook for my family", "Dentist appointment", "Plumber for a leak", "Cab to the airport"])
     if field_name == "location":
         if svc.transport:
-            return f"Got it: {label}. Where from, and where to?", ["From JP Nagar to Kempegowda Airport"]
-        return ("Got it. Which area should I search in?" if generic else
-                f"Got it: {label}. Which area should I search in?"), ["📍 Use my current location",
-                                                                        "JP Nagar, Bengaluru", "Koramangala, Bengaluru"]
+            return (concierge.HINDI["location_route"].format(label=label) if hi else
+                    f"Got it: {label}. Where from, and where to?"), ["From JP Nagar to Kempegowda Airport"]
+        return ((concierge.HINDI["location"].format(label=label) if hi else
+                 "Got it. Which area should I search in?" if generic else f"Got it: {label}. Which area should I search in?"),
+                ["📍 Use my current location", "Koramangala, Bengaluru", "Kothrud, Pune"])
     if field_name == "when":
-        prompt = ("When would you like the appointment?" if svc.goal == "appointment" else
-                  "When do you need this done?" if generic else f"When do you need the {label}?")
+        if hi:
+            prompt = concierge.HINDI["when_appt"] if svc.goal == "appointment" else \
+                concierge.HINDI["when"].format(label=label)
+        else:
+            prompt = ("When would you like the appointment?" if svc.goal == "appointment" else
+                      "When do you need this done?" if generic else f"When do you need the {label}?")
         return prompt, ["Today", "Tomorrow morning", "This weekend"]
     if field_name == "details":
-        return (svc.detail_question or "Anything specific they should know?") + " (or say 'skip')", ["Skip"]
+        return (concierge.HINDI["details"] if hi else
+                (svc.detail_question or "Anything specific they should know?") + " (or say 'skip')"), ["Skip"]
     if field_name == "budget":
         target, high = services.suggested_budget(svc)
         unit = services.UNIT_WORDS.get(svc.unit, "")
+        if hi:
+            return (concierge.HINDI["budget"].format(target=format_inr(target), high=format_inr(high)),
+                    [f"Around {format_inr(target)}, max {format_inr(high)}", "Suggest a budget"])
         return (f"What's your budget? Give a target and the most you'd pay{(' ' + unit) if unit else ''}, e.g. "
                 f"'around {format_inr(target)}, max {format_inr(high)}'. Not sure? Say 'suggest'.",
                 [f"Around {format_inr(target)}, max {format_inr(high)}", "Suggest a budget"])
@@ -275,28 +269,97 @@ def summary(task: dict) -> str:
     return " · ".join(parts)
 
 
+def _confirm_line(task: dict, user_lang: str) -> str:
+    n = auto_call_count()
+    lang = languages.get(task.get("call_language"))
+    if user_lang == "hi":
+        return concierge.HINDI["confirm"].format(summary=summary(task).replace("**", ""), n=n,
+                                                 language=languages.HINDI_NAMES[lang.code])
+    return (f"Perfect. {summary(task)}. Shall I call the {n} best-rated nearby, in {lang.name}? "
+            f"(Say yes, or tell me what to change.)")
+
+
+def auto_call_count() -> int:
+    from app import config
+    return config.settings.auto_call_count
+
+
+_RESTART_RE = re.compile(r"\b(start over|start again|new request|reset|restart|cancel everything)\b", re.I)
+
+
+def _set_call_language(intake: "Intake", requested: Optional[str], source: str) -> None:
+    """The call language: what the user asked for (sticky), else the language of the place."""
+    task = intake.task
+    if requested:
+        if requested != task.get("call_language") or not task.get("call_language_locked"):
+            task.update(call_language=requested, call_language_locked=True,
+                        call_language_reason=f"you chose {languages.name(requested)}")
+            intake.trace.append({"agent": "linguist", "text": f"calls in {languages.name(requested)} ({source})"})
+        return
+    if task.get("call_language_locked"):
+        return
+    code, reason = languages.detect(task.get("location") or task.get("pickup") or "", task.get("state", ""))
+    if code and code != task.get("call_language"):
+        task.update(call_language=code, call_language_reason=reason)
+        intake.trace.append({"agent": "linguist", "text": f"calls in {languages.name(code)}: {reason}"})
+    elif not task.get("call_language"):
+        task.update(call_language=languages.DEFAULT,
+                    call_language_reason="Hindi, the most widely understood (tell me the city to pick its language)")
+
+
 async def chat(conversation_id: Optional[str], message: str, lat: Optional[float] = None,
-               lng: Optional[float] = None) -> dict:
+               lng: Optional[float] = None, user_lang: Optional[str] = None,
+               call_language: Optional[str] = None) -> dict:
     intake = CONVERSATIONS.get(conversation_id or "") or Intake(id=uuid.uuid4().hex[:10])
     CONVERSATIONS[intake.id] = intake
+    intake.touched = time.time()
+    intake.user_lang = languages.normalize(user_lang) or intake.user_lang
     text = (message or "").strip()[:600]
+    if _RESTART_RE.search(text):
+        intake.task, intake.asked, intake.last_question = {}, [], ""
+        text = ""
+    if call_language:
+        _set_call_language(intake, languages.normalize(call_language), "picked on screen")
     if lat is not None and lng is not None:
         intake.task.update(lat=lat, lng=lng)
         if places.is_near_me(intake.task.get("location", "")) and not intake.task.get("pickup"):
             # live location: name the area so the user can see (and correct) where we'll search
             intake.task["location"] = await places.reverse_geocode(lat, lng) or "your current location"
+            intake.task["state"] = places.state_for(lat, lng)
+    action, thought, wants_change = "", {}, False
     if text:
         asking = intake.last_question
-        updates = extract_rules(text, intake.task, asking)
-        llm_updates = await extract_llm(intake, text)
-        if updates.get("service_key") == "other" and llm_updates.get("service_key") not in (None, "other"):
-            updates.pop("service_key")
-        # LLM fills gaps; explicit rule hits on the field we just asked about win
-        merged = {**llm_updates, **{k: v for k, v in updates.items() if v not in (None, "")}}
-        if merged.get("service_key") and intake.task.get("service_key") and asking != "service":
-            merged.pop("service_key", None)  # don't silently switch service mid-conversation
-            merged.pop("service_label", None)
-        intake.task.update(merged)
+        confirming = asking in {"confirm", "change"} and not missing_fields(intake.task, intake.asked)
+        # A bare "yes / haan / ಹೌದು" starts the calls; "yes but call them in Hindi" changes something first
+        if confirming and languages.is_yes(text) and not languages.requested_language(text) and \
+                not extract_rules(text, intake.task, asking):
+            action = "go"
+        else:
+            updates = extract_rules(text, intake.task, asking)
+            thought = await concierge.think(intake.messages, text, intake.task,
+                                            missing_fields(intake.task, intake.asked),
+                                            intake.task.get("call_language") or languages.DEFAULT,
+                                            intake.task.get("call_language_reason", ""), intake.user_lang)
+            llm_updates = thought.get("updates", {})
+            if thought.get("intent") == "yes" and asking in {"confirm", "change"} and not llm_updates and \
+                    not missing_fields(intake.task, intake.asked):
+                action = "go"
+            if updates.get("service_key") == "other" and llm_updates.get("service_key") not in (None, "other"):
+                updates.pop("service_key")
+            # The model fills gaps; explicit rule hits on the field we just asked about win
+            merged = {**llm_updates, **{k: v for k, v in updates.items() if v not in (None, "")}}
+            if merged.get("service_key") and intake.task.get("service_key") and asking != "service":
+                merged.pop("service_key", None)  # don't silently switch service mid-conversation
+                merged.pop("service_label", None)
+            requested = languages.requested_language(text) or merged.pop("call_language", None)
+            merged.pop("call_language", None)
+            intake.task.update(merged)
+            _set_call_language(intake, requested, "you asked")
+            intake.trace.append({"agent": "concierge", "text": ("understood with " + llm.status()["last_used"].get(
+                "chat", "Gemini")) if thought.get("updates") or thought.get("reply") else "understood with rules"})
+            if confirming and (languages.is_no(text) or thought.get("intent") == "no") and not merged \
+                    and not requested:
+                wants_change = True
         intake.messages.append({"role": "user", "text": text})
     task = intake.task
     if task.get("service_key"):
@@ -306,6 +369,7 @@ async def chat(conversation_id: Optional[str], message: str, lat: Optional[float
         if task.pop("budget_suggested", False) or (task["goal"] == "negotiate" and "budget" in intake.asked
                                                    and not task.get("walkaway_ceiling") and NOT_SURE_RE.search(text)):
             task["target_price"], task["walkaway_ceiling"] = services.suggested_budget(svc)
+    _set_call_language(intake, None, "")
     missing = missing_fields(task, intake.asked)
     if missing:
         nxt = missing[0]
@@ -313,17 +377,35 @@ async def chat(conversation_id: Optional[str], message: str, lat: Optional[float
             task["details_done"] = True
             missing = missing_fields(task, intake.asked)
             nxt = missing[0] if missing else ""
-    if missing:
-        reply, suggestions = question(nxt, task)
+    reply_lang = "hi" if intake.user_lang == "hi" else "en"
+    llm_reply = thought.get("reply", "")
+    if action == "go":
+        intake.last_question = "go"
+        reply = concierge.HINDI["go"] if intake.user_lang == "hi" else \
+            f"On it. Finding the best-rated {task.get('service_label', 'providers')} near you and calling them now."
+        suggestions = []
+    elif missing:
+        reply, suggestions = question(nxt, task, intake.user_lang)
+        if llm_reply and thought.get("asking") == nxt and concierge.reply_ok(llm_reply, task):
+            reply, reply_lang = llm_reply, thought.get("reply_language") or intake.user_lang
         if nxt not in intake.asked:
             intake.asked.append(nxt)
         intake.last_question = nxt
+    elif wants_change:
+        intake.last_question = "change"
+        reply = concierge.HINDI["change"] if intake.user_lang == "hi" else "Sure, what should I change?"
+        if llm_reply and concierge.reply_ok(llm_reply, task):
+            reply, reply_lang = llm_reply, thought.get("reply_language") or intake.user_lang
+        suggestions = ["Change the time", "Change the budget", "Call in another language"]
     else:
         intake.last_question = "confirm"
-        reply = f"Perfect. {summary(task)}. Shall I find the best-rated providers nearby?"
-        suggestions = ["Find providers"]
+        reply = _confirm_line(task, intake.user_lang)
+        if llm_reply and thought.get("asking") in {"confirm", "none"} and concierge.reply_ok(llm_reply, task):
+            reply, reply_lang = llm_reply, thought.get("reply_language") or intake.user_lang
+        suggestions = ["Yes, call them", "Change something"]
     intake.messages.append({"role": "assistant", "text": reply})
-    return {**intake.public(), "reply": reply, "suggestions": suggestions}
+    return {**intake.public(), "reply": reply, "reply_language": reply_lang, "suggestions": suggestions,
+            "action": action}
 
 
 def to_request(task: dict) -> ServiceRequest:
@@ -345,4 +427,4 @@ def to_request(task: dict) -> ServiceRequest:
         drop=task.get("drop", ""), when=task.get("when", ""), target_price=target, walkaway_ceiling=ceiling,
         est_km=float(task.get("est_km") or (40 if svc.key == "cab_outstation" else 10)),
         min_km_per_day=250 if outstation else 0, lat=task.get("lat"), lng=task.get("lng"),
-        language_hint=task.get("language", "hi"))
+        language_hint=task.get("call_language") or task.get("language") or languages.DEFAULT)

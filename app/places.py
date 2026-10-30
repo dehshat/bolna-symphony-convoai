@@ -122,15 +122,26 @@ def is_near_me(location: str) -> bool:
     return not (location or "").strip() or bool(NEAR_ME_RE.match(location.strip()))
 
 
+_geo_state: dict[tuple, str] = {}
+
+
+def state_for(lat: float, lng: float) -> str:
+    """The state of a position we reverse-geocoded earlier ("Maharashtra"): it picks the call language."""
+    return _geo_state.get((round(lat, 3), round(lng, 3)), "")
+
+
 async def reverse_geocode(lat: float, lng: float) -> str:
     """Live GPS position -> "Koramangala, Bengaluru" (OpenStreetMap Nominatim; no Google Geocoding API needed)."""
     try:
         async with httpx.AsyncClient(timeout=6, headers=UA) as client:
             r = await client.get("https://nominatim.openstreetmap.org/reverse",
-                                 params={"lat": lat, "lon": lng, "format": "json", "zoom": 16, "addressdetails": 1})
+                                 params={"lat": lat, "lon": lng, "format": "json", "zoom": 16, "addressdetails": 1,
+                                         "accept-language": "en"})
         addr = (r.json() if r.status_code < 400 else {}).get("address") or {}
     except (httpx.HTTPError, ValueError):
         return ""
+    if addr.get("state"):
+        _geo_state[(round(lat, 3), round(lng, 3))] = addr["state"]
     area = next((addr[k] for k in ("suburb", "neighbourhood", "quarter", "city_district", "village", "town")
                  if addr.get(k)), "")
     city = next((addr[k] for k in ("city", "town", "state_district", "county") if addr.get(k)), "")
@@ -288,14 +299,18 @@ async def openstreetmap(svc: ServiceType, location: str, lat=None, lng=None, lim
 
 # ---------------------------------------------------------------------------- 4. Demo listings
 
+CITY_NAMES = {"bengaluru", "bangalore", "mumbai", "pune", "delhi", "new delhi", "hyderabad", "chennai", "kolkata",
+              "ahmedabad", "kochi", "jaipur", "lucknow", "chandigarh", "bhubaneswar", "amritsar", "nagpur", "surat"}
 DEMO_PREFIX = ("Sri Lakshmi", "Namma", "Royal", "Green Leaf", "City", "Sai Krupa", "Annapoorna", "Metro", "Prime",
                "Ganesh", "Sunrise", "Classic")
 
 
 async def demo(svc: ServiceType, location: str, lat=None, lng=None, limit: int = 6) -> list[Provider]:
     rng = random.Random(f"{svc.key}:{svc.label}:{location}".lower())
-    area = ("Bengaluru" if is_near_me(location) else location).split(",")[0].strip() or "Bengaluru"
+    parts = [p.strip() for p in ("Bengaluru" if is_near_me(location) else location).split(",") if p.strip()]
+    area = parts[0] if parts else "Bengaluru"
     area = area if any(c.isupper() for c in area) else area.title()
+    city = parts[-1] if len(parts) > 1 else ("" if area.lower() in CITY_NAMES else "Bengaluru")
     noun = svc.label.split("/")[0].strip().title()
     names = rng.sample(DEMO_PREFIX, k=min(limit, len(DEMO_PREFIX)))
     out = []
@@ -304,7 +319,7 @@ async def demo(svc: ServiceType, location: str, lat=None, lng=None, limit: int =
         reviews = int(rng.choice([12, 38, 85, 160, 240, 410, 760, 1250, 2300]) * rng.uniform(0.8, 1.2))
         out.append(Provider(id=_pid("demo", svc.key, prefix, area), name=f"{prefix} {noun}",
                             phone=f"+9180{rng.randint(20000000, 99999999)}", rating=rating, reviews=reviews,
-                            address=f"{rng.randint(1, 40)}th Cross, {area}, Bengaluru",
+                            address=", ".join(x for x in (f"{rng.randint(1, 40)}th Cross", area, city) if x),
                             distance_km=round(rng.uniform(0.4, 6.5), 1), open_now=rng.random() > 0.2,
                             source="Demo listing (add GOOGLE_MAPS_API_KEY for real data)"))
     return out

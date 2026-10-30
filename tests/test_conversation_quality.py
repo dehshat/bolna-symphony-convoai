@@ -2,7 +2,7 @@
 
 import asyncio
 
-from app import briefs, config, llm
+from app import briefs, config, languages, llm
 from app.negotiation import Competitor, LegNegotiationState, decide
 from app.pricing import ServiceRequest, normalize_quote
 
@@ -40,11 +40,20 @@ def test_agent_line_falls_back_when_model_invents_a_price(monkeypatch):
 
 def test_agent_line_accepts_faithful_rewrite(monkeypatch):
     async def fake_generate(*a, **k):
+        return "अच्छा भैया, ₹2,450 का दाम मेरे पास है, ₹2,300 आख़िरी कर दो ना?"
+    monkeypatch.setattr(llm, "enabled", lambda: True)
+    monkeypatch.setattr(llm, "generate", fake_generate)
+    out = asyncio.run(llm.agent_line("hi", "भैया, ₹2,450 का दाम सामने है। ₹2,300 आख़िरी कर दो?"))
+    assert out.startswith("अच्छा भैया")
+
+
+def test_rewrite_with_english_words_is_rejected_on_a_hindi_call(monkeypatch):
+    async def fake_generate(*a, **k):
         return "Achha bhaiya, ₹2,450 ka offer mere paas hai, ₹2,300 final kar do na?"
     monkeypatch.setattr(llm, "enabled", lambda: True)
     monkeypatch.setattr(llm, "generate", fake_generate)
-    out = asyncio.run(llm.agent_line("hi", "Bhaiya, ₹2,450 ka offer saamne hai. ₹2,300 last kar do?"))
-    assert out.startswith("Achha bhaiya")
+    original = "भैया, ₹2,450 का दाम सामने है। ₹2,300 आख़िरी कर दो?"
+    assert asyncio.run(llm.agent_line("hi", original)) == original
 
 
 def test_repeated_counter_uses_shorter_follow_up_line(monkeypatch):
@@ -53,7 +62,8 @@ def test_repeated_counter_uses_shorter_follow_up_line(monkeypatch):
     comp = Competitor("B", "Other", 2450)
     first = step(r, s, 2900, comp)
     second = step(r, s, 2800, comp)
-    assert "operator" in first.say and "operator" not in second.say and "2,450" in second.say
+    assert "दूसरी जगह" in first.say and "दूसरी जगह" not in second.say and "2,450" in second.say
+    assert "Another operator nearby" in first.say_en and "on the table" in second.say_en
 
 
 def test_vendor_who_will_not_move_is_closed_politely():
@@ -76,9 +86,11 @@ def test_live_opening_line_is_native_script():
     r = briefs.request_from_preset("airport_innova")
     hi = briefs.opening_line(r, "hi", native=True)
     kn = briefs.opening_line(r, "kn", native=True)
-    assert "कल सुबह 6 बजे" in hi and "Innova" in hi
+    assert "कल सुबह 6 बजे" in hi and "इनोवा" in hi
     assert "ನಾಳೆ ಬೆಳಿಗ್ಗೆ 6 ಗಂಟೆಗೆ" in kn
-    assert briefs.opening_line(r, "hi").startswith("Haan bhaiya")  # on-screen simulation stays romanized
+    # Only the place names stay in Latin letters; the simulation shows the very same native line
+    assert languages.latin_words(hi, allow=("JP Nagar", "Kempegowda Airport")) == []
+    assert briefs.opening_line(r, "hi") == hi
 
 
 def test_rate_limited_gemini_answers_instantly(monkeypatch):

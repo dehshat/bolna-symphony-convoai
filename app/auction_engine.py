@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
+from app import advisor
 from app.negotiation import Competitor, Decision, LegNegotiationState, classify_situation, decide
 from app.pricing import (NormalizedQuote, ServiceRequest, category_rules, charge_kind, format_inr, merge_charges,
                          normalize_quote, parse_extras, parse_inr, parse_range)
@@ -162,6 +163,8 @@ class Session:
     arbitrage_log: list = field(default_factory=list)
     payment: Optional[dict] = None
     whatsapp: Optional[dict] = None
+    localized: dict = field(default_factory=dict)   # call language -> the job in that language (Gemini), if any
+    trace: list = field(default_factory=list)       # what each agent did, in order (shown as the agent log)
 
     def t(self) -> float:
         return round(time.time() - self.created_at, 1)
@@ -203,6 +206,9 @@ class Session:
             "arbitrage_log": self.arbitrage_log[-30:],
             "payment": self.payment,
             "whatsapp": self.whatsapp,
+            "language": next(iter(self.legs.values())).language if self.legs else "",
+            "recommendation": advisor.recommend(self),
+            "trace": self.trace[-60:],
         }
 
 
@@ -289,9 +295,25 @@ class AuctionEngine:
                 log.warning("publish failed: %s", exc)
 
     @staticmethod
-    def _say(session: Session, leg: Leg, role: str, text: str) -> None:
+    def _say(session: Session, leg: Leg, role: str, text: str, gloss: str = "") -> None:
         if text:
-            leg.transcript.append({"role": role, "text": text, "t": session.t()})
+            entry = {"role": role, "text": text, "t": session.t()}
+            if gloss and gloss != text:
+                entry["gloss"] = gloss   # English meaning, shown under a line in another language
+            leg.transcript.append(entry)
+
+    @staticmethod
+    def _trace(session: Session, agent: str, text: str, leg_id: str = "") -> None:
+        session.trace.append({"t": session.t(), "agent": agent, "leg_id": leg_id, "text": text[:240]})
+        del session.trace[:-120]
+
+    async def trace(self, session_id: str, agent: str, text: str, leg_id: str = "") -> None:
+        """Record one step of an agent (dialer, linguist, advisor…) in the session's agent log."""
+        session = self.get(session_id)
+        async with self.lock_for(session_id):
+            self._trace(session, agent, text, leg_id)
+            session.state_version += 1
+        await self._emit(session, {"type": "trace", "agent": agent})
 
     # ------------------------------------------------------------------ lifecycle
     async def create_session(self, request: ServiceRequest, vendors: list[dict], mode: str = "simulation") -> Session:
@@ -326,10 +348,10 @@ class AuctionEngine:
             session.state_version += 1
         await self._emit(session, {"type": "leg_status", "leg_id": leg_id, "status": status})
 
-    async def add_transcript(self, session_id: str, leg_id: str, role: str, text: str) -> None:
+    async def add_transcript(self, session_id: str, leg_id: str, role: str, text: str, gloss: str = "") -> None:
         session = self.get(session_id)
         async with self.lock_for(session_id):
-            self._say(session, session.legs[leg_id], role, text)
+            self._say(session, session.legs[leg_id], role, text, gloss)
             session.state_version += 1
         await self._emit(session, {"type": "transcript", "leg_id": leg_id, "role": role, "text": text})
 
@@ -366,7 +388,8 @@ class AuctionEngine:
                 return {**leg.last_tool[2], "duplicate": True}   # Bolna retried the call: same answer, no new round
             req = session.request
             said = str(args.get("vendor_said") or "").strip()
-            self._say(session, leg, "vendor", said)
+            spoken = str(args.get("_spoken") or "").strip()   # simulated vendors: the words in the call's language
+            self._say(session, leg, "vendor", spoken or said, said if spoken else "")
             if leg.status in {LegStatus.PENDING, LegStatus.DIALING}:
                 leg.status = LegStatus.CONNECTED
             if session.status == "CREATED":
@@ -463,6 +486,11 @@ class AuctionEngine:
             if decision.action == "CALL_BACK" and "Asked to call back later" not in leg.details:
                 leg.details.append("Asked to call back later")
             self._apply_decision(session, leg, decision)
+            heard = f"heard {format_inr(quote.all_in)} all-in" if quote is not None and quote.all_in else "no price yet"
+            self._trace(session, "strategist", f"{leg.vendor_name}: {heard} → {decision.action.lower().replace('_', ' ')}"
+                        + (f" at {format_inr(decision.counter_price)}" if decision.counter_price else "")
+                        + (f" (cited {format_inr(decision.leverage['price'])} from {decision.leverage['vendor_name']})"
+                           if decision.leverage else "") + f" · {decision.reason.replace('_', ' ')}", leg.leg_id)
             event.update(self._decision_event(session, leg, decision, quote))
             response = self._tool_response(session, leg, decision, quote, competitor)  # snapshot under the lock
             leg.last_tool = (key, time.monotonic(), response)
@@ -507,7 +535,7 @@ class AuctionEngine:
         new_status = ACTION_TO_STATUS.get(decision.action)
         if new_status and leg.status not in {LegStatus.WON, LegStatus.RELEASED}:
             leg.status = new_status
-        self._say(session, leg, "agent", decision.say)
+        self._say(session, leg, "agent", decision.say, decision.say_en)
         if decision.leverage:
             session.arbitrage_log.append({
                 "t": session.t(), "from_leg": decision.leverage["leg_id"],
@@ -531,6 +559,7 @@ class AuctionEngine:
             "ok": True,
             "action": decision.action,
             "say_this": decision.say,
+            "meaning": decision.say_en,
             "counter_price_inr": decision.counter_price,
             "agreed_price_inr": decision.binding_price,
             "end_call": decision.end_call,
@@ -586,6 +615,8 @@ class AuctionEngine:
                 raise GuardrailViolation("this call failed")
             session.locked_leg_id = leg_id
             session.status = "LOCKED"
+            self._trace(session, "you", f"confirmed {leg.vendor_name}" + (f" at {format_inr(price)}" if price else "")
+                        + (f", {leg.neg.slot}" if leg.neg.slot else ""), leg_id)
             leg.status = LegStatus.WON
             released = []
             for other in session.legs.values():

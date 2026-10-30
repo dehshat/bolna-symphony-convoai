@@ -98,9 +98,23 @@ class Settings:
     rate_limit_search: int = field(default_factory=lambda: _int("RATE_LIMIT_SEARCH_PER_HOUR", 60))
     rate_limit_calls: int = field(default_factory=lambda: _int("RATE_LIMIT_CALLS_PER_HOUR", 20))
     rate_limit_chat: int = field(default_factory=lambda: _int("RATE_LIMIT_CHAT_PER_HOUR", 300))
+    rate_limit_voice: int = field(default_factory=lambda: _int("RATE_LIMIT_VOICE_PER_HOUR", 120))
+    # Render's free plan sleeps after 15 idle minutes. >0 pings our own public URL this often to stay awake.
+    keep_awake_minutes: int = field(default_factory=lambda: _int("KEEP_AWAKE_MINUTES", 0))
+    # How many of the best-rated providers the voice flow calls automatically (the user can change the pick)
+    auto_call_count: int = field(default_factory=lambda: max(1, min(5, _int("AUTO_CALL_COUNT", 3))))
     # Counter-offers per call before taking the vendor's best price (or walking away above the ceiling)
     max_counter_rounds: int = field(default_factory=lambda: max(0, _int("MAX_COUNTER_ROUNDS", 1)))
+    # Agents created on boot. Any of the 11 call languages not listed is created the first time a call needs it.
     bolna_agent_languages: str = field(default_factory=lambda: os.getenv("BOLNA_AGENT_LANGUAGES", "hi,kn"))
+    # Turn-taking on live calls: wait this long after the vendor stops before treating it as the end of their turn
+    # (vendors pause mid-number: "teen hazaar... paanch sau"), then pause briefly before answering; the vendor must
+    # say this many words to interrupt the agent (so "haan", "ji" don't cut it off).
+    call_endpointing_ms: int = field(default_factory=lambda: _int("CALL_ENDPOINTING_MS", 900))
+    call_response_delay_ms: int = field(default_factory=lambda: _int("CALL_RESPONSE_DELAY_MS", 400))
+    call_interruption_words: int = field(default_factory=lambda: _int("CALL_INTERRUPTION_WORDS", 3))
+    call_hangup_silence_s: int = field(default_factory=lambda: _int("CALL_HANGUP_SILENCE_SECONDS", 20))
+    call_max_seconds: int = field(default_factory=lambda: _int("CALL_MAX_SECONDS", 240))
     # Sarvam models/voice used by the Bolna agent (bulbul:v2 and saarika were retired by Sarvam)
     sarvam_tts_model: str = field(default_factory=lambda: os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"))
     sarvam_tts_voice: str = field(default_factory=lambda: os.getenv("SARVAM_TTS_VOICE", "shubh"))
@@ -127,6 +141,19 @@ class Settings:
     gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", ""))
     gemini_model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
     llm_enabled: bool = field(default_factory=lambda: _bool("LLM_ENABLED", True))
+    # Same GEMINI_API_KEY, a different model per job. The free tier's daily quota is per model, so the concierge you
+    # talk to, the translator and the voice never use up each other's quota. Each list is tried in order; a model that
+    # doesn't exist for your key is skipped, a rate-limited one is retried later. Gemma has a large free quota.
+    gemini_chat_models: str = field(default_factory=lambda: os.getenv(
+        "GEMINI_CHAT_MODELS", "gemini-2.5-flash-lite,gemini-2.0-flash,gemini-3-flash-preview,gemini-2.5-flash,"
+                              "gemma-3-27b-it"))
+    gemini_localize_models: str = field(default_factory=lambda: os.getenv(
+        "GEMINI_LOCALIZE_MODELS", "gemini-2.5-flash,gemini-3-flash-preview,gemini-2.5-flash-lite,gemma-3-27b-it"))
+    gemini_stt_models: str = field(default_factory=lambda: os.getenv(
+        "GEMINI_STT_MODELS", "gemini-2.5-flash-lite,gemini-2.0-flash,gemini-2.5-flash"))
+    gemini_tts_models: str = field(default_factory=lambda: os.getenv(
+        "GEMINI_TTS_MODELS", "gemini-2.5-flash-preview-tts,gemini-2.5-flash-tts,gemini-2.5-pro-preview-tts"))
+    gemini_tts_voice: str = field(default_factory=lambda: os.getenv("GEMINI_TTS_VOICE", "Kore"))
     # Gemini rewording of simulated call lines (~25 requests per simulation). Off by default because the
     # free tier allows only ~20 requests/day/model; brief parsing still uses Gemini.
     sim_llm_rephrase: bool = field(default_factory=lambda: _bool("SIM_LLM_REPHRASE", False))
@@ -175,6 +202,9 @@ class Settings:
             "dial_strategy": self.dial_strategy,
             "gemini_enabled": bool(self.gemini_api_key and self.llm_enabled),
             "gemini_model": self.gemini_model,
+            "gemini_chat_model": self.gemini_chat_models.split(",")[0].strip(),
+            "auto_call_count": self.auto_call_count,
+            "keep_awake_minutes": self.keep_awake_minutes,
             "sim_llm_rephrase": self.sim_llm_rephrase,
             "razorpay_enabled": bool(self.razorpay_key_id and self.razorpay_key_secret),
             "whatsapp_api_enabled": bool(self.whatsapp_token and self.whatsapp_phone_number_id),
