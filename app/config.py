@@ -129,6 +129,8 @@ class Settings:
     google_maps_api_key: str = field(default_factory=lambda: os.getenv("GOOGLE_MAPS_API_KEY", ""))
     # Off by default: every provider found on the map is dialled on the test phone instead of their real number
     call_real_numbers: bool = field(default_factory=lambda: _bool("CALL_REAL_NUMBERS", False))
+    # Look up the state of a place the language table doesn't know (OpenStreetMap), to pick its call language
+    geocode_places: bool = field(default_factory=lambda: _bool("GEOCODE_PLACES", True))
     test_phone_override: str = field(default_factory=lambda: os.getenv("TEST_PHONE_OVERRIDE", ""))
     # parallel | sequential | auto (auto = sequential when several legs would ring the same phone)
     dial_strategy: str = field(default_factory=lambda: os.getenv("DIAL_STRATEGY", "auto").lower())

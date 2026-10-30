@@ -247,6 +247,32 @@ async def gemini_maps(svc: ServiceType, location: str, lat=None, lng=None, limit
 UA = {"User-Agent": "SwarmNegotiator/1.0 (hackathon prototype)"}
 
 
+_place_state: dict[str, str] = {}
+
+
+async def state_of(location: str) -> str:
+    """'Wagholi' / 'கோரமங்களா' -> the Indian state it is in (OpenStreetMap Nominatim), for places the language table
+    doesn't know: the state picks the call language. Cached; '' when unknown or offline."""
+    key = re.sub(r"\s+", " ", (location or "").strip().lower())
+    if not key or not config.settings.geocode_places:
+        return ""
+    if key in _place_state:
+        return _place_state[key]
+    state = ""
+    try:
+        async with httpx.AsyncClient(timeout=5, headers=UA) as client:
+            r = await client.get("https://nominatim.openstreetmap.org/search",
+                                 params={"q": location, "countrycodes": "in", "format": "json", "limit": 1,
+                                         "addressdetails": 1, "accept-language": "en"})
+        data = r.json() if r.status_code < 400 else []
+        if data:
+            state = (data[0].get("address") or {}).get("state", "")
+    except (httpx.HTTPError, ValueError, KeyError, IndexError):
+        pass
+    _place_state[key] = state
+    return state
+
+
 async def geocode_osm(location: str) -> Optional[tuple[float, float]]:
     try:
         async with httpx.AsyncClient(timeout=8, headers=UA) as client:

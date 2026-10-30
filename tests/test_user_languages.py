@@ -70,7 +70,8 @@ def test_browser_gets_the_narration_in_each_language():
     ("I need a plumber tomorrow", None, "ta", "en"),
     ("Koramangala, Bengaluru", "en", "ta", "ta"),     # place names are Latin in every language
     ("ok", "en", "kn", "kn"), ("2000", None, "te", "te"),
-    ("plumber kal", "hi", "en", "hi"),                 # what speech recognition heard
+    ("plumber chaiye Kothrud tomorrow", "hi", "en", "hi"),   # what speech recognition heard, on a real sentence
+    ("Kothrud, Pune", "mr", "ta", "ta"),               # ...but not on a bare place name
 ])
 def test_user_language(text, heard, current, expected):
     assert languages.user_language(text, heard, current) == expected
@@ -109,6 +110,97 @@ def test_the_greeting_follows_the_browser_and_the_reply_follows_the_speaker():
     assert r["user_lang"] == "mr" and r["reply"] == userlex.line("mr", "when", service="प्लंबर")
     assert r["task"]["location"] == "Kothrud, Pune" and r["call_language"]["code"] == "mr"
     assert any("speaking Marathi" in x["text"] for x in r["trace"])
+
+
+def test_the_first_language_spoken_is_kept_for_the_whole_conversation():
+    """Detected once, then fixed: later English, another language, or what speech recognition hears don't flip it."""
+    r = chat(["", "எனக்கு Koramangala, Bengaluru-ல plumber வேண்டும்"], heard_lang="en")
+    assert r["user_lang"] == "ta" and r["user_lang_locked"]
+    later = ["I need it tomorrow morning please", "मुझे कल सुबह चाहिए", "ok"]
+    for i in range(1, len(later) + 1):
+        r = chat(["", "எனக்கு Koramangala, Bengaluru-ல plumber வேண்டும்", *later[:i]], heard_lang="hi")
+        assert r["user_lang"] == "ta" and languages.writes_in(r["reply"], "ta"), r["reply"]
+    assert sum("speaking" in x["text"] for x in r["trace"]) == 1
+
+
+def test_messages_that_show_no_language_decide_nothing_yet():
+    r = chat(["", "Koramangala, Bengaluru"], heard_lang="kn")
+    assert r["user_lang"] == "kn" and not r["user_lang_locked"]      # still the browser's guess, not fixed
+    r = chat(["", "Koramangala, Bengaluru", "నాకు ప్లంబర్ కావాలి"], heard_lang="kn")
+    assert r["user_lang"] == "te" and r["user_lang_locked"]
+
+
+def test_a_new_conversation_detects_again():
+    assert chat(["", "எனக்கு plumber வேண்டும்"])["user_lang"] == "ta"
+    assert chat(["", "मला plumber पाहिजे"])["user_lang"] == "mr"
+
+
+# ---------------------------------------------------------------- the call language: the place's, and it stays
+
+def test_call_language_is_the_local_language_of_the_place_not_the_speakers():
+    r = chat(["எனக்கு Kothrud, Pune-ல plumber வேண்டும்"])
+    assert r["user_lang"] == "ta" and r["call_language"]["code"] == "mr"   # Tamil speaker, Marathi calls in Pune
+    r = chat(["எனக்கு Kothrud, Pune-ல plumber வேண்டும்", "இல்லை, Koramangala, Bengaluru"])
+    assert r["call_language"]["code"] == "kn"                               # another place, its language
+
+
+def test_a_named_call_language_sticks_even_when_the_place_changes():
+    r = chat(["I need a plumber in Kothrud, Pune", "call them in Hindi", "actually in Koramangala, Bengaluru"])
+    assert r["call_language"]["code"] == "hi" and r["call_language"]["locked"]
+    r = chat(["எனக்கு Kothrud, Pune-ல plumber வேண்டும்", "தமிழ் மொழியில் அழையுங்கள்"])   # named in Tamil
+    assert r["call_language"]["code"] == "ta"
+
+
+def test_the_models_guess_never_changes_the_call_language(monkeypatch):
+    import json
+    from app import llm
+
+    async def gen(*a, **k):   # the model "helpfully" picks the speaker's own language for the calls
+        return json.dumps({"updates": {"service_key": "plumber", "location": "Kothrud, Pune", "call_language": "ta"},
+                           "asking": "when", "reply": "சரி. எப்போது வேண்டும்?", "intent": "inform"})
+    monkeypatch.setattr(llm, "enabled", lambda: True)
+    monkeypatch.setattr(llm, "generate", gen)
+    r = chat(["எனக்கு Kothrud-ல plumber வேண்டும்"])
+    assert r["call_language"]["code"] == "mr" and not r["call_language"]["locked"]
+
+
+def test_an_unknown_place_gets_the_language_of_its_state(monkeypatch):
+    from app import places
+
+    async def state_of(place):
+        return {"Wagholi": "Maharashtra"}.get(place.split(",")[0].strip(), "")
+    monkeypatch.setattr(places, "state_of", state_of)
+    r = chat(["I need a plumber", "Wagholi"])
+    assert r["task"]["state"] == "Maharashtra" and r["call_language"]["code"] == "mr"
+
+
+def test_a_typed_place_wins_over_an_old_gps_state(monkeypatch):
+    from app import places
+
+    async def reverse(lat, lng):
+        places._geo_state[(round(lat, 3), round(lng, 3))] = "Karnataka"
+        return "Shivaji Nagar"
+    monkeypatch.setattr(places, "reverse_geocode", reverse)
+
+    async def run():
+        r = await intake.chat(None, "I need an electrician near me")
+        r = await intake.chat(r["conversation_id"], "", lat=12.98, lng=77.6)
+        assert r["call_language"]["code"] == "kn"
+        return await intake.chat(r["conversation_id"], "no, in Kothrud, Pune")
+    r = asyncio.run(run())
+    assert r["task"]["location"] == "Kothrud, Pune" and "state" not in r["task"]
+    assert r["call_language"]["code"] == "mr"
+
+
+def test_the_call_agent_cannot_switch_language_mid_call():
+    from app import bolna_client
+    payload = bolna_client.build_agent_payload("mr", "https://swarm.example.com")
+    tools = payload["agent_config"]["tasks"][0]["tools_config"]
+    assert tools["transcriber"]["language"] == "mr" and not tools["transcriber"].get("multilingual")
+    assert "language_injection_mode" not in payload["agent_config"]["tasks"][0]["task_config"]
+    assert "switch_language" not in {t["name"] for t in tools["api_tools"]["tools"]}
+    prompt = payload["agent_prompts"]["task_1"]["system_prompt"]
+    assert "for the whole call" in prompt and "carry on in simple Marathi" in prompt
 
 
 def test_a_language_picked_in_the_settings_turns_detection_off():

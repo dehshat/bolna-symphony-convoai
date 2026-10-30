@@ -5,9 +5,13 @@ services only) → confirm. Each message is understood by rules and, when availa
 chat model, see app.concierge), which also words the replies in the user's own language. The call language follows
 the place ("Kothrud, Pune" → Marathi) unless the user picks one.
 
-The user can talk in any of the 11 languages: each message's language is detected (from what speech recognition heard,
-or the script of the text) and every reply, the summary and the confirmation come back in that language
-(`app.userlex`). Picking a language in the settings turns detection off.
+The user can talk in any of the 11 languages. The first message that shows its language (from what speech recognition
+heard, or the script of the text) fixes it for the whole conversation: every reply, the summary and the confirmation
+come back in it (`app.userlex`), and it never flips mid-conversation. Picking a language in the settings fixes it too.
+
+The call language is the local language of the place the service is needed in: from the area/city table, the state of
+a GPS position, or (for places the table doesn't know) the state OpenStreetMap puts the place in. It changes only
+when the user gives another place, or names a language for the calls; once named, it stays.
 """
 
 from __future__ import annotations
@@ -77,7 +81,8 @@ class Intake:
     asked: list = field(default_factory=list)
     last_question: str = ""
     user_lang: str = "en"           # the language the user talks to the app in (detected, or chosen)
-    lang_auto: bool = True          # detect it from every message (off once the user picks one in the settings)
+    lang_auto: bool = True          # detect it (off once the user picks one in the settings)
+    lang_locked: bool = False       # fixed for the rest of the conversation (detected once, or picked)
     trace: list = field(default_factory=list)
     touched: float = field(default_factory=time.time)
 
@@ -86,6 +91,7 @@ class Intake:
         code = self.task.get("call_language") or languages.DEFAULT
         return {"conversation_id": self.id, "messages": self.messages[-30:], "task": self.task,
                 "ready": not missing, "missing": missing, "user_lang": self.user_lang,
+                "user_lang_locked": self.lang_locked,
                 "call_language": {**languages.get(code).public(),
                                   "reason": self.task.get("call_language_reason", ""),
                                   "locked": bool(self.task.get("call_language_locked"))},
@@ -342,24 +348,42 @@ def _set_call_language(intake: "Intake", requested: Optional[str], source: str) 
 
 
 def _set_user_language(intake: "Intake", setting: Optional[str], text: str, heard: Optional[str]) -> None:
-    """The language to answer in: the one the user picked, else the one this message is in."""
-    if (setting or "").strip().lower() == "auto":
-        intake.lang_auto = True
-    elif languages.normalize(setting):
-        intake.lang_auto, intake.user_lang = False, languages.normalize(setting)
+    """The language to answer in: the one picked in the settings, else the one the user first spoke in.
+
+    It is decided once and then fixed for the conversation: a Tamil speaker who later says "okay", reads out an
+    English address or mixes in English words still gets Tamil. Messages that don't show a language ("2000",
+    "Koramangala, Bengaluru") decide nothing; until one does, Swarm talks in the browser's language."""
+    picked = languages.normalize(setting) if (setting or "").strip().lower() != "auto" else None
+    if picked:
+        if picked != intake.user_lang or not intake.lang_locked:
+            intake.trace.append({"agent": "linguist", "text": f"talking to you in {languages.name(picked)} "
+                                                              "(picked in the settings)"})
+        intake.lang_auto, intake.lang_locked, intake.user_lang = False, True, picked
         return
-    if not intake.lang_auto:
+    if (setting or "").strip().lower() == "auto" and not intake.lang_auto:
+        intake.lang_auto, intake.lang_locked = True, False   # the user went back to "any language"
+    if intake.lang_locked:
         return
     if not text:
-        # Before the first word: greet in the browser's language, if it's one of ours
+        # Before the first word: greet in the browser's language, if it's one of ours (not fixed yet)
         if not intake.messages and languages.normalize(heard):
             intake.user_lang = languages.normalize(heard)
         return
-    detected = languages.user_language(text, heard, intake.user_lang)
-    if detected != intake.user_lang:
-        intake.trace.append({"agent": "linguist", "text": f"you're speaking {languages.name(detected)}: "
-                                                          f"replying in {languages.name(detected)}"})
-    intake.user_lang = detected
+    detected = languages.confident_language(text, heard, intake.user_lang)
+    if detected:
+        intake.user_lang, intake.lang_locked = detected, True
+        intake.trace.append({"agent": "linguist", "text": f"you're speaking {languages.name(detected)}: the whole "
+                                                          f"conversation stays in {languages.name(detected)}"})
+
+
+async def _place_state(task: dict) -> None:
+    """For a place the language table doesn't know, look up its state, which picks the local call language."""
+    place = task.get("location") or task.get("pickup") or ""
+    if not place or task.get("state") or places.is_near_me(place) or languages.detect(place)[0]:
+        return
+    state = await places.state_of(place)
+    if state:
+        task["state"] = state
 
 
 async def chat(conversation_id: Optional[str], message: str, lat: Optional[float] = None,
@@ -408,9 +432,16 @@ async def chat(conversation_id: Optional[str], message: str, lat: Optional[float
             if merged.get("service_key") and intake.task.get("service_key") and asking != "service":
                 merged.pop("service_key", None)  # don't silently switch service mid-conversation
                 merged.pop("service_label", None)
-            requested = languages.requested_language(text) or merged.pop("call_language", None)
-            merged.pop("call_language", None)
+            # The call language follows the place; it changes only when the user names a language for the calls
+            # (never on the model's guess, e.g. their own language when they didn't ask for it)
+            llm_language = merged.pop("call_language", None)
+            requested = languages.requested_language(text) or \
+                (llm_language if languages.mentions_language(text) else None)
+            moved = any(merged.get(k) and merged[k] != intake.task.get(k) for k in ("location", "pickup"))
+            if moved and not places.is_near_me(merged.get("location", "")):
+                intake.task.pop("state", None)   # a GPS state belongs to the old place, not the one just typed
             intake.task.update(merged)
+            await _place_state(intake.task)
             _set_call_language(intake, requested, "you asked")
             intake.trace.append({"agent": "concierge", "text": ("understood with " + llm.status()["last_used"].get(
                 "chat", "Gemini")) if thought.get("updates") or thought.get("reply") else "understood with rules"})

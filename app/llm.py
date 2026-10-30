@@ -203,8 +203,10 @@ async def transcribe(audio: bytes, mime: str, language_hint: str = "") -> Option
     """Speech -> {text, language} for browsers without speech recognition (Firefox, some iPhones)."""
     from app import languages
     names = ", ".join(f"{l.name} ({l.code})" for l in languages.LANGUAGES.values())
-    hint = (f"most likely speaking {languages.get(language_hint).name} (languages: {names})" if language_hint else
-            f"speaking one of: {names}; work out which from the audio itself")
+    lang = languages.get(language_hint)
+    # A hint is the conversation's language, already fixed: transcribe in it, don't re-guess
+    hint = (f"speaking {lang.name}; write the transcript in {lang.name} ({lang.script} script) (languages: {names})"
+            if language_hint else f"speaking one of: {names}; work out which from the audio itself")
     prompt = (f"Transcribe this short voice message exactly as spoken. The speaker is in India, {hint}. Write each "
               f"language in its own script (Hindi and Marathi in Devanagari, Tamil in Tamil script, English in Latin "
               f"letters, and so on), never romanized; keep English words the speaker used in English. \"language\" "
