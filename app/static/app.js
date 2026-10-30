@@ -759,6 +759,13 @@
   }
 
   async function boot() {
+    // A cached old page with this new script (or the reverse) can't work: fetch a fresh copy once
+    const required = ["#orb", "#botLine", "#typeForm", "#langPill", "#callList", "#settings", "#langSheet", "#dealModal"];
+    if (required.some((sel) => !$(sel))) {
+      if (!/[?&]fresh=/.test(location.search)) { location.replace(`${location.pathname}?fresh=${Date.now()}${location.hash}`); return; }
+      throw new Error("the page is out of date — please hard-refresh (pull down to reload, or Ctrl+Shift+R)");
+    }
+    if (/[?&]fresh=/.test(location.search)) history.replaceState(null, "", location.pathname + location.hash);
     S.config = await api("/api/config");
     for (const l of S.config.languages || []) S.langs[l.code] = l;
     S.commands = S.config.voice_commands || S.commands;
@@ -810,5 +817,9 @@
     }
     await sendChat("");
   }
-  boot().catch((e) => { showBot("Couldn't load: " + e.message); });
+  boot().catch((e) => {
+    const el = $("#botLine");
+    if (el) el.textContent = "Couldn't load: " + e.message;
+    else document.body.insertAdjacentHTML("afterbegin", `<p style="padding:16px">Couldn't load: ${esc(e.message)}. Please refresh.</p>`);
+  });
 })();

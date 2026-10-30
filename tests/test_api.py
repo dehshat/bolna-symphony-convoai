@@ -432,3 +432,20 @@ def test_language_errors_do_not_downgrade_the_llm(monkeypatch):
                                                 'not available for the model: saaras:v4"}')
     assert note and payload["agent_config"]["tasks"][0]["tools_config"]["llm_agent"]["llm_config"]["model"] == \
         "gpt-5.4-mini"
+
+
+def test_page_assets_are_versioned_so_browsers_never_run_a_stale_script(client):
+    """A cached old app.js against the new page broke the UI ("Cannot set properties of null")."""
+    import hashlib
+    from pathlib import Path
+    html = client.get("/").text
+    for name in ("app.js", "styles.css"):
+        digest = hashlib.sha1((Path("app/static") / name).read_bytes()).hexdigest()[:10]
+        assert f"/static/{name}?v={digest}" in html
+    assert "no-cache" in client.get("/").headers["cache-control"]
+    assert client.get("/static/app.js").headers["cache-control"] == "no-cache"
+    # every element the script needs is on the page
+    js = Path("app/static/app.js").read_text()
+    for el in ("orb", "botLine", "typeForm", "langPill", "callList", "settings", "langSheet", "dealModal",
+               "chips", "taskLine", "slList", "verdict", "log", "userLang", "modeSeg", "toast"):
+        assert f'id="{el}"' in html and f"#{el}" in js, el
