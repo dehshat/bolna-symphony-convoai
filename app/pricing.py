@@ -242,6 +242,8 @@ class ServiceRequest:
     lng: Optional[float] = None
     months: int = 1               # for per-month services (cook, maid, tutor)
     visits: int = 1               # for per-visit services
+    user_language: str = "en"     # the language the user talks to the app in (narration, recommendation, summary)
+    user_summary: str = ""        # the request in one line, in that language, for the screen
 
     def __post_init__(self) -> None:
         from app import services

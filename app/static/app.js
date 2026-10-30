@@ -18,7 +18,9 @@
     voiceOn: store.get("voiceOn", "1") === "1",
     handsFree: store.get("handsFree", "1") === "1",
     glossOn: store.get("glossOn", "1") === "1",
-    userLang: store.get("userLang", (navigator.language || "en").toLowerCase().startsWith("hi") ? "hi" : "en"),
+    userLang: store.get("userLang", "auto"),   // "auto": detect the language of every message; or a code picked in ⋯
+    spokenLang: "en",                          // the language Swarm answers in (detected, or the one picked)
+    lines: {}, sttDown: false,
     conv: { id: null, task: {}, ready: false, trace: [] },
     callLang: "hi", callLangReason: "", callLangLocked: false,
     phase: "intake", interacted: false,
@@ -43,11 +45,35 @@
     clearTimeout(toast.t); toast.t = setTimeout(() => { t.hidden = true; }, ms);
   }
 
+  // ================================================================ the user's language
+  // The browser's language, if it's one of the 11: what Swarm greets in before the user says anything
+  function browserLang() {
+    for (const tag of navigator.languages || [navigator.language || "en"]) {
+      const base = String(tag).toLowerCase().split("-")[0];
+      const code = base === "or" ? "od" : base;
+      if (S.langs[code]) return code;
+    }
+    return "en";
+  }
+  async function loadLines(code) {
+    if (S.lines[code]) return;
+    try { S.lines[code] = await api(`/api/lines/${encodeURIComponent(code)}`); } catch { /* English until it loads */ }
+  }
+  // Every reply says which language it's in; narration, the verdict and the deal follow it
+  async function setSpokenLang(code) {
+    if (!code || !S.langs[code]) return;
+    const changed = code !== S.spokenLang;
+    S.spokenLang = code;
+    await loadLines(code);
+    if (changed && S.userLang === "auto" && S.conv.id) toast(`${S.langs[code].native} · ${S.langs[code].name}`, 1800);
+  }
+
   // ================================================================ voice in / out
   const Voice = {
     SR: window.SpeechRecognition || window.webkitSpeechRecognition,
     rec: null, stopRecorder: null, audio: null, utter: null, speakDone: null,
-    canListen() { return !!(this.SR || (navigator.mediaDevices?.getUserMedia && (window.AudioContext || window.webkitAudioContext))); },
+    canRecord() { return !!(navigator.mediaDevices?.getUserMedia && (window.AudioContext || window.webkitAudioContext)); },
+    canListen() { return !!(this.SR || this.canRecord()); },
     tag(code) { return S.langs[code]?.browser || "en-IN"; },
 
     listen(code) {
@@ -89,8 +115,8 @@
           setOrb("thinking", "Transcribing…");
           try {
             const r = await api("/api/stt", { method: "POST", body: { audio: b64(wav16k(chunks, rate)), mime: "audio/wav", language: code } });
-            resolve({ text: (r.text || "").trim(), error: "" });
-          } catch (e) { resolve({ text: "", error: e.message }); }
+            resolve({ text: (r.text || "").trim(), error: "", language: r.language || "" });
+          } catch (e) { resolve({ text: "", error: e.message, failed: true }); }
         };
         this.stopRecorder = () => finish(false);
         proc.onaudioprocess = (e) => {
@@ -210,21 +236,28 @@
     Voice.stopSpeaking();
     setOrb("listening");
     showUser("");
-    const { text, error } = await Voice.listen(S.userLang);
+    // Auto: record and let the server work out which of the 11 languages it is (browser speech recognition only
+    // understands the one language it is told). A fixed language, or no Gemini, uses the browser's recognition.
+    const detect = S.userLang === "auto" && S.config?.gemini_enabled && !S.sttDown && Voice.canRecord();
+    const { text, error, language, failed } = detect ? await Voice.listenRecorder("") : await Voice.listen(S.spokenLang);
     if (error === "not-allowed" || error === "service-not-allowed") {
       setOrb("idle"); toast("Microphone is blocked. Allow it in the browser, or type instead."); return;
     }
+    if (detect && failed) {
+      S.sttDown = true;
+      toast(`Language detection is busy, so I'll listen in ${S.langs[S.spokenLang]?.name || "English"}. Pick your language in ⋯ to change it.`, 6000);
+    }
     if (!text) { setOrb("idle", "Didn't catch that — tap and try again"); return; }
-    await onUtterance(text);
+    await onUtterance(text, language);
   }
 
-  async function onUtterance(text) {
+  async function onUtterance(text, heard = "") {
     text = String(text || "").trim();
     if (!text) return;
-    if (/^(📍\s*)?use my (current |live )?location$/i.test(text)) { showUser(text); await useLocation(); return; }
+    if (text.startsWith("📍") || /^use my (current |live )?location$/i.test(text)) { showUser(text); await useLocation(); return; }
     if (S.phase === "calling" || S.phase === "done") { showUser(text); await onCallCommand(text); return; }
     if (S.phase === "shortlist") { showUser(text); onShortlistCommand(text); return; }
-    await sendChat(text);
+    await sendChat(text, heard ? { heard_lang: heard } : {});
   }
 
   // ================================================================ 1. the conversation
@@ -235,11 +268,12 @@
     try {
       r = await api("/api/chat", { method: "POST", body: {
         conversation_id: S.conv.id, message: text || "", lat: S.geo?.lat, lng: S.geo?.lng,
-        user_lang: S.userLang, ...extra } });
+        user_lang: S.userLang, heard_lang: S.conv.id ? undefined : browserLang(), ...extra } });
     } catch (e) {
       setOrb("idle"); showBot("Sorry, I couldn't reach the server: " + e.message); return;
     }
-    S.conv = { id: r.conversation_id, task: r.task || {}, ready: r.ready, trace: r.trace || [] };
+    S.conv = { id: r.conversation_id, task: r.task || {}, ready: r.ready, trace: r.trace || [], service: r.service_name };
+    await setSpokenLang(r.user_lang);
     if (r.call_language) {
       S.callLang = r.call_language.code; S.callLangReason = r.call_language.reason || ""; S.callLangLocked = !!r.call_language.locked;
     }
@@ -307,7 +341,7 @@
   async function useLocation() {
     S.geoDenied = false;
     setOrb("thinking", "Finding where you are…");
-    if (!(await getGeo())) { setOrb("idle"); showBot("I couldn't get your location. Just tell me the area."); await Voice.say("I couldn't get your location. Just tell me the area.", "en"); return; }
+    if (!(await getGeo())) { const line = narr("no_location"); setOrb("idle"); showBot(line); await Voice.say(line, narrLang()); return; }
     if (S.conv.task && /near|location|here/i.test(S.conv.task.location || "")) S.conv.task.location = "";
     await sendChat("");   // the server names the area from your position and picks its language
   }
@@ -344,7 +378,7 @@
     S.phase = "shortlist";
     dock(true);
     const t = S.conv.task;
-    const say = narr("searching", { service: t.service_label || "providers", place: (t.location || "you").split(",")[0] });
+    const say = narr("searching", { service: S.conv.service || t.service_label || "", place: (t.location || "").split(",")[0] });
     showBot(say); setOrb("thinking", "Searching the map…");
     let r;
     try {
@@ -361,7 +395,7 @@
     renderShortlist();
     $("#shortlist").hidden = false;
     window.scrollTo({ top: 0, behavior: "smooth" });
-    const line = narr("found", { n: S.providers.length, k, lang: langName(S.callLang) });
+    const line = narr("found", { n: S.providers.length, k, language: langName(S.callLang) });
     showBot(line);
     setOrb("idle", "Say “wait” to choose yourself");
     startCountdown(5);
@@ -414,7 +448,7 @@
   }
   function stopCountdown() { clearInterval(S.countdown); S.countdown = null; $("#countdown").textContent = ""; }
   function onShortlistCommand(text) {
-    if (isNo(text) || /\b(wait|ruko|hold|choose|pick)\b/i.test(text)) { stopCountdown(); showBot("Okay — tick who to call, then tap Call."); setOrb("idle"); return; }
+    if (isNo(text) || /\b(wait|ruko|hold|choose|pick)\b/i.test(text)) { stopCountdown(); showBot(narr("choose")); setOrb("idle"); return; }
     if (isYes(text)) { stopCountdown(); callSelected(); return; }
     setOrb("idle");
   }
@@ -443,7 +477,7 @@
     renderChips([]);
     history.replaceState(null, "", "#s=" + session.session_id);
     const n = session.legs.length;
-    showBot(narr("calling", { n, lang: langName(session.language) }));
+    showBot(narr("calling", { n, language: langName(session.language) }));
     setOrb("idle", "Say “stop” to end the calls");
     render(session);
     connect(session.session_id);
@@ -528,54 +562,17 @@
     v.hidden = false;
     $("#vMain").textContent = rec.summary;
     $("#vReasons").innerHTML = (rec.reasons || []).map((x) => `<li>${esc(x)}</li>`).join("");
-    $(".verdict-k", v).textContent = rec.confirmed ? "Confirmed" : "Recommended";
+    $(".verdict-k", v).textContent = narr(rec.confirmed ? "confirmed_k" : "recommended");
+    $("#vConfirm").textContent = narr("confirm_btn"); $("#vOther").textContent = narr("other_btn");
     $("#vConfirm").hidden = !!rec.confirmed; $("#vOther").hidden = !!rec.confirmed;
   }
 
   // ---------------------------------------------------------------- spoken narration of the calls
-  const NARR = {
-    en: {
-      searching: "Looking for the best-rated {service} near {place}…",
-      found: "Found {n}. Calling the top {k} in {lang}.",
-      none: "I couldn't find anyone for that nearby. Try a wider area or other words.",
-      calling: "Calling {n} now, in {lang}. I'll tell you what they say.",
-      quoted: "{name}: {price}, all-in.",
-      hidden: "{name} said {said}, but with hidden extras it's really {price}.",
-      hold: "{name} agreed to {price}.",
-      slot: "{name} can see you {slot}.",
-      walk: "{name} stayed above your max.",
-      failed: "Couldn't reach {name}.",
-      nodeal: "{name} couldn't do it.",
-      recommend: "All done. I recommend {name}: {what}. Shall I confirm?",
-      nobody: "Calls done, but nobody fit your budget. You could raise the max or call more providers.",
-      confirmed: "Confirmed with {name}. Your summary is ready to send on WhatsApp.",
-      pick: "Okay. Tap a provider to choose, or say their name.",
-      unknown: "Say yes to confirm {name}, or tap another one.",
-      stopped: "Stopped the calls.",
-    },
-    hi: {
-      searching: "पास में सबसे अच्छे {service} ढूँढ रहा हूँ…",
-      found: "{n} मिले। सबसे अच्छे {k} को {lang} में फ़ोन कर रहा हूँ।",
-      none: "पास में कोई नहीं मिला। थोड़ा बड़ा इलाका या दूसरे शब्द बताइए।",
-      calling: "{n} लोगों को {lang} में फ़ोन लगा रहा हूँ। जो बोलेंगे, आपको बताता रहूँगा।",
-      quoted: "{name}: सब मिलाकर {price}।",
-      hidden: "{name} ने {said} बोला, पर छुपे ख़र्चे मिलाकर असल में {price} है।",
-      hold: "{name} {price} पर राज़ी हैं।",
-      slot: "{name} के पास {slot} का समय है।",
-      walk: "{name} आपके बजट से ऊपर रहे।",
-      failed: "{name} से बात नहीं हो पाई।",
-      nodeal: "{name} से बात नहीं बनी।",
-      recommend: "सारे फ़ोन हो गए। मेरी सलाह: {name}, {what}। पक्का कर दूँ?",
-      nobody: "फ़ोन हो गए, पर कोई आपके बजट में नहीं आया। बजट बढ़ा सकते हैं या और लोगों को फ़ोन करें।",
-      confirmed: "{name} के साथ पक्का हो गया। व्हाट्सऐप पर भेजने के लिए सारांश तैयार है।",
-      pick: "ठीक है। किसी को चुनने के लिए उस पर टैप कीजिए, या नाम बोलिए।",
-      unknown: "{name} को पक्का करने के लिए 'हाँ' बोलिए, या किसी और पर टैप कीजिए।",
-      stopped: "फ़ोन रोक दिए।",
-    },
-  };
-  const narrLang = () => (S.userLang === "hi" ? "hi" : "en");
-  const langName = (code) => (narrLang() === "hi" ? S.langs[code]?.hi_name : S.langs[code]?.name) || "";
-  const narr = (key, vars) => (NARR[narrLang()][key] || NARR.en[key]).replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? "");
+  // Narration, the verdict and the deal, in the user's language (app/userlex.py; English until a table loads)
+  const narrLang = () => (S.lines[S.spokenLang] ? S.spokenLang : "en");
+  const table = () => S.lines[narrLang()] || S.lines.en || { lines: {}, language_names: {} };
+  const langName = (code) => table().language_names?.[code] || S.langs[code]?.name || "";
+  const narr = (key, vars = {}) => (table().lines[key] || S.lines.en?.lines[key] || "").replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? "");
 
   const Narrator = {
     queue: [], busy: false,
@@ -607,7 +604,7 @@
         once("quote", leg.first_hidden ? narr("hidden", { name, said: inr(leg.first_stated), price: inr(leg.first_all_in) }) : narr("quoted", { name, price: inr(leg.first_all_in) }));
       }
       if (leg.status !== prev.status) {
-        if (leg.status === "HOLD") once("hold", appt ? narr("slot", { name, slot: leg.slot }) : narr("hold", { name, price: inr(leg.best_all_in) }), true);
+        if (leg.status === "HOLD") once("hold", appt ? narr("slot", { name, slot: leg.slot_user || leg.slot }) : narr("hold", { name, price: inr(leg.best_all_in) }), true);
         if (leg.status === "FAILED") once("failed", narr("failed", { name }));
         if (leg.status === "ENDED" && !leg.slot) once("ended", leg.last_action === "WALK_AWAY" ? narr("walk", { name }) : narr("nodeal", { name }));
       }
@@ -617,7 +614,7 @@
     if (rec?.all_done && S.recSpoken !== session.session_id && !session.locked_leg_id) {
       S.recSpoken = session.session_id;
       S.phase = "done";
-      const what = appt ? [rec.slot, rec.price ? `fee ${inr(rec.price)}` : ""].filter(Boolean).join(", ") : `${inr(rec.price)} all-in`;
+      const what = rec.what || (appt ? [rec.slot, rec.price ? `fee ${inr(rec.price)}` : ""].filter(Boolean).join(", ") : `${inr(rec.price)} all-in`);
       const line = rec.leg_id ? narr("recommend", { name: rec.vendor_name, what }) : narr("nobody", {});
       S.log.push({ agent: "advisor", text: rec.leg_id ? `recommends ${rec.summary} (${(rec.reasons || []).join("; ")})` : rec.summary });
       renderLog();
@@ -670,19 +667,20 @@
   function showDeal(session) {
     const leg = session.legs.find((l) => l.leg_id === session.locked_leg_id);
     const p = session.payment || {}, wa = session.whatsapp || {}, appt = session.request.goal === "appointment", paid = p.status === "paid";
-    $("#dealTitle").textContent = appt ? "Appointment confirmed" : paid ? "Advance paid" : "Deal confirmed";
-    const callback = leg?.mode === "live" ? `<p class="fine">Calling ${esc(leg.vendor_name)} back now to confirm it with them.</p>` : "";
-    const excluded = (leg?.excluded || []).length ? `<p class="fine">Paid separately: ${leg.excluded.map((x) => esc(x.item) + (x.amount ? " " + inr(x.amount) : " (at actuals)")).join(", ")}</p>` : "";
-    $("#dealBody").innerHTML = `<div class="deal"><span class="fine">${esc(session.request.summary)}</span><b>${esc(leg?.vendor_name)}</b>
+    $("#dealTitle").textContent = narr(appt ? "appt_title" : paid ? "paid_title" : "deal_title");
+    const callback = leg?.mode === "live" ? `<p class="fine">${esc(narr("calling_back", { name: leg.vendor_name }))}</p>` : "";
+    const excluded = (leg?.excluded || []).length ? `<p class="fine">${esc(narr("paid_separately", { items: leg.excluded.map((x, i) => (leg.excluded_user?.[i] || x.item) + (x.amount ? " " + inr(x.amount) : ` (${narr("at_actuals")})`)).join(", ") }))}</p>` : "";
+    const saved = session.savings_vs_worst_first_quote ? ` · ${narr("saved", { amount: inr(session.savings_vs_worst_first_quote) })}` : "";
+    $("#dealBody").innerHTML = `<div class="deal"><span class="fine">${esc(session.request.user_summary || session.request.summary)}</span><b>${esc(leg?.vendor_name)}</b>
       <span class="big">${appt ? esc(leg?.slot || "") : inr(leg?.best_all_in)}</span>
-      ${appt ? `<span class="fine">${leg?.best_all_in ? "Fee " + inr(leg.best_all_in) : "Fee to be confirmed"}</span>`
-        : `<span class="fine">All-inclusive${session.savings_vs_worst_first_quote ? ` · saved ${inr(session.savings_vs_worst_first_quote)}` : ""}${p.amount ? ` · advance ${inr(p.amount)}` : ""}</span>`}
-      ${excluded}<span class="fine">Others released politely · your number shared with nobody</span>${callback}</div>
+      ${appt ? `<span class="fine">${esc(leg?.best_all_in ? narr("fee", { fee: inr(leg.best_all_in) }) : narr("fee_tbc"))}</span>`
+        : `<span class="fine">${esc(narr("all_inclusive"))}${esc(saved)}${p.amount ? ` · ${esc(narr("advance", { amount: inr(p.amount) }))}` : ""}</span>`}
+      ${excluded}<span class="fine">${esc(narr("released"))}</span>${callback}</div>
       ${!appt && p.provider === "mock" && !paid ? `<div class="mockpay"><div class="qr" aria-hidden="true"></div><div><b>Test checkout</b><br>No real money moves. Advance ${inr(p.amount)}</div></div>` : ""}`;
     const actions = [];
-    if (p.provider === "razorpay" && p.url) actions.push(`<a class="btn primary" href="${esc(p.url)}" target="_blank" rel="noopener">Pay ${inr(p.amount)}</a>`);
+    if (p.provider === "razorpay" && p.url) actions.push(`<a class="btn primary" href="${esc(p.url)}" target="_blank" rel="noopener">${esc(narr("pay", { amount: inr(p.amount) }))}</a>`);
     if (!appt && p.provider === "mock" && !paid) actions.push(`<button type="button" class="btn primary" id="mockPayBtn">Pay ${inr(p.amount)} (test)</button>`);
-    if (wa.link) actions.push(`<a class="btn" href="${esc(wa.link)}" target="_blank" rel="noopener">${wa.sent ? "Sent on WhatsApp ✓" : "Send on WhatsApp"}</a>`);
+    if (wa.link) actions.push(`<a class="btn" href="${esc(wa.link)}" target="_blank" rel="noopener">${esc(narr(wa.sent ? "sent_wa" : "send_wa"))}</a>`);
     $("#dealActions").innerHTML = actions.join("");
     $("#mockPayBtn")?.addEventListener("click", async () => {
       try { const s = await api(`/api/session/${session.session_id}/mock_pay`, { method: "POST" }); render(s); showDeal(s); } catch (e) { toast(e.message); }
@@ -769,8 +767,12 @@
     S.config = await api("/api/config");
     for (const l of S.config.languages || []) S.langs[l.code] = l;
     S.commands = S.config.voice_commands || S.commands;
-    $("#userLang").innerHTML = Object.values(S.langs).map((l) => `<option value="${esc(l.code)}">${esc(l.native)} · ${esc(l.name)}</option>`).join("");
-    $("#userLang").value = S.langs[S.userLang] ? S.userLang : "en";
+    S.lines.en = S.config.user_lines?.en;
+    $("#userLang").innerHTML = `<option value="auto">Any language (detect it)</option>` +
+      Object.values(S.langs).map((l) => `<option value="${esc(l.code)}">${esc(l.native)} · ${esc(l.name)}</option>`).join("");
+    if (S.userLang !== "auto" && !S.langs[S.userLang]) S.userLang = "auto";
+    $("#userLang").value = S.userLang;
+    await setSpokenLang(S.userLang === "auto" ? browserLang() : S.userLang);
     applyToggles(); renderLangPill(); setOrb("idle");
     try { window.speechSynthesis?.getVoices(); window.speechSynthesis?.addEventListener?.("voiceschanged", () => {}); } catch { /* none */ }
 
@@ -799,7 +801,10 @@
     $("#voiceOn").addEventListener("change", (e) => { S.voiceOn = e.target.checked; store.set("voiceOn", S.voiceOn ? "1" : "0"); if (!S.voiceOn) Voice.stopSpeaking(); });
     $("#handsFree").addEventListener("change", (e) => { S.handsFree = e.target.checked; store.set("handsFree", S.handsFree ? "1" : "0"); });
     $("#glossOn").addEventListener("change", (e) => { S.glossOn = e.target.checked; store.set("glossOn", S.glossOn ? "1" : "0"); applyToggles(); });
-    $("#userLang").addEventListener("change", (e) => { S.userLang = e.target.value; store.set("userLang", S.userLang); });
+    $("#userLang").addEventListener("change", (e) => {
+      S.userLang = e.target.value; store.set("userLang", S.userLang); S.sttDown = false;
+      if (S.userLang !== "auto") setSpokenLang(S.userLang);
+    });
     $("#checkBtn").addEventListener("click", () => adminCall("check"));
     $("#previewBtn").addEventListener("click", () => adminCall("preview"));
     $("#syncBtn").addEventListener("click", () => adminCall("sync"));

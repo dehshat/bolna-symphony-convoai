@@ -694,7 +694,8 @@ def localize_when(when: str, language: str) -> str:
     text = (when or "").strip()
     if language not in NATIVE:
         return text or "soon"
-    if text and not re.search(r"[A-Za-z]", text):
+    from app.languages import foreign_letters  # local import: languages imports nothing from here
+    if text and not re.search(r"[A-Za-z]", text) and not foreign_letters(text, language):
         return text   # already in the vendor's own words
     starts = False
     m = re.match(r"^\s*(?:starting\s+)?from\s+(.+)$", text, re.I)
@@ -738,13 +739,49 @@ def localize_when(when: str, language: str) -> str:
             word_ = WHEN_WORDS[_WHEN_ALIASES[low]][language]
             if not out or out[-1] != word_:
                 out.append(word_)
-        elif not re.search(r"[A-Za-z]", tok):
-            out.append(tok)   # already native
+        elif not re.search(r"[A-Za-z]", tok) and not foreign_letters(tok, language):
+            out.append(tok)   # already native (a Tamil word on a Marathi call is dropped like an English one)
         # any other English word ("by", "at", "lunch") is dropped rather than spoken in English
     if starts and out:
         _append_from(out, language)
     result = " ".join(out).strip()
     return result or WHEN_WORDS["soon"][language]
+
+
+_ENGLISH_WHEN = {"today": "today", "tomorrow": "tomorrow", "day_after": "day after tomorrow", "tonight": "tonight",
+                 "now": "now", "anytime": "anytime", "morning": "morning", "afternoon": "afternoon",
+                 "evening": "evening", "night": "night", "this": "this", "next": "next", "week": "week",
+                 "weekend": "weekend", "month": "month", "monday": "monday", "tuesday": "tuesday",
+                 "wednesday": "wednesday", "thursday": "thursday", "friday": "friday", "saturday": "saturday",
+                 "sunday": "sunday"}
+
+
+# Everyday variants the WHEN_WORDS table (written for the calls) doesn't use
+_WHEN_EXTRA = {"today": ("இன்று", "ಇಂದು", "আজকে"), "tomorrow": ("કાલે", "நாளை"),
+               "weekend": ("সপ্তাহান্তে", "ವಾರಾಂತ್ಯ", "വാരാന്ത്യത്തിൽ", "आख़िर", "ਅਖੀਰ", "ଶେଷରେ", "இறுதியில்")}
+
+
+def english_when(text: str) -> str:
+    """'நாளை காலை' / 'उद्या सकाळी 9 वाजता' -> 'tomorrow morning' / 'tomorrow morning 9': a time said in any of the
+    languages, back in English words, so every call can say it in its own language. '' if nothing is recognised."""
+    if not text or not re.search(r"[^\x00-\x7f]", text):
+        return ""
+    words = [(w, concept) for concept in _ENGLISH_WHEN
+             for phrase in [*(WHEN_WORDS.get(concept) or {}).values(), *_WHEN_EXTRA.get(concept, ())]
+             for w in phrase.split()]
+    out: list[str] = []
+    for tok in _TOKEN_RE.findall(text):
+        if tok.isdigit():
+            out.append(tok)
+            continue
+        # Prefix match both ways: 'நாளை' ~ 'நாளைக்கு', 'காலையில' ~ 'காலை'
+        hit = next((c for w, c in sorted(words, key=lambda x: -len(x[0]))
+                    if len(w) >= 2 and len(tok) >= 2 and (tok.startswith(w) or w.startswith(tok))), None)
+        if hit and _ENGLISH_WHEN[hit] not in out:
+            out.append(_ENGLISH_WHEN[hit])
+    if "weekend" in out and "week" in out:   # "इस हफ़्ते के आख़िर में" = this weekend
+        out.remove("week")
+    return " ".join(out)
 
 
 # ================================================================================================ charges

@@ -26,6 +26,22 @@ log = logging.getLogger("bolna")
 
 SARVAM_LANG = {code: lang.sarvam for code, lang in languages.LANGUAGES.items()}
 PRE_CALL_MESSAGE = {code: lexicon.word(code, "pre_call") for code in lexicon.ALL}
+
+
+def every_tag(line: str) -> dict:
+    """{language tag: line} for every tag Bolna may look a message up by.
+
+    Bolna picks the tool-call filler and the "are you there?" line by the language it thinks the vendor speaks, falls
+    back to the "en" entry, and then to its own English ("Just give me a moment, I'll be back with you."). Every key
+    carries the call language's own line, so a Marathi call never hears an English sentence, whatever Bolna detects."""
+    keys = set(lexicon.ALL) | set(SARVAM_LANG.values()) | {"or", "or-IN"}
+    return {key: line for key in sorted(keys)}
+
+
+def pre_call_message(language: str) -> dict:
+    return every_tag(PRE_CALL_MESSAGE.get(language) or PRE_CALL_MESSAGE["hi"])
+
+
 STILL_THERE = {code: lexicon.word(code, "still_there") for code in lexicon.ALL}
 
 TOOL_FIELDS = ["session_id", "leg_id", "vendor_said", "price", "pricing_model", "toll", "driver_bata",
@@ -37,11 +53,12 @@ CHARGE_DESC = ("'included', 'extra', 'extra <amount in digits>', 'na' (not appli
 def _example(language: str) -> str:
     """A two-turn example call, built from the language's own lines (so every language gets a native example)."""
     vendor = lexicon.VENDOR[language]
+    hold = lexicon.word(language, "pre_call")
     return (f"Vendor: {vendor['avail_budget']}\n"
-            f"You: (call submit_and_counter with price \"unknown\" and situation asks_budget, then say its line) "
-            f"{lexicon.render(language, 'ASK_VENDOR_FIRST')}\n"
+            f"You: {hold} (call submit_and_counter with price \"unknown\" and situation asks_budget, then say its "
+            f"line) {lexicon.render(language, 'ASK_VENDOR_FIRST')}\n"
             f"Vendor: {vendor['quote_inclusive'].format(price=3000)}\n"
-            f"You: (call submit_and_counter with price 3000, then say its line) "
+            f"You: {hold} (call submit_and_counter with price 3000, then say its line) "
             f"{lexicon.render(language, 'COUNTER_LEVERAGE', who='operator', competitor=2450, counter=2300)}")
 
 
@@ -49,6 +66,7 @@ def _language_rules(language: str) -> str:
     if language not in lexicon.NATIVE:
         return """LANGUAGE
 - Speak simple, warm Indian English. Rupee amounts with digits and the ₹ sign exactly as the tools give them.
+- Never go silent into a tool call: in the same turn, first say "One second, noting that down.", then call the tool.
 - Tool arguments are data: write them in English."""
     lang = languages.get(language)
     w = lambda key: lexicon.word(language, key)  # noqa: E731
@@ -61,6 +79,8 @@ def _language_rules(language: str) -> str:
 - If the vendor asks you to change language, apologise briefly in {lang.name} and carry on in simple {lang.name}.
 - Call the vendor "{w('address')}". Be respectful and friendly.
 - Tool arguments are data, not speech: write them in English. Only what you SAY must be {lang.name}.
+- Never go silent into a tool call: in the same turn, first say "{w('pre_call')}", then call the tool. Every
+  filler, hold or "one moment" line is {lang.name} too; never "give me a moment" or any other English.
 
 {lang.name.upper()} WORDS TO USE (never the English ones): customer = {w('customer')}; all-inclusive = {w('all_in')};
 price = {w('price')}; extra / separate = {w('extra')}; included = {w('included')}; advance payment = {w('advance')};
@@ -148,6 +168,7 @@ EXAMPLE (style only; real prices always come from the tools)
 
 
 def _tools(language: str) -> list[dict]:
+    pre_call = pre_call_message(language)
     ids = {
         "session_id": {"type": "string", "description": "Exactly the session_id from your instructions"},
         "leg_id": {"type": "string", "description": "Exactly the leg_id from your instructions"},
@@ -156,6 +177,7 @@ def _tools(language: str) -> list[dict]:
         {
             "name": "submit_and_counter",
             "key": "custom_task",
+            "pre_call_message": pre_call,
             "description": ("Record what the vendor just said (availability, price, rate or any extra charge) in the "
                             "shared live auction and get the exact next line to say. Call this EVERY time the vendor "
                             "mentions any number or charge, or asks for the budget."),
@@ -205,6 +227,7 @@ def _tools(language: str) -> list[dict]:
         {
             "name": "check_auction_status",
             "key": "custom_task",
+            "pre_call_message": pre_call,
             "description": ("Check the shared live auction: has another vendor just quoted lower, or has the customer "
                             "already chosen someone? Call it when the vendor asks you to wait or before ending."),
             "parameters": {"type": "object", "properties": ids, "required": ["session_id", "leg_id"]},
@@ -244,12 +267,12 @@ def build_agent_payload(language: str = "hi", base_url: Optional[str] = None) ->
     tools_params = {
         "submit_and_counter": {
             "method": "POST", "url": f"{base}/api/tools/submit_and_counter", "api_token": token,
-            "param": _param_template(TOOL_FIELDS, style), "pre_call_message": PRE_CALL_MESSAGE.get(language),
+            "param": _param_template(TOOL_FIELDS, style), "pre_call_message": pre_call_message(language),
         },
         "check_auction_status": {
             "method": "POST", "url": f"{base}/api/tools/check_auction_status", "api_token": token,
             "param": _param_template(["session_id", "leg_id"], style),
-            "pre_call_message": PRE_CALL_MESSAGE.get(language),
+            "pre_call_message": pre_call_message(language),
         },
     }
     telephony = s.bolna_telephony_provider
@@ -300,7 +323,7 @@ def build_agent_payload(language: str = "hi", base_url: Optional[str] = None) ->
                     "incremental_delay": s.call_response_delay_ms,
                     "number_of_words_for_interruption": s.call_interruption_words, "interruption_backoff_period": 150,
                     "voicemail": True, "check_if_user_online": True, "trigger_user_online_message_after": 10,
-                    "check_user_online_message": STILL_THERE[language],
+                    "check_user_online_message": every_tag(STILL_THERE[language]),
                 },
             }],
         },

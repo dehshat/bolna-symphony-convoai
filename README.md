@@ -79,6 +79,12 @@ Sarvam's ASR and TTS support.
   and a two-turn example call in that language. Each tool result carries the exact native line to say plus its
   English `meaning`.
 * **Bolna's backchannel fillers are English**, so they're switched off for every non-English call.
+* **No English "Just give me a moment, I'll be back with you."** That is Bolna's built-in line while a tool runs; it
+  picks the line by the language it detects and falls back to English. Every agent sets its own
+  `pre_call_message` (and the "can you hear me?" line) under every language tag Bolna may look up, and the prompt has
+  the agent say its native "one second, noting that down" itself before each tool call, which stops Bolna adding a
+  filler at all. Existing agents pick this up after the next deploy (the boot languages at start, the others on their
+  first call); agents pinned with `BOLNA_AGENT_IDS` need ⋯ → Bolna setup → *Create / update agents*.
 * **Tested:** `tests/test_languages.py` checks that every line in every language has zero Latin letters and no
   letters from another script, renders every template, runs a full simulated call in each language, and replays
   **all 43 call scenarios × 11 languages (473 runs)** through the live negotiation code. The same sweep runs from
@@ -87,6 +93,19 @@ Sarvam's ASR and TTS support.
 Place names keep their spelling when Gemini isn't available to transliterate them (they're names, not English).
 
 ---
+
+## Talk to it in any language
+
+You don't pick a language first: **speak (or type) in any of the 11 and Swarm answers in it.** The mic records your
+voice and Gemini works out which language it is (the browser's own speech recognition only understands the one
+language it's told); typed text is told apart by its script (Tamil, Bengali…; Devanagari is Hindi or Marathi by its
+words; romanized Hindi counts as Hindi). Place names in English letters don't switch you to English.
+
+Every question, the one-line summary you confirm, the narration of the calls, the recommendation and its reasons, and
+the deal sheet come back in your language (`app/userlex.py`, also used when Gemini is off). The calls still use the
+call language: a Tamil speaker in Pune hears the Marathi calls narrated in Tamil. A time you say in your language
+("நாளை காலை") is stored in English words so each call says it in its own language. To fix one language instead,
+pick it in ⋯ → *You speak*. Without a Gemini key the mic uses the browser's recognition in the last language you used.
 
 ## Natural, patient calls
 
