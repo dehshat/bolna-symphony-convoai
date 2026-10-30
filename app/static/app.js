@@ -1,24 +1,33 @@
-/* Swarm Negotiator war-room. Vanilla JS, no build step, no CDN. */
+/* Swarm: a voice-first concierge. Talk → it finds providers → calls them in the local language → you confirm.
+   Vanilla JS, no build step. */
 (() => {
   "use strict";
   const $ = (s, el = document) => el.querySelector(s);
   const $$ = (s, el = document) => [...el.querySelectorAll(s)];
   const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const inr = (n) => (n == null ? "—" : "₹" + Number(n).toLocaleString("en-IN"));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const store = {
-    get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+    get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch { return d; } },
     set(k, v) { try { localStorage.setItem(k, v); } catch { /* private mode */ } },
   };
 
-  const LANG = { kn: "KN", hi: "HI", ta: "TA", mr: "MR", en: "EN" };
-  const CATEGORY = { cab_outstation: "🚙 Cab", mini_truck: "🚚 Mini-truck", ac_repair: "❄️ AC repair" };
-  const STATUS_LABEL = { PENDING: "QUEUED", DIALING: "DIALING", CONNECTED: "CONNECTED", QUOTED: "QUOTED", COUNTERED: "COUNTERED", HOLD: "ON HOLD", WON: "WON", RELEASED: "RELEASED", ENDED: "ENDED", FAILED: "FAILED" };
+  const S = {
+    config: null, langs: {}, commands: { yes: [], no: [] },
+    mode: store.get("mode", "simulation"),
+    voiceOn: store.get("voiceOn", "1") === "1",
+    handsFree: store.get("handsFree", "1") === "1",
+    glossOn: store.get("glossOn", "1") === "1",
+    userLang: store.get("userLang", (navigator.language || "en").toLowerCase().startsWith("hi") ? "hi" : "en"),
+    conv: { id: null, task: {}, ready: false, trace: [] },
+    callLang: "hi", callLangReason: "", callLangLocked: false,
+    phase: "intake", interacted: false,
+    geo: null, geoDenied: false,
+    providers: [], provInfo: null, sel: new Set(), countdown: null,
+    session: null, ws: null, poll: null, prev: {}, narrated: new Set(), recSpoken: null, openLegs: new Set(),
+  };
 
-  const S = { config: null, preset: null, mode: store.get("mode", "simulation"), session: null, ws: null, poll: null, seenTicks: new Set(), tickTimer: null, lastT: 0, lastTAt: 0,
-    chat: { id: null, task: {}, ready: false }, geo: null, providers: [], provSel: new Set(), provInfo: null };
-  const md = (t) => esc(t).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
-
-  // ------------------------------------------------------------------ API
+  // ================================================================ API
   async function api(path, opts = {}) {
     const headers = { "Content-Type": "application/json" };
     const tok = $("#adminToken")?.value || store.get("adminToken", "");
@@ -28,195 +37,256 @@
     if (!r.ok) throw new Error(data.detail || data.error || r.statusText);
     return data;
   }
-
-  // ------------------------------------------------------------------ brief panel
-  function renderPresets() {
-    const box = $("#presetChips");
-    box.innerHTML = Object.entries(S.config.presets).map(([k, p]) => `<button class="chip" data-k="${esc(k)}">${esc(p.title)}</button>`).join("");
-    $$(".chip", box).forEach((b) => b.addEventListener("click", () => applyPreset(b.dataset.k)));
-  }
-  function applyPreset(key) {
-    const p = S.config.presets[key];
-    if (!p) return;
-    S.preset = key;
-    $$(".chip").forEach((c) => c.classList.toggle("active", c.dataset.k === key));
-    $("#briefText").value = p.brief;
-    fillRequest(p.request);
-    $("#parsedBy").textContent = "preset";
-  }
-  function fillRequest(r) {
-    S.request = { ...r };
-    $("#target").value = r.target_price ?? "";
-    $("#ceiling").value = r.walkaway_ceiling ?? "";
-    $("#summary").value = r.summary ?? "";
-  }
-  async function parseBrief() {
-    const text = $("#briefText").value.trim();
-    if (text.length < 3) return;
-    $("#parseBtn").disabled = true;
-    $("#parsedBy").textContent = "parsing…";
-    try {
-      const r = await api("/api/parse_brief", { method: "POST", body: { text } });
-      fillRequest(r);
-      S.preset = null;
-      $$(".chip").forEach((c) => c.classList.remove("active"));
-      $("#parsedBy").textContent = r.parsed_by === "gemini" ? "parsed by Gemini" : "parsed by rules";
-    } catch (e) {
-      $("#parsedBy").textContent = "parse failed: " + e.message;
-    } finally {
-      $("#parseBtn").disabled = false;
-    }
+  function toast(text, ms = 3200) {
+    const t = $("#toast");
+    t.textContent = text; t.hidden = false;
+    clearTimeout(toast.t); toast.t = setTimeout(() => { t.hidden = true; }, ms);
   }
 
-  function setupMic() {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const btn = $("#micBtn");
-    if (!SR) { btn.title = "Speech input not supported in this browser"; btn.disabled = true; return; }
-    let rec = null;
-    btn.addEventListener("click", () => {
-      if (rec) { rec.stop(); return; }
-      rec = new SR();
-      rec.lang = $("#micLang").value;
-      rec.interimResults = true;
-      rec.continuous = false;
-      const base = "";
-      rec.onresult = (ev) => {
-        $("#briefText").value = base + [...ev.results].map((r) => r[0].transcript).join(" ");
-      };
-      rec.onend = () => { btn.classList.remove("rec"); rec = null; parseBrief(); };
-      rec.onerror = () => { btn.classList.remove("rec"); rec = null; };
-      btn.classList.add("rec");
-      rec.start();
-    });
+  // ================================================================ voice in / out
+  const Voice = {
+    SR: window.SpeechRecognition || window.webkitSpeechRecognition,
+    rec: null, stopRecorder: null, audio: null, utter: null, speakDone: null,
+    canListen() { return !!(this.SR || (navigator.mediaDevices?.getUserMedia && (window.AudioContext || window.webkitAudioContext))); },
+    tag(code) { return S.langs[code]?.browser || "en-IN"; },
+
+    listen(code) {
+      return this.SR ? this.listenBrowser(code) : this.listenRecorder(code);
+    },
+    listenBrowser(code) {
+      return new Promise((resolve) => {
+        const rec = new this.SR();
+        this.rec = rec;
+        rec.lang = this.tag(code); rec.interimResults = true; rec.continuous = false; rec.maxAlternatives = 1;
+        let text = "", error = "";
+        rec.onresult = (ev) => {
+          text = [...ev.results].map((r) => r[0].transcript).join(" ").trim();
+          showUser(text, true);
+        };
+        rec.onerror = (e) => { error = e.error || "error"; };
+        rec.onend = () => { this.rec = null; resolve({ text, error: text ? "" : error }); };
+        try { rec.start(); } catch (e) { this.rec = null; resolve({ text: "", error: "busy" }); }
+      });
+    },
+    // Browsers without speech recognition: record 16 kHz WAV, stop on silence, transcribe with Gemini on the server
+    async listenRecorder(code) {
+      let stream;
+      try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }); }
+      catch { return { text: "", error: "not-allowed" }; }
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new Ctx();
+      const src = ctx.createMediaStreamSource(stream);
+      const proc = ctx.createScriptProcessor(4096, 1, 1);
+      const chunks = [];
+      let spoke = false, silent = 0, total = 0, done = false;
+      return new Promise((resolve) => {
+        const finish = async (cancel = false) => {
+          if (done) return; done = true;
+          proc.disconnect(); src.disconnect(); stream.getTracks().forEach((t) => t.stop());
+          const rate = ctx.sampleRate; ctx.close();
+          this.stopRecorder = null;
+          if (cancel || !spoke) { resolve({ text: "", error: spoke ? "" : "no-speech" }); return; }
+          setOrb("thinking", "Transcribing…");
+          try {
+            const r = await api("/api/stt", { method: "POST", body: { audio: b64(wav16k(chunks, rate)), mime: "audio/wav", language: code } });
+            resolve({ text: (r.text || "").trim(), error: "" });
+          } catch (e) { resolve({ text: "", error: e.message }); }
+        };
+        this.stopRecorder = () => finish(false);
+        proc.onaudioprocess = (e) => {
+          const data = e.inputBuffer.getChannelData(0);
+          chunks.push(new Float32Array(data));
+          let sum = 0; for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+          const rms = Math.sqrt(sum / data.length), dt = data.length / ctx.sampleRate;
+          total += dt;
+          if (rms > 0.025) { spoke = true; silent = 0; } else if (spoke) silent += dt;
+          $("#orb").style.setProperty("--level", Math.min(1, rms * 12).toFixed(2));
+          if ((spoke && silent > 1.3) || total > 15 || (!spoke && total > 8)) finish();
+        };
+        src.connect(proc); proc.connect(ctx.destination);
+      });
+    },
+    stopListening() {
+      if (this.rec) { try { this.rec.stop(); } catch { /* already stopped */ } }
+      if (this.stopRecorder) this.stopRecorder();
+    },
+
+    voiceFor(code) {
+      const voices = window.speechSynthesis?.getVoices() || [];
+      const tag = this.tag(code).toLowerCase(), base = tag.split("-")[0];
+      return voices.find((v) => v.lang.replace("_", "-").toLowerCase() === tag)
+        || voices.find((v) => v.lang.toLowerCase().startsWith(base === "od" ? "or" : base))
+        || null;
+    },
+    // Speak a line in its language: the browser's voice if it has one, else a Gemini voice, else stay silent
+    async say(text, code = "en") {
+      this.stopSpeaking();
+      const line = String(text || "").replace(/\*\*/g, "").replace(/\s*\(Say yes[^)]*\)/, "").trim();
+      if (!S.voiceOn || !line || !S.interacted) return;
+      const voice = this.voiceFor(code);
+      setOrb("speaking");
+      if (voice) {
+        await new Promise((resolve) => {
+          const u = new SpeechSynthesisUtterance(line);
+          u.voice = voice; u.lang = voice.lang; u.rate = 1.02;
+          const safety = setTimeout(resolve, 2500 + line.length * 110);
+          u.onend = u.onerror = () => { clearTimeout(safety); resolve(); };
+          this.utter = u; this.speakDone = resolve;
+          window.speechSynthesis.speak(u);
+        });
+      } else if (S.config?.gemini_enabled) {
+        try {
+          const r = await fetch("/api/tts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: line }) });
+          if (r.ok) {
+            const url = URL.createObjectURL(await r.blob());
+            await new Promise((resolve) => {
+              const a = new Audio(url);
+              this.audio = a; this.speakDone = resolve;
+              a.onended = a.onerror = () => resolve();
+              a.play().catch(resolve);
+            });
+            URL.revokeObjectURL(url);
+          }
+        } catch { /* no voice: the text is on screen */ }
+      }
+      this.audio = null; this.utter = null; this.speakDone = null;
+      if ($("#orb").dataset.state === "speaking") setOrb("idle");
+    },
+    stopSpeaking() {
+      try { window.speechSynthesis?.cancel(); } catch { /* none */ }
+      if (this.audio) { this.audio.pause(); this.audio = null; }
+      if (this.speakDone) { const d = this.speakDone; this.speakDone = null; d(); }
+    },
+  };
+
+  function wav16k(chunks, rate) {
+    const len = chunks.reduce((a, c) => a + c.length, 0);
+    const all = new Float32Array(len); let off = 0;
+    for (const c of chunks) { all.set(c, off); off += c.length; }
+    const ratio = rate / 16000, n = Math.floor(len / ratio);
+    const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+    const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    str(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); str(8, "WAVE"); str(12, "fmt "); v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, 16000, true); v.setUint32(28, 32000, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true); str(36, "data"); v.setUint32(40, n * 2, true);
+    for (let i = 0; i < n; i++) {
+      const s = Math.max(-1, Math.min(1, all[Math.floor(i * ratio)]));
+      v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return buf;
+  }
+  function b64(buf) {
+    const bytes = new Uint8Array(buf); let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(bin);
   }
 
-  function setupChatMic() {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const btn = $("#chatMic");
-    if (!SR) { btn.disabled = true; btn.title = "Speech input not supported in this browser"; return; }
-    let rec = null;
-    btn.addEventListener("click", () => {
-      if (rec) { rec.stop(); return; }
-      rec = new SR();
-      rec.lang = $("#chatMicLang").value;
-      rec.interimResults = true;
-      rec.onresult = (ev) => { $("#chatInput").value = [...ev.results].map((r) => r[0].transcript).join(" "); };
-      rec.onend = () => { btn.classList.remove("rec"); rec = null; if ($("#chatInput").value.trim()) sendChat(); };
-      rec.onerror = () => { btn.classList.remove("rec"); rec = null; };
-      btn.classList.add("rec");
-      rec.start();
-    });
+  // ================================================================ the stage
+  function setOrb(state, hint) {
+    const orb = $("#orb");
+    orb.dataset.state = state;
+    orb.setAttribute("aria-label", state === "listening" ? "Stop listening" : state === "speaking" ? "Stop and talk" : "Tap to talk");
+    const hints = { idle: Voice.canListen() ? "Tap and speak" : "Type below", listening: "Listening… tap when done", thinking: "Thinking…", speaking: "Tap to interrupt" };
+    $("#orbHint").textContent = hint ?? hints[state] ?? "";
   }
-
-  function setMode(mode) {
-    S.mode = mode;
-    store.set("mode", mode);
-    $$("#modeSeg button").forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
-    $("#hybridFields").hidden = mode !== "hybrid";
-    $("#liveFields").hidden = mode !== "live";
-    const c = S.config || {};
-    const sync = c.bolna_sync || {};
-    const why = sync.state && sync.state !== "ok" ? ` (Bolna setup: ${sync.state} — ${sync.detail || ""})` : "";
-    const hints = {
-      simulation: "3 AI-simulated vendors negotiate against each other through the same shared-memory engine. No phone, no cost.",
-      hybrid: c.bolna_ready ? "Your phone rings as Vendor A via Bolna + Sarvam. Vendors B & C are simulated; their quotes are used against you live." : "⚠ Hybrid needs BOLNA_API_KEY + a synced agent (⚙︎ Setup)." + why,
-      live: c.bolna_ready ? "Dials 3 real numbers via Bolna in staggered waves (t=0, +8s, +16s)." : "⚠ Live needs BOLNA_API_KEY + a synced agent (⚙︎ Setup)." + why,
-    };
-    $("#modeHint").textContent = hints[mode];
-    if (S.providers.length) updateCallHint();
-    $("#launchBtn").textContent = mode === "simulation" ? "🚀 Launch swarm · 3 simulated calls" : mode === "hybrid" ? "📞 Launch · ring my phone + 2 AI vendors" : "📞 Launch · 3 real calls";
+  function dock(on) {
+    $("#stage").classList.toggle("compact", on);
+    document.body.classList.toggle("docked", on);
   }
-
-  async function launch() {
-    const btn = $("#launchBtn");
-    btn.disabled = true;
-    const target = parseInt($("#target").value, 10);
-    const ceiling = parseInt($("#ceiling").value, 10);
-    if (!(target > 0) || !(ceiling >= target)) {
-      alert("Set a target and a walk-away ceiling (ceiling ≥ target).");
-      btn.disabled = false;
-      return;
-    }
-    const body = {
-      preset: S.preset || undefined,
-      mode: S.mode,
-      request: { ...(S.request || {}), target_price: target, walkaway_ceiling: ceiling, summary: $("#summary").value || undefined },
-    };
-    delete body.request.parsed_by;
-    if (S.mode === "hybrid") {
-      body.live_phone = $("#livePhone").value;
-      body.live_language = $("#liveLang").value;
-      store.set("livePhone", body.live_phone);
-    }
-    if (S.mode === "live") {
-      body.vendor_phones = $$("#liveFields .lp").map((i) => i.value.trim()).filter(Boolean);
-      body.vendor_names = $$("#liveFields .ln").map((i) => i.value.trim());
-      body.vendor_languages = $$("#liveFields .ll").map((i) => i.value);
-    }
-    try {
-      const session = await api("/api/session", { method: "POST", body });
-      startWarRoom(session);
-    } catch (e) {
-      alert("Could not start: " + e.message);
-    } finally {
-      btn.disabled = false;
-    }
-  }
-
-  // ------------------------------------------------------------------ 1. chat intake
-  function addMsg(role, text) {
-    const el = document.createElement("div");
-    el.className = `msg ${role}`;
-    el.innerHTML = md(text);
-    $("#chatLog").appendChild(el);
-    $("#chatLog").scrollTop = $("#chatLog").scrollHeight;
-    return el;
-  }
-  async function sendChat(raw) {
-    const text = (raw ?? $("#chatInput").value).trim();
-    if (/^find providers$/i.test(text)) { await findProviders(); return; }
-    if (/use my (current |live )?location/i.test(text)) { $("#chatInput").value = ""; await useLocation(); return; }
-    if (text) addMsg("user", text);
-    $("#chatInput").value = "";
-    const typing = addMsg("bot typing", "…");
-    try {
-      const r = await api("/api/chat", { method: "POST", body: { conversation_id: S.chat.id, message: text, lat: S.geo?.lat, lng: S.geo?.lng } });
-      Object.assign(S.chat, { id: r.conversation_id, task: r.task, ready: r.ready });
-      typing.remove();
-      addMsg("bot", r.reply);
-      renderChips(r.suggestions || []);
-      renderTaskCard();
-      if (!S.geo && !S.geoDenied && NEAR_ME.test(r.task?.location || "")) await useLocation();
-    } catch (e) {
-      typing.remove();
-      addMsg("bot", "Sorry, something went wrong: " + e.message);
-    }
+  function showBot(text) { $("#botLine").innerHTML = esc(text).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>"); }
+  function showUser(text, interim = false) {
+    const el = $("#userLine");
+    el.textContent = text ? (interim ? text : `“${text}”`) : "";
+    el.classList.toggle("interim", interim);
   }
   function renderChips(list) {
-    $("#chatChips").innerHTML = list.map((t) => `<button class="chip" type="button">${esc(t)}</button>`).join("");
-    $$("#chatChips .chip").forEach((b) => b.addEventListener("click", () => sendChat(b.textContent)));
+    $("#chips").innerHTML = (list || []).map((t) => `<button class="chip" type="button">${esc(t)}</button>`).join("");
+    $$("#chips .chip").forEach((b) => b.addEventListener("click", () => { S.interacted = true; onUtterance(b.textContent); }));
   }
-  function renderTaskCard() {
-    const t = S.chat.task || {};
-    $("#taskCard").hidden = !t.service_key;
+
+  async function listen() {
+    if (!Voice.canListen()) { toast("Voice input isn't available in this browser — please type."); $("#typeInput").focus(); return; }
+    S.interacted = true;
+    Voice.stopSpeaking();
+    setOrb("listening");
+    showUser("");
+    const { text, error } = await Voice.listen(S.userLang);
+    if (error === "not-allowed" || error === "service-not-allowed") {
+      setOrb("idle"); toast("Microphone is blocked. Allow it in the browser, or type instead."); return;
+    }
+    if (!text) { setOrb("idle", "Didn't catch that — tap and try again"); return; }
+    await onUtterance(text);
+  }
+
+  async function onUtterance(text) {
+    text = String(text || "").trim();
+    if (!text) return;
+    if (/^(📍\s*)?use my (current |live )?location$/i.test(text)) { showUser(text); await useLocation(); return; }
+    if (S.phase === "calling" || S.phase === "done") { showUser(text); await onCallCommand(text); return; }
+    if (S.phase === "shortlist") { showUser(text); onShortlistCommand(text); return; }
+    await sendChat(text);
+  }
+
+  // ================================================================ 1. the conversation
+  async function sendChat(text, extra = {}) {
+    if (text) showUser(text);
+    setOrb("thinking");
+    let r;
+    try {
+      r = await api("/api/chat", { method: "POST", body: {
+        conversation_id: S.conv.id, message: text || "", lat: S.geo?.lat, lng: S.geo?.lng,
+        user_lang: S.userLang, ...extra } });
+    } catch (e) {
+      setOrb("idle"); showBot("Sorry, I couldn't reach the server: " + e.message); return;
+    }
+    S.conv = { id: r.conversation_id, task: r.task || {}, ready: r.ready, trace: r.trace || [] };
+    if (r.call_language) {
+      S.callLang = r.call_language.code; S.callLangReason = r.call_language.reason || ""; S.callLangLocked = !!r.call_language.locked;
+    }
+    renderLangPill(); renderTask(); renderLog();
+    showBot(r.reply);
+    renderChips(r.suggestions);
+    if (r.action === "go") {
+      await Voice.say(r.reply, r.reply_language);
+      await startSearch();
+      return;
+    }
+    if (!S.geo && !S.geoDenied && /^\W*(near(by| me)?|around me|here|my (current |live )?location)\W*$/i.test(S.conv.task.location || "")) {
+      await useLocation();
+      return;
+    }
+    await Voice.say(r.reply, r.reply_language);
+    if (S.handsFree && S.interacted && S.phase === "intake" && !S.typing && Voice.canListen()) { await sleep(150); listen(); }
+    else setOrb("idle");
+  }
+
+  function renderTask() {
+    const t = S.conv.task || {};
+    $("#task").hidden = !t.service_key;
     if (!t.service_key) return;
+    const appt = t.goal === "appointment";
+    const where = t.pickup && t.drop ? `${t.pickup} → ${t.drop}` : t.location;
+    const bits = [
+      t.service_label, where, t.when, t.details,
+      appt ? "appointment" : (t.walkaway_ceiling ? `${inr(t.target_price)}–${inr(t.walkaway_ceiling)}` : ""),
+      S.langs[S.callLang] ? `calls in ${S.langs[S.callLang].native}` : "",
+    ].filter(Boolean);
+    $("#taskLine").innerHTML = bits.map((b) => `<span class="t">${esc(b)}</span>`).join("") + `<span class="edit">Edit</span>`;
     $("#tService").value = t.service_label || "";
     $("#tLocation").value = t.pickup && t.drop ? `${t.pickup} → ${t.drop}` : (t.location || "");
     $("#tWhen").value = t.when || "";
     $("#tDetails").value = t.details || "";
     $("#tTarget").value = t.target_price || "";
     $("#tCeiling").value = t.walkaway_ceiling || "";
-    const appt = t.goal === "appointment";
-    $$(".budget-field").forEach((el) => { el.hidden = appt; });
-    $("#tGoal").textContent = appt ? "Appointment: I'll book a slot and get the fee. No haggling with clinics."
-      : "Negotiation: your target and max are never told to the AI agent. It can't be talked above them.";
-    $("#findBtn").disabled = !S.chat.ready;
+    $$(".budget").forEach((el) => { el.hidden = appt; });
+    $("#tGoal").textContent = appt ? "Appointment: I book a slot and get the fee. No haggling with clinics."
+      : "Your target and max are never told to the calling agent, so it can't be talked above them.";
   }
-  function readTaskCard() {
-    const t = S.chat.task;
+  function readTask() {
+    const t = S.conv.task;
     t.service_label = $("#tService").value.trim() || t.service_label;
     const loc = $("#tLocation").value.trim();
-    if (loc.includes("→")) { [t.pickup, t.drop] = loc.split("→").map((x) => x.trim()); t.location = t.pickup; } else if (loc) { t.location = loc; }
+    if (loc.includes("→")) { [t.pickup, t.drop] = loc.split("→").map((x) => x.trim()); t.location = t.pickup; } else if (loc) t.location = loc;
     t.when = $("#tWhen").value.trim() || t.when;
     t.details = $("#tDetails").value.trim();
     if (t.goal !== "appointment") {
@@ -225,458 +295,520 @@
       if (max > 0) t.walkaway_ceiling = Math.max(max, t.target_price || 0);
     }
   }
-  const NEAR_ME = /^\W*(near(by| me| you)?|around me|here|(my|your) (current |live )?location|current location)\W*$/i;
-  // Live GPS position from the browser (asks permission once). Resolves to null if denied/unavailable.
+
+  // ---------------------------------------------------------------- location
   function getGeo() {
     if (S.geo) return Promise.resolve(S.geo);
     if (!navigator.geolocation || S.geoDenied) return Promise.resolve(null);
     return new Promise((resolve) => navigator.geolocation.getCurrentPosition((p) => {
-      S.geo = { lat: p.coords.latitude, lng: p.coords.longitude };
-      $("#geoBtn").classList.add("active");
-      resolve(S.geo);
+      S.geo = { lat: p.coords.latitude, lng: p.coords.longitude }; resolve(S.geo);
     }, () => { S.geoDenied = true; resolve(null); }, { timeout: 10000, maximumAge: 120000, enableHighAccuracy: true }));
   }
   async function useLocation() {
-    if (!navigator.geolocation) { addMsg("bot", "Location isn't available in this browser."); return; }
     S.geoDenied = false;
-    if (!(await getGeo())) { addMsg("bot", "Couldn't get your location. Just tell me the area instead."); return; }
-    addMsg("bot", "📍 Got your live location. I'll search near you.");
-    if (S.chat.id) {
-      if (S.chat.task && NEAR_ME.test(S.chat.task.location || "")) S.chat.task.location = "";
-      await sendChat("");  // the server names your area from the GPS position
+    setOrb("thinking", "Finding where you are…");
+    if (!(await getGeo())) { setOrb("idle"); showBot("I couldn't get your location. Just tell me the area."); await Voice.say("I couldn't get your location. Just tell me the area.", "en"); return; }
+    if (S.conv.task && /near|location|here/i.test(S.conv.task.location || "")) S.conv.task.location = "";
+    await sendChat("");   // the server names the area from your position and picks its language
+  }
+
+  // ---------------------------------------------------------------- call language
+  function renderLangPill() {
+    const l = S.langs[S.callLang];
+    $("#langPillText").textContent = l ? l.native : S.callLang;
+    $("#langPill").title = `Calls in ${l?.name || S.callLang}${S.callLangReason ? " — " + S.callLangReason : ""}`;
+  }
+  function openLangSheet() {
+    $("#langReason").textContent = S.callLangReason ? `Now: ${S.langs[S.callLang]?.name} — ${S.callLangReason}.` : "";
+    $("#langGrid").innerHTML = Object.values(S.langs).map((l) =>
+      `<button type="button" class="lang ${l.code === S.callLang ? "on" : ""}" data-code="${esc(l.code)}"><b>${esc(l.native)}</b><span>${esc(l.name)}</span></button>`).join("");
+    $$("#langGrid .lang").forEach((b) => b.addEventListener("click", () => pickCallLanguage(b.dataset.code)));
+    $("#langSheet").showModal();
+  }
+  async function pickCallLanguage(code) {
+    $("#langSheet").close();
+    S.callLang = code; S.callLangLocked = true; S.callLangReason = `you chose ${S.langs[code]?.name}`;
+    renderLangPill(); renderTask();
+    toast(`Calls will be in ${S.langs[code]?.native} · ${S.langs[code]?.name}`);
+    if (S.conv.id && S.phase === "intake") {
+      try {
+        const r = await api("/api/chat", { method: "POST", body: { conversation_id: S.conv.id, message: "", call_language: code, user_lang: S.userLang } });
+        S.conv.task = r.task || S.conv.task; S.conv.trace = r.trace || S.conv.trace; renderTask(); renderLog();
+      } catch { /* applied when the calls start */ }
     }
   }
 
-  // ------------------------------------------------------------------ 2. providers
-  async function findProviders() {
-    if (!S.chat.ready) { addMsg("bot", "I still need a couple of details first."); return; }
-    readTaskCard();
-    const btn = $("#findBtn");
-    btn.disabled = true; btn.textContent = "Searching maps…";
+  // ================================================================ 2. who to call
+  async function startSearch() {
+    readTask();
+    S.phase = "shortlist";
+    dock(true);
+    const t = S.conv.task;
+    const say = narr("searching", { service: t.service_label || "providers", place: (t.location || "you").split(",")[0] });
+    showBot(say); setOrb("thinking", "Searching the map…");
+    let r;
     try {
-      await getGeo();  // live location: results ranked by distance from where you are
-      const r = await api("/api/providers/search", { method: "POST", body: { task: S.chat.task, lat: S.geo?.lat, lng: S.geo?.lng } });
-      S.providers = r.providers || [];
-      S.provInfo = r;
-      S.provSel = new Set(S.providers.slice(0, 3).map((p) => p.id));
-      renderProviders();
-      $("#providersPanel").hidden = false;
-      $("#providersPanel").scrollIntoView({ behavior: "smooth", block: "start" });
-      if (!S.providers.length) addMsg("bot", "I couldn't find providers for that. Try a broader area or different words.");
-    } catch (e) {
-      alert("Search failed: " + e.message);
-    } finally {
-      btn.disabled = false; btn.textContent = "🔎 Find the best-rated providers nearby";
+      await getGeo();
+      r = await api("/api/providers/search", { method: "POST", body: { task: t, lat: S.geo?.lat, lng: S.geo?.lng } });
+    } catch (e) { setOrb("idle"); S.phase = "intake"; dock(false); showBot("Search failed: " + e.message); return; }
+    S.providers = r.providers || []; S.provInfo = r;
+    if (!S.providers.length) {
+      S.phase = "intake"; dock(false); setOrb("idle");
+      const line = narr("none", {}); showBot(line); await Voice.say(line, narrLang()); return;
     }
+    const k = Math.min(S.config.auto_call_count || 3, S.providers.length);
+    S.sel = new Set(S.providers.slice(0, k).map((p) => p.id));
+    renderShortlist();
+    $("#shortlist").hidden = false;
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    const line = narr("found", { n: S.providers.length, k, lang: langName(S.callLang) });
+    showBot(line);
+    setOrb("idle", "Say “wait” to choose yourself");
+    startCountdown(5);
+    await Voice.say(line, narrLang());
   }
-  function renderProviders() {
-    const r = S.provInfo || {};
-    const t = S.chat.task || {};
-    $("#provTitle").textContent = `2 · Best-rated ${t.service_label || "providers"} near ${(t.location || "you").split(",")[0]}`;
-    $("#provSource").textContent = r.source ? `source: ${r.providers?.[0]?.source || r.source}` : "";
-    const banner = $("#testBanner");
-    banner.hidden = !r.test_mode;
-    banner.textContent = `🧪 Test mode: every call rings ${r.test_phone || "your test phone"}, not the business. Set CALL_REAL_NUMBERS=true to call real numbers.`;
-    $("#provList").innerHTML = S.providers.map((p, i) => {
-      const meta = [
-        p.rating != null ? `<span class="stars">★ ${p.rating.toFixed(1)}</span> (${Number(p.reviews || 0).toLocaleString("en-IN")})` : "no ratings",
-        p.distance_km != null ? `${p.distance_km} km` : "",
-        p.open_now === true ? "open now" : p.open_now === false ? "closed now" : "",
-      ].filter(Boolean).join(" · ");
-      const phone = p.phone ? `<a href="tel:${esc(p.phone)}">${esc(p.phone_local || p.phone)}</a>` : "no listed number";
-      const links = [
-        p.website ? `<a href="${esc(p.website)}" target="_blank" rel="noopener">🌐 website</a>` : "",
-        p.maps_uri ? `<a href="${esc(p.maps_uri)}" target="_blank" rel="noopener">🗺️ map</a>` : "",
-      ].filter(Boolean).join(" · ");
-      const hours = (p.hours || []).length
-        ? `<details class="pmeta phours"><summary>🕒 Opening hours</summary>${p.hours.map((h) => esc(h)).join("<br>")}</details>` : "";
-      return `<label class="prov ${S.provSel.has(p.id) ? "sel" : ""}" data-id="${esc(p.id)}">
-        <input type="checkbox" ${S.provSel.has(p.id) ? "checked" : ""}>
-        <div><div class="pname">${esc(p.name)}</div><div class="pmeta">${p.category ? `${esc(p.category)} · ` : ""}${meta}</div>
-          <div class="pmeta">📍 ${esc(p.address || "")}</div>
-          <div class="pmeta">📞 ${phone}${links ? ` · ${links}` : ""}</div>
-          ${p.test_number ? `<div class="pmeta">↪ our call rings <b>${esc(p.dial_phone)}</b>, not the business</div>` : ""}
-          ${hours}</div>
-        <div class="rank">#${i + 1}</div></label>`;
+  function renderShortlist() {
+    const r = S.provInfo || {}, t = S.conv.task || {};
+    $("#slTitle").textContent = `Best-rated ${t.service_label || "providers"} near ${(t.location || "you").split(",")[0]}`;
+    $("#slSource").textContent = r.providers?.[0]?.source ? r.providers[0].source.replace(/ \(.*\)$/, "") : "";
+    const test = r.test_mode && S.mode !== "simulation";
+    $("#testNote").hidden = !test;
+    $("#testNote").textContent = `Test mode: every call rings ${r.test_phone || "your test phone"}, not the business. Set CALL_REAL_NUMBERS=true for real calls.`;
+    $("#slList").innerHTML = S.providers.map((p, i) => {
+      const meta = [p.rating != null ? `<span class="stars">★ ${p.rating.toFixed(1)}</span> (${Number(p.reviews || 0).toLocaleString("en-IN")})` : "no ratings",
+        p.distance_km != null ? `${p.distance_km} km` : "", p.open_now === true ? "open now" : p.open_now === false ? "closed now" : ""].filter(Boolean).join(" · ");
+      const links = [p.phone ? `<a href="tel:${esc(p.phone)}">${esc(p.phone_local || p.phone)}</a>` : "",
+        p.maps_uri ? `<a href="${esc(p.maps_uri)}" target="_blank" rel="noopener">map</a>` : "",
+        p.website ? `<a href="${esc(p.website)}" target="_blank" rel="noopener">website</a>` : ""].filter(Boolean).join(" · ");
+      return `<li><label class="prov ${S.sel.has(p.id) ? "sel" : ""}" data-id="${esc(p.id)}">
+        <input type="checkbox" ${S.sel.has(p.id) ? "checked" : ""} aria-label="Call ${esc(p.name)}">
+        <div><b>${esc(p.name)}</b><div class="meta">${meta}</div>${p.address ? `<div class="meta">${esc(p.address)}</div>` : ""}${links ? `<div class="meta">${links}</div>` : ""}</div>
+        <span class="rank">#${i + 1}</span></label></li>`;
     }).join("");
-    $$("#provList .prov").forEach((row) => {
-      $("input", row).addEventListener("change", (ev) => {
-        const id = row.dataset.id;
-        if (ev.target.checked) {
-          if (S.provSel.size >= 5) { ev.target.checked = false; alert("Up to 5 providers at a time."); return; }
-          S.provSel.add(id);
-        } else S.provSel.delete(id);
-        row.classList.toggle("sel", ev.target.checked);
-        updateCallHint();
-      });
-    });
-    updateCallHint();
+    $$("#slList .prov").forEach((row) => $("input", row).addEventListener("change", (ev) => {
+      stopCountdown();
+      const id = row.dataset.id;
+      if (ev.target.checked) {
+        if (S.sel.size >= 5) { ev.target.checked = false; toast("Up to 5 at a time."); return; }
+        S.sel.add(id);
+      } else S.sel.delete(id);
+      row.classList.toggle("sel", ev.target.checked);
+      updateCallBtn();
+    }));
+    updateCallBtn();
   }
-  function updateCallHint() {
-    const n = S.provSel.size;
-    const test = S.provInfo?.test_phone || "your test phone";
-    $("#callBtn").textContent = S.mode === "simulation" ? `🤖 Simulate ${n} call${n === 1 ? "" : "s"}` : `📞 Call ${n} selected`;
-    $("#callBtn").disabled = n === 0;
-    $("#callHint").textContent = {
-      simulation: "Sim mode: the selected providers are played by AI. No phone calls, no cost.",
-      hybrid: `Hybrid: #1 rings ${test} for real (you play the provider); the others are simulated and their quotes are used on the call.`,
-      live: `Live: every selected provider is called${S.provInfo?.test_mode ? ` on ${test}, one after another` : ""}. After you confirm, the winner gets a confirmation call.`,
-    }[S.mode];
+  function updateCallBtn() {
+    const n = S.sel.size;
+    $("#callBtn").disabled = !n;
+    $("#callBtn").textContent = S.mode === "simulation" ? `Simulate ${n} call${n === 1 ? "" : "s"}` : `Call ${n} now`;
   }
-  async function callProviders() {
-    readTaskCard();
-    const chosen = S.providers.filter((p) => S.provSel.has(p.id));
+  function startCountdown(seconds) {
+    stopCountdown();
+    let left = seconds;
+    const tick = () => {
+      $("#countdown").textContent = `Calling in ${left}… tap any provider to choose yourself`;
+      if (left-- <= 0) { stopCountdown(); callSelected(); }
+    };
+    tick();
+    S.countdown = setInterval(tick, 1000);
+  }
+  function stopCountdown() { clearInterval(S.countdown); S.countdown = null; $("#countdown").textContent = ""; }
+  function onShortlistCommand(text) {
+    if (isNo(text) || /\b(wait|ruko|hold|choose|pick)\b/i.test(text)) { stopCountdown(); showBot("Okay — tick who to call, then tap Call."); setOrb("idle"); return; }
+    if (isYes(text)) { stopCountdown(); callSelected(); return; }
+    setOrb("idle");
+  }
+  async function callSelected() {
+    stopCountdown();
+    const chosen = S.providers.filter((p) => S.sel.has(p.id));
     if (!chosen.length) return;
-    const btn = $("#callBtn");
-    btn.disabled = true;
+    readTask();
+    $("#callBtn").disabled = true;
     try {
-      const session = await api("/api/session", { method: "POST", body: { task: S.chat.task, providers: chosen, mode: S.mode, language: $("#callLang").value } });
-      startWarRoom(session);
+      const session = await api("/api/session", { method: "POST", body: { task: S.conv.task, providers: chosen, mode: S.mode, language: S.callLang } });
+      startCalls(session);
     } catch (e) {
-      alert("Could not start calls: " + e.message);
-    } finally {
-      btn.disabled = false;
+      toast("Couldn't start the calls: " + e.message, 6000);
+      $("#callBtn").disabled = false;
     }
   }
 
-  // ------------------------------------------------------------------ war room
-  function startWarRoom(session) {
-    S.session = session;
-    S.seenTicks = new Set();
-    $("#tickerTrack").innerHTML = '<span class="muted">Waiting for the first quote…</span>';
-    $("#briefPanel").hidden = true;
-    $("#chatPanel").hidden = true;
-    $("#providersPanel").hidden = true;
-    $("#warRoom").hidden = false;
-    $("#ticker").hidden = false;
+  // ================================================================ 3. the calls
+  function startCalls(session) {
+    S.phase = "calling"; S.session = session; S.prev = {}; S.narrated = new Set(); S.recSpoken = null; S.openLegs = new Set();
+    dock(true);
+    window.scrollTo({ top: 0 });
+    $("#shortlist").hidden = true; $("#task").hidden = true;
+    $("#calls").hidden = false; $("#callList").innerHTML = "";
+    renderChips([]);
     history.replaceState(null, "", "#s=" + session.session_id);
+    const n = session.legs.length;
+    showBot(narr("calling", { n, lang: langName(session.language) }));
+    setOrb("idle", "Say “stop” to end the calls");
     render(session);
     connect(session.session_id);
-    clearInterval(S.tickTimer);
-    S.tickTimer = setInterval(() => {
-      if (!S.session) return;
-      const t = S.lastT + (Date.now() - S.lastTAt) / 1000;
-      if (S.session.status !== "LOCKED" && S.session.status !== "CLOSED") $("#sbTime").textContent = Math.round(t) + "s";
-    }, 500);
   }
-
   function connect(sid) {
     if (S.ws) { S.ws.onclose = null; S.ws.close(); }
     clearInterval(S.poll);
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws/session/${sid}`);
+    const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/session/${sid}`);
     S.ws = ws;
-    const conn = $("#conn");
-    ws.onopen = () => { conn.className = "conn on"; $("span", conn).textContent = "live"; };
-    ws.onmessage = (m) => {
-      if (m.data === "pong") return;
-      try { const msg = JSON.parse(m.data); if (msg.session) { render(msg.session, msg.event); } } catch { /* ignore */ }
-    };
+    ws.onmessage = (m) => { if (m.data === "pong") return; try { const msg = JSON.parse(m.data); if (msg.session) render(msg.session); } catch { /* ignore */ } };
     ws.onclose = () => {
-      conn.className = "conn off"; $("span", conn).textContent = "polling";
       S.poll = setInterval(async () => { try { render(await api(`/api/session/${sid}`)); } catch { /* ignore */ } }, 2000);
       setTimeout(() => { if (S.session?.session_id === sid) connect(sid); }, 4000);
     };
+    ws.onopen = () => clearInterval(S.poll);
     const ping = setInterval(() => { if (ws.readyState === 1) ws.send("ping"); else clearInterval(ping); }, 20000);
   }
 
-  function render(session, event) {
+  function render(session) {
+    if (!session || (S.session && session.session_id !== S.session.session_id)) return;
     S.session = session;
-    S.lastT = session.t; S.lastTAt = Date.now();
-    const r = session.request;
-    const appt = r.goal === "appointment";
-    $("#sbCategory").textContent = `${CATEGORY[r.category] || "🧰 " + (r.service_label || r.category)} · ${session.mode.toUpperCase()} MODE`;
-    $("#sbJob").textContent = r.summary;
-    $("#sbMeta").textContent = appt ? `${r.location || ""} · preferred ${r.when || "any time"} · booking a slot, no haggling`
-      : `${r.when || ""} · target ${inr(r.target_price)} · walk-away ${inr(r.walkaway_ceiling)} (never told to the AI)`;
-    const best = session.current_best_quote;
-    const bestLeg = best ? session.legs.find((l) => l.leg_id === best.leg_id) : null;
-    $("#sbBest").textContent = best ? (appt ? (bestLeg?.slot || "—") : inr(best.price)) : "—";
-    $("#sbBestVendor").textContent = best ? best.vendor_name + (appt && best.price ? ` · fee ${inr(best.price)}` : "") : "";
-    $("#sbBest").previousElementSibling.textContent = appt ? "Best slot" : "Best all-in";
-    if (appt) {
-      const held = session.legs.filter((l) => l.slot).length;
-      $("#sbSaved").textContent = `${held}/${session.legs.length}`;
-      $("#sbSaved").previousElementSibling.textContent = "Slots offered";
-      $("#sbSaved").nextElementSibling.textContent = "providers with a slot";
-    } else {
-      $("#sbSaved").textContent = session.savings_vs_worst_first_quote ? inr(session.savings_vs_worst_first_quote) : "—";
-    }
-    $("#sbVersion").textContent = "state v" + session.state_version;
-    if (session.status === "LOCKED") $("#sbTime").textContent = Math.round(session.t) + "s ✓";
-    const lockable = !session.locked_leg_id && best && (!r.has_budget || best.price <= r.walkaway_ceiling);
-    $("#lockBestBtn").disabled = !lockable;
-    $("#lockBestBtn").textContent = session.locked_leg_id ? (appt ? "Appointment confirmed ✓" : "Deal locked ✓")
-      : (appt ? "Confirm best slot" : "Lock best deal & send UPI token");
-
-    const cards = $("#cards");
+    const r = session.request, appt = r.goal === "appointment";
+    const best = session.current_best_quote, bestLeg = best ? session.legs.find((l) => l.leg_id === best.leg_id) : null;
+    $("#stBestL").textContent = appt ? "Best slot" : "Best so far";
+    $("#stBest").textContent = best ? (appt ? (bestLeg?.slot || "—") : inr(best.price)) : "—";
+    $("#stSavedL").textContent = appt ? "Slots offered" : "Saved";
+    $("#stSaved").textContent = appt ? `${session.legs.filter((l) => l.slot).length}/${session.legs.length}`
+      : (session.savings_vs_worst_first_quote ? inr(session.savings_vs_worst_first_quote) : "—");
+    const list = $("#callList");
     session.legs.forEach((leg) => {
-      let card = $(`#card-${leg.leg_id}`);
-      if (!card) {
-        card = document.createElement("article");
-        card.id = `card-${leg.leg_id}`;
-        card.className = "card";
-        cards.appendChild(card);
-      }
-      renderCard(card, leg, session);
+      let li = $(`#leg-${leg.leg_id}`);
+      if (!li) { li = document.createElement("li"); li.id = `leg-${leg.leg_id}`; list.appendChild(li); }
+      renderLeg(li, leg, session);
     });
-    renderTicker(session, event);
-    if (session.whatsapp && session.locked_leg_id && !$("#lockModal").open && !S.modalShownFor) {
-      S.modalShownFor = session.session_id;
-      showLockModal(session);
-    }
-    if (session.payment?.status === "paid" && $("#lockModal").open) showLockModal(session);
+    renderVerdict(session);
+    renderLog();
+    narrate(session);
+    if (session.whatsapp && session.locked_leg_id && !S.dealShown) { S.dealShown = session.session_id; showDeal(session); }
   }
 
-  function renderCard(card, leg, session) {
-    const r = session.request;
-    const prevScroll = $(".transcript", card);
-    const atBottom = !prevScroll || prevScroll.scrollHeight - prevScroll.scrollTop - prevScroll.clientHeight < 40;
-    const keepTop = prevScroll ? prevScroll.scrollTop : 0;
-    const unit = leg.first_model && leg.first_model !== "flat";
-    const unitLabel = unit ? leg.first_model.replace("per_", "") : "";
-    const hidden = leg.first_hidden || 0;
-    const saved = leg.first_all_in && leg.best_all_in && leg.first_all_in > leg.best_all_in ? leg.first_all_in - leg.best_all_in : 0;
+  const STATUS = { PENDING: "Queued", DIALING: "Ringing", CONNECTED: "On the call", QUOTED: "Quoted", COUNTERED: "Negotiating", HOLD: "Agreed", WON: "Confirmed", RELEASED: "Released", ENDED: "No deal", FAILED: "Failed" };
+  function renderLeg(li, leg, session) {
+    const r = session.request, appt = r.goal === "appointment", pv = leg.provider || {};
+    const lines = (leg.transcript || []).filter((t) => t.role !== "system");
+    const last = lines[lines.length - 1];
+    const meta = [pv.rating != null ? `★ ${Number(pv.rating).toFixed(1)}` : "", pv.distance_km != null ? `${pv.distance_km} km` : "",
+      leg.mode === "live" ? "live call" : "simulated", pv.test_number ? "test phone" : ""].filter(Boolean).join(" · ");
     const flags = [];
-    if (hidden) flags.push(`<span class="flag hidden">⚠ ${inr(hidden)} hidden add-ons caught</span>`);
-    if (unit && leg.first_all_in !== leg.first_stated) flags.push(`<span class="flag unit">${inr(leg.first_stated)}/${unitLabel} → ${inr(leg.first_all_in)} total</span>`);
-    if (saved) flags.push(`<span class="flag save">▼ ${inr(saved)} negotiated</span>`);
-    if (r.has_budget && leg.best_all_in && leg.best_all_in > r.walkaway_ceiling) flags.push(`<span class="flag guard">🛡 above ceiling: blocked</span>`);
-    for (const x of leg.excluded || []) flags.push(`<span class="flag excl" title="Billed separately by the vendor: not in the price, outside your budget">➕ ${esc(x.item)} ${x.amount ? inr(x.amount) : "at actuals"}: not included</span>`);
-    const captured = [
-      ...(leg.extras || []).filter((x) => x.kind !== "excluded").map((x) => `${x.item}: ${x.status === "included" ? "included" : (x.amount ? inr(x.amount) + " " : "") + "extra"}`),
-      ...(leg.details || []),
-    ];
-    const appt = r.goal === "appointment";
-    const pv = leg.provider || {};
-    const pmeta = [pv.rating != null ? `★ ${Number(pv.rating).toFixed(1)} (${Number(pv.reviews || 0).toLocaleString("en-IN")})` : "",
-      pv.distance_km != null ? `${pv.distance_km} km` : "", pv.test_number ? "🧪 test number" : ""].filter(Boolean).join(" · ");
-    card.className = "card" + (leg.status === "WON" ? " won" : "") + (leg.status === "RELEASED" ? " released" : "");
-    const levT = new Set((session.arbitrage_log || []).filter((a) => a.to_leg === leg.leg_id).map((a) => a.t));
-    const seen = Number(card.dataset.seen || 0);
-    card.dataset.seen = String((leg.transcript || []).length);
-    const bubbles = (leg.transcript || []).map((t, i) => {
-      const who = t.role === "agent" ? "🤖 NEGOTIATOR" : t.role === "vendor" ? "🧑 " + leg.vendor_name.toUpperCase() : "";
-      const lev = t.role === "agent" && levT.has(t.t) ? " lev" : "";
-      return `<div class="bubble ${esc(t.role)}${lev}${i >= seen ? " new" : ""}">${who ? `<span class="who">${esc(who)}</span>` : ""}${esc(t.text)}</div>`;
-    }).join("");
-    const canLock = !session.locked_leg_id && leg.status !== "FAILED" && (appt ? !!leg.slot
-      : leg.best_all_in && (!r.has_budget || leg.best_all_in <= r.walkaway_ceiling));
-    const priceBoxes = appt ? `
-        <div class="pbox"><div class="l">Slot</div><div class="v">${esc(leg.slot || "—")}</div></div>
-        <div class="pbox"><div class="l">Fee</div><div class="v">${inr(leg.best_all_in)}</div></div>
-        <div class="pbox now"><div class="l">Rating</div><div class="v">${pv.rating != null ? "★ " + Number(pv.rating).toFixed(1) : "—"}</div></div>` : `
-        <div class="pbox"><div class="l">Said</div><div class="v">${unit ? inr(leg.first_stated) + "/" + unitLabel : inr(leg.first_stated)}</div></div>
-        <div class="pbox"><div class="l">Real all-in</div><div class="v ${saved ? "strike" : ""}">${inr(leg.first_all_in)}</div></div>
-        <div class="pbox now"><div class="l">Now</div><div class="v">${inr(leg.best_all_in)}</div></div>`;
-    const lockLabel = leg.status === "WON" ? "✓ Winner" : appt ? (leg.slot ? `Confirm ${leg.slot}` : "Waiting for a slot") : "Lock " + inr(leg.best_all_in);
-    card.innerHTML = `
-      <div class="card-head">
-        <div>
-          <div class="vname">${esc(leg.vendor_name)}</div>
-          ${pmeta ? `<div class="pmeta-card">${esc(pmeta)}</div>` : ""}
-          <div class="tags"><span class="tag">${esc(LANG[leg.language] || leg.language)}</span>
-            <span class="tag ${leg.mode === "live" ? "live" : ""}">${leg.mode === "live" ? "📞 LIVE" : "AI SIM"}</span>
-            <span class="tag">LEG ${esc(leg.leg_id)}</span>${leg.rounds ? `<span class="tag">ROUND ${leg.rounds}</span>` : ""}</div>
-        </div>
-        <span class="badge st-${esc(leg.status)}">${esc(STATUS_LABEL[leg.status] || leg.status)}</span>
+    if (leg.first_hidden) flags.push(`<span class="flag hidden">${inr(leg.first_hidden)} hidden extras caught</span>`);
+    const saved = leg.first_all_in && leg.best_all_in && leg.first_all_in > leg.best_all_in ? leg.first_all_in - leg.best_all_in : 0;
+    if (saved) flags.push(`<span class="flag save">${inr(saved)} negotiated off</span>`);
+    for (const x of leg.excluded || []) flags.push(`<span class="flag">${esc(x.item)} ${x.amount ? inr(x.amount) : "at actuals"}, paid separately</span>`);
+    const captured = [...(leg.extras || []).filter((x) => x.kind !== "excluded").map((x) => `${x.item}: ${x.status === "included" ? "included" : (x.amount ? inr(x.amount) + " " : "") + "extra"}`), ...(leg.details || [])];
+    const canLock = !session.locked_leg_id && leg.status !== "FAILED" && (appt ? !!leg.slot : leg.best_all_in && (!r.has_budget || leg.best_all_in <= r.walkaway_ceiling));
+    const price = appt ? (leg.slot || (leg.best_all_in ? inr(leg.best_all_in) : "")) : (leg.best_all_in ? inr(leg.best_all_in) : "");
+    const bubble = (t) => `<div class="bubble ${esc(t.role)}">${esc(t.text)}${t.gloss ? `<p class="gloss">${esc(t.gloss)}</p>` : ""}</div>`;
+    const wasOpen = S.openLegs.has(leg.leg_id);
+    li.className = `call st-${leg.status}` + (leg.status === "WON" ? " won" : "") + (leg.status === "RELEASED" ? " released" : "");
+    li.innerHTML = `
+      <div class="call-top">
+        <span class="avatar">${esc((leg.vendor_name || "?").trim()[0])}</span>
+        <div class="who"><b>${esc(leg.vendor_name)}</b><span class="meta">${esc(meta)}</span></div>
+        <div class="price"><b>${esc(price || "")}</b><span class="status">${esc(STATUS[leg.status] || leg.status)}</span></div>
       </div>
-      <div class="prices">${priceBoxes}
-      </div>
-      <div class="flags">${flags.join("")}</div>
-      ${captured.length ? `<ul class="captured" title="Everything the vendor said that matters">${captured.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>` : ""}
-      <div class="transcript">${bubbles || '<div class="bubble system">Waiting to dial…</div>'}</div>
-      ${leg.recording_url ? `<audio controls preload="none" src="${esc(leg.recording_url)}"></audio>` : ""}
-      ${leg.error ? `<div class="err">${esc(leg.error)}</div>` : ""}
-      <div class="card-foot"><button class="btn win" data-lock="${esc(leg.leg_id)}" ${canLock ? "" : "disabled"}>${esc(lockLabel)}</button></div>`;
-    const tr = $(".transcript", card);
-    tr.scrollTop = atBottom ? tr.scrollHeight : keepTop;
-    $("[data-lock]", card).addEventListener("click", () => lockWinner(leg.leg_id));
+      ${last ? `<p class="last"><span class="who-said">${last.role === "agent" ? "Swarm" : "Them"}</span>${esc(last.text)}</p>${last.gloss ? `<p class="gloss">${esc(last.gloss)}</p>` : ""}` : ""}
+      ${flags.length ? `<div class="flags">${flags.join("")}</div>` : ""}
+      ${leg.error ? `<p class="err">${esc(leg.error)}</p>` : ""}
+      <details class="more" ${wasOpen ? "open" : ""}><summary>Full call</summary>
+        <div class="transcript">${(leg.transcript || []).map(bubble).join("") || '<div class="bubble system">Waiting to dial…</div>'}</div>
+        ${captured.length ? `<ul class="captured">${captured.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>` : ""}
+        ${leg.recording_url ? `<audio controls preload="none" src="${esc(leg.recording_url)}"></audio>` : ""}
+        ${canLock ? `<button class="btn" type="button" data-lock="${esc(leg.leg_id)}">Choose ${esc(leg.vendor_name.split(" ")[0])}${price ? " · " + esc(price) : ""}</button>` : ""}
+      </details>`;
+    $("details", li).addEventListener("toggle", (e) => { if (e.target.open) S.openLegs.add(leg.leg_id); else S.openLegs.delete(leg.leg_id); });
+    $("[data-lock]", li)?.addEventListener("click", () => lockWinner(leg.leg_id));
+    if (wasOpen) { const tr = $(".transcript", li); tr.scrollTop = tr.scrollHeight; }
   }
 
-  function renderTicker(session, event) {
-    const log = session.arbitrage_log || [];
-    const track = $("#tickerTrack");
-    if (!log.length) return;
-    const names = Object.fromEntries(session.legs.map((l) => [l.leg_id, l.vendor_name]));
-    let fresh = null;
-    const html = log.slice().reverse().map((a) => {
-      const key = `${a.state_version}-${a.to_leg}`;
-      const isNew = !S.seenTicks.has(key);
-      if (isNew) { S.seenTicks.add(key); fresh = fresh || a; }
-      const what = a.counter ? `counter <b>${inr(a.counter)}</b>` : "asked to beat it";
-      return `<span class="tick ${isNew ? "new" : ""}">t=${Math.round(a.t)}s · ${esc(names[a.from_leg] || a.from_leg)} <b>${inr(a.competitor_price)}</b> → <span class="to">${esc(names[a.to_leg] || a.to_leg)}</span>: ${what}</span>`;
-    }).join("");
-    track.innerHTML = html;
-    if (fresh && event && (event.type === "quote" || event.type === "status_check")) flashLeverage(fresh, names);
+  function renderVerdict(session) {
+    const rec = session.recommendation, v = $("#verdict");
+    if (!rec || !rec.all_done || !rec.leg_id) { v.hidden = true; return; }
+    v.hidden = false;
+    $("#vMain").textContent = rec.summary;
+    $("#vReasons").innerHTML = (rec.reasons || []).map((x) => `<li>${esc(x)}</li>`).join("");
+    $(".verdict-k", v).textContent = rec.confirmed ? "Confirmed" : "Recommended";
+    $("#vConfirm").hidden = !!rec.confirmed; $("#vOther").hidden = !!rec.confirmed;
   }
 
-  function flashLeverage(a, names) {
-    const src = $(`#card-${a.from_leg}`), dst = $(`#card-${a.to_leg}`);
-    src?.classList.add("source"); dst?.classList.add("target");
-    setTimeout(() => { src?.classList.remove("source"); dst?.classList.remove("target"); }, 1800);
-    const f = $("#flash");
-    f.hidden = false;
-    f.innerHTML = `⚡ Leverage injected: ${esc(names[a.from_leg])} ${inr(a.competitor_price)} → ${esc(names[a.to_leg])}${a.counter ? " · counter " + inr(a.counter) : ""}`;
-    f.style.animation = "none"; void f.offsetWidth; f.style.animation = "";
-    clearTimeout(S.flashT);
-    S.flashT = setTimeout(() => { f.hidden = true; }, 1900);
-    if (navigator.vibrate) navigator.vibrate(60);
-  }
+  // ---------------------------------------------------------------- spoken narration of the calls
+  const NARR = {
+    en: {
+      searching: "Looking for the best-rated {service} near {place}…",
+      found: "Found {n}. Calling the top {k} in {lang}.",
+      none: "I couldn't find anyone for that nearby. Try a wider area or other words.",
+      calling: "Calling {n} now, in {lang}. I'll tell you what they say.",
+      quoted: "{name}: {price}, all-in.",
+      hidden: "{name} said {said}, but with hidden extras it's really {price}.",
+      hold: "{name} agreed to {price}.",
+      slot: "{name} can see you {slot}.",
+      walk: "{name} stayed above your max.",
+      failed: "Couldn't reach {name}.",
+      nodeal: "{name} couldn't do it.",
+      recommend: "All done. I recommend {name}: {what}. Shall I confirm?",
+      nobody: "Calls done, but nobody fit your budget. You could raise the max or call more providers.",
+      confirmed: "Confirmed with {name}. Your summary is ready to send on WhatsApp.",
+      pick: "Okay. Tap a provider to choose, or say their name.",
+      unknown: "Say yes to confirm {name}, or tap another one.",
+      stopped: "Stopped the calls.",
+    },
+    hi: {
+      searching: "पास में सबसे अच्छे {service} ढूँढ रहा हूँ…",
+      found: "{n} मिले। सबसे अच्छे {k} को {lang} में फ़ोन कर रहा हूँ।",
+      none: "पास में कोई नहीं मिला। थोड़ा बड़ा इलाका या दूसरे शब्द बताइए।",
+      calling: "{n} लोगों को {lang} में फ़ोन लगा रहा हूँ। जो बोलेंगे, आपको बताता रहूँगा।",
+      quoted: "{name}: सब मिलाकर {price}।",
+      hidden: "{name} ने {said} बोला, पर छुपे ख़र्चे मिलाकर असल में {price} है।",
+      hold: "{name} {price} पर राज़ी हैं।",
+      slot: "{name} के पास {slot} का समय है।",
+      walk: "{name} आपके बजट से ऊपर रहे।",
+      failed: "{name} से बात नहीं हो पाई।",
+      nodeal: "{name} से बात नहीं बनी।",
+      recommend: "सारे फ़ोन हो गए। मेरी सलाह: {name}, {what}। पक्का कर दूँ?",
+      nobody: "फ़ोन हो गए, पर कोई आपके बजट में नहीं आया। बजट बढ़ा सकते हैं या और लोगों को फ़ोन करें।",
+      confirmed: "{name} के साथ पक्का हो गया। व्हाट्सऐप पर भेजने के लिए सारांश तैयार है।",
+      pick: "ठीक है। किसी को चुनने के लिए उस पर टैप कीजिए, या नाम बोलिए।",
+      unknown: "{name} को पक्का करने के लिए 'हाँ' बोलिए, या किसी और पर टैप कीजिए।",
+      stopped: "फ़ोन रोक दिए।",
+    },
+  };
+  const narrLang = () => (S.userLang === "hi" ? "hi" : "en");
+  const langName = (code) => (narrLang() === "hi" ? S.langs[code]?.hi_name : S.langs[code]?.name) || "";
+  const narr = (key, vars) => (NARR[narrLang()][key] || NARR.en[key]).replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? "");
 
-  // ------------------------------------------------------------------ lock + checkout
-  async function lockWinner(legId) {
-    const s = S.session;
-    if (!s) return;
-    const id = legId || s.current_best_quote?.leg_id;
-    if (!id) return;
-    try {
-      const res = await api(`/api/session/${s.session_id}/lock`, { method: "POST", body: { leg_id: id } });
-      S.modalShownFor = s.session_id;
-      render(res.session);
-      showLockModal(res.session);
-    } catch (e) {
-      alert("Guardrail: " + e.message);
-    }
-  }
+  const Narrator = {
+    queue: [], busy: false,
+    push(text, important = false) {
+      showBot(text);
+      if (!important) { this.queue = this.queue.filter((q) => q.important).slice(-1); }
+      this.queue.push({ text, important });
+      this.run();
+    },
+    async run() {
+      if (this.busy) return;
+      this.busy = true;
+      while (this.queue.length) {
+        const { text } = this.queue.shift();
+        if ($("#orb").dataset.state === "listening") break;
+        await Voice.say(text, narrLang());
+      }
+      this.busy = false;
+    },
+  };
 
-  function showLockModal(session) {
-    const leg = session.legs.find((l) => l.leg_id === session.locked_leg_id);
-    const p = session.payment || {};
-    const wa = session.whatsapp || {};
-    const paid = p.status === "paid";
+  function narrate(session) {
     const appt = session.request.goal === "appointment";
-    $("#lmTitle").textContent = appt ? "Appointment confirmed 🎉" : paid ? "Token advance paid ✓" : "Deal locked 🎉";
-    const confirmNote = leg?.mode === "live" ? `<div class="small">📞 Calling ${esc(leg.vendor_name)} back now to confirm it with them.</div>` : "";
-    if (appt) {
-      $("#lmBody").innerHTML = `<div class="deal"><div class="muted small">${esc(session.request.summary)}</div>
-        <div><b>${esc(leg?.vendor_name)}</b></div><div class="big">${esc(leg?.slot || "")}</div>
-        <div class="small">${leg?.best_all_in ? "Fee " + inr(leg.best_all_in) : "Fee to be confirmed"} · other providers released politely</div>${confirmNote}</div>`;
-      $("#lmActions").innerHTML = session.whatsapp?.link ? `<a class="btn win" href="${esc(session.whatsapp.link)}" target="_blank" rel="noopener">Send WhatsApp summary</a>` : "";
-      if (!$("#lockModal").open) $("#lockModal").showModal();
-      return;
+    for (const leg of session.legs) {
+      const prev = S.prev[leg.leg_id] || {};
+      const name = leg.vendor_name.split(",")[0];
+      const once = (key, text, important) => { const k = `${leg.leg_id}:${key}`; if (!S.narrated.has(k)) { S.narrated.add(k); Narrator.push(text, important); } };
+      if (!appt && leg.first_all_in && !prev.first_all_in) {
+        once("quote", leg.first_hidden ? narr("hidden", { name, said: inr(leg.first_stated), price: inr(leg.first_all_in) }) : narr("quoted", { name, price: inr(leg.first_all_in) }));
+      }
+      if (leg.status !== prev.status) {
+        if (leg.status === "HOLD") once("hold", appt ? narr("slot", { name, slot: leg.slot }) : narr("hold", { name, price: inr(leg.best_all_in) }), true);
+        if (leg.status === "FAILED") once("failed", narr("failed", { name }));
+        if (leg.status === "ENDED" && !leg.slot) once("ended", leg.last_action === "WALK_AWAY" ? narr("walk", { name }) : narr("nodeal", { name }));
+      }
+      S.prev[leg.leg_id] = { status: leg.status, first_all_in: leg.first_all_in };
     }
-    const mockUpi = p.provider === "mock" ? `
-      <div class="upi"><div class="qr" aria-hidden="true"></div>
-        <div><b>Razorpay Test Checkout (mock)</b><div style="font-size:12px">Test mode · no real money moves<br>Amount ${inr(p.amount)}${p.error ? `<br><span style="color:#c2413a">${esc(p.error)}</span>` : ""}</div></div></div>` : "";
-    $("#lmBody").innerHTML = `
-      <div class="deal">
-        <div class="muted small">${esc(session.request.summary)}</div>
-        <div><b>${esc(leg?.vendor_name)}</b> · all-inclusive</div>
-        <div class="big">${inr(leg?.best_all_in)}</div>
-        <div class="small">UPI token advance: <b>${inr(p.amount)}</b> · saved <b class="good">${inr(session.savings_vs_worst_first_quote)}</b> vs highest first quote</div>
-        ${(leg?.excluded || []).length ? `<div class="small">Not included, pay separately (outside your budget): <b>${leg.excluded.map((x) => esc(x.item) + (x.amount ? " " + inr(x.amount) : " (at actuals)")).join(", ")}</b></div>` : ""}
-        <div class="small muted">Runner-ups released politely · your number shared with 0 vendors</div>${confirmNote}
-      </div>${mockUpi}`;
-    const actions = [];
-    if (p.provider === "razorpay" && p.url) actions.push(`<a class="btn primary" href="${esc(p.url)}" target="_blank" rel="noopener">Pay ${inr(p.amount)} (Razorpay ${p.test_mode ? "test" : ""})</a>`);
-    if (p.provider === "mock" && !paid) actions.push(`<button type="button" class="btn primary" id="mockPayBtn">Pay ${inr(p.amount)} (test)</button>`);
-    if (wa.link) actions.push(`<a class="btn win" href="${esc(wa.link)}" target="_blank" rel="noopener">${wa.sent ? "WhatsApp sent ✓ · open" : "Send WhatsApp summary"}</a>`);
-    $("#lmActions").innerHTML = actions.join("");
-    $("#mockPayBtn")?.addEventListener("click", async () => {
-      try { render(await api(`/api/session/${session.session_id}/mock_pay`, { method: "POST" })); } catch (e) { alert(e.message); }
-    });
-    const dlg = $("#lockModal");
-    if (!dlg.open) dlg.showModal();
+    const rec = session.recommendation;
+    if (rec?.all_done && S.recSpoken !== session.session_id && !session.locked_leg_id) {
+      S.recSpoken = session.session_id;
+      S.phase = "done";
+      const what = appt ? [rec.slot, rec.price ? `fee ${inr(rec.price)}` : ""].filter(Boolean).join(", ") : `${inr(rec.price)} all-in`;
+      const line = rec.leg_id ? narr("recommend", { name: rec.vendor_name, what }) : narr("nobody", {});
+      S.log.push({ agent: "advisor", text: rec.leg_id ? `recommends ${rec.summary} (${(rec.reasons || []).join("; ")})` : rec.summary });
+      renderLog();
+      Narrator.queue = [];
+      Narrator.push(line, true);
+      (async () => {
+        while (Narrator.busy || Narrator.queue.length) await sleep(150);
+        if (S.handsFree && S.interacted && rec.leg_id && !S.session.locked_leg_id && Voice.canListen()) listen();
+        else setOrb("idle", rec.leg_id ? "Say “yes” to confirm" : "");
+      })();
+    }
   }
 
-  // ------------------------------------------------------------------ admin
-  async function openAdmin() {
+  // ---------------------------------------------------------------- voice commands during calls
+  function matches(text, words) {
+    const t = ` ${String(text).toLowerCase().replace(/[.,!?;:"'()।]/g, " ").replace(/\s+/g, " ").trim()} `;
+    return words.some((w) => t.includes(` ${w} `));
+  }
+  const isNo = (t) => matches(String(t).replace(/no problem/gi, ""), S.commands.no);
+  const isYes = (t) => !isNo(t) && String(t).split(/\s+/).length <= 6 && matches(t, S.commands.yes);
+
+  async function onCallCommand(text) {
+    const s = S.session; if (!s) return;
+    const rec = s.recommendation;
+    if (/\b(stop|end|cancel)( the)? calls?\b|^stop$|^रुको$|^बंद करो$/i.test(text)) {
+      try { await api(`/api/session/${s.session_id}/stop`, { method: "POST" }); } catch { /* already over */ }
+      Narrator.push(narr("stopped", {}), true); return;
+    }
+    if (/\b(new|start over|another request|naya)\b/i.test(text)) { newRequest(); return; }
+    const named = s.legs.find((l) => l.vendor_name && text.toLowerCase().includes(l.vendor_name.split(" ")[0].toLowerCase()) && l.vendor_name.split(" ")[0].length > 2);
+    if (named && !s.locked_leg_id) { await lockWinner(named.leg_id); return; }
+    if (isNo(text)) { Narrator.push(narr("pick", {}), true); return; }
+    if (isYes(text) && rec?.leg_id && !s.locked_leg_id) { await lockWinner(rec.leg_id); return; }
+    if (rec?.leg_id && !s.locked_leg_id) Narrator.push(narr("unknown", { name: rec.vendor_name }), true);
+    else setOrb("idle");
+  }
+
+  // ================================================================ 4. confirm
+  async function lockWinner(legId) {
+    const s = S.session; if (!s) return;
+    try {
+      const res = await api(`/api/session/${s.session_id}/lock`, { method: "POST", body: { leg_id: legId } });
+      S.dealShown = s.session_id;
+      render(res.session);
+      showDeal(res.session);
+      Narrator.queue = [];
+      Narrator.push(narr("confirmed", { name: res.vendor_name }), true);
+    } catch (e) { toast(e.message, 5000); }
+  }
+  function showDeal(session) {
+    const leg = session.legs.find((l) => l.leg_id === session.locked_leg_id);
+    const p = session.payment || {}, wa = session.whatsapp || {}, appt = session.request.goal === "appointment", paid = p.status === "paid";
+    $("#dealTitle").textContent = appt ? "Appointment confirmed" : paid ? "Advance paid" : "Deal confirmed";
+    const callback = leg?.mode === "live" ? `<p class="fine">Calling ${esc(leg.vendor_name)} back now to confirm it with them.</p>` : "";
+    const excluded = (leg?.excluded || []).length ? `<p class="fine">Paid separately: ${leg.excluded.map((x) => esc(x.item) + (x.amount ? " " + inr(x.amount) : " (at actuals)")).join(", ")}</p>` : "";
+    $("#dealBody").innerHTML = `<div class="deal"><span class="fine">${esc(session.request.summary)}</span><b>${esc(leg?.vendor_name)}</b>
+      <span class="big">${appt ? esc(leg?.slot || "") : inr(leg?.best_all_in)}</span>
+      ${appt ? `<span class="fine">${leg?.best_all_in ? "Fee " + inr(leg.best_all_in) : "Fee to be confirmed"}</span>`
+        : `<span class="fine">All-inclusive${session.savings_vs_worst_first_quote ? ` · saved ${inr(session.savings_vs_worst_first_quote)}` : ""}${p.amount ? ` · advance ${inr(p.amount)}` : ""}</span>`}
+      ${excluded}<span class="fine">Others released politely · your number shared with nobody</span>${callback}</div>
+      ${!appt && p.provider === "mock" && !paid ? `<div class="mockpay"><div class="qr" aria-hidden="true"></div><div><b>Test checkout</b><br>No real money moves. Advance ${inr(p.amount)}</div></div>` : ""}`;
+    const actions = [];
+    if (p.provider === "razorpay" && p.url) actions.push(`<a class="btn primary" href="${esc(p.url)}" target="_blank" rel="noopener">Pay ${inr(p.amount)}</a>`);
+    if (!appt && p.provider === "mock" && !paid) actions.push(`<button type="button" class="btn primary" id="mockPayBtn">Pay ${inr(p.amount)} (test)</button>`);
+    if (wa.link) actions.push(`<a class="btn" href="${esc(wa.link)}" target="_blank" rel="noopener">${wa.sent ? "Sent on WhatsApp ✓" : "Send on WhatsApp"}</a>`);
+    $("#dealActions").innerHTML = actions.join("");
+    $("#mockPayBtn")?.addEventListener("click", async () => {
+      try { const s = await api(`/api/session/${session.session_id}/mock_pay`, { method: "POST" }); render(s); showDeal(s); } catch (e) { toast(e.message); }
+    });
+    if (!$("#dealModal").open) $("#dealModal").showModal();
+  }
+
+  // ================================================================ agent log
+  S.log = [];
+  function renderLog() {
+    const items = [...(S.conv.trace || []), ...(S.session?.trace || []), ...S.log];
+    $("#logBox").hidden = !items.length;
+    $("#log").innerHTML = items.slice(-80).map((x) => `<li><span class="agent">${esc(x.agent)}</span><span>${esc(x.text)}</span></li>`).join("");
+  }
+
+  // ================================================================ settings
+  function applyToggles() {
+    document.body.classList.toggle("show-gloss", S.glossOn);
+    $("#voiceOn").checked = S.voiceOn; $("#handsFree").checked = S.handsFree; $("#glossOn").checked = S.glossOn;
+    $$("#modeSeg input").forEach((i) => { i.checked = i.value === S.mode; });
+    const c = S.config || {}, sync = c.bolna_sync || {};
+    $("#modeNote").textContent = S.mode === "simulation" ? "No phone calls, no cost."
+      : c.bolna_api_key_set ? (sync.state && sync.state !== "ok" ? `Bolna setup: ${sync.state} — ${sync.detail || ""}` : "Agents for each language are created on first use.")
+        : "Needs BOLNA_API_KEY on the server (see Bolna setup below).";
+  }
+  async function openSettings() {
     try { S.config = await api("/api/config"); } catch { /* keep old */ }
-    const c = S.config;
+    applyToggles();
+    const c = S.config, g = c.gemini || {};
     const rows = [
       ["Public URL", c.public_base_url || c.detected_base_url + " (auto)"],
-      ["Bolna API key", c.bolna_api_key_set ? "✓ set" : "✗ missing"],
-      ["Bolna agents", Object.keys(c.bolna_agent_ids || {}).length ? JSON.stringify(c.bolna_agent_ids) : "none yet"],
+      ["Bolna API key", c.bolna_api_key_set ? "set" : "missing"],
+      ["Bolna agents", Object.keys(c.bolna_agent_ids || {}).length ? Object.keys(c.bolna_agent_ids).join(", ") : "none yet (created on first call)"],
       ["Telephony", c.bolna_telephony_provider],
-      ["Call LLM", (c.bolna_llm_active || c.bolna_llm_model) + (c.bolna_llm_active && c.bolna_llm_active !== c.bolna_llm_model
-        ? ` (wanted ${c.bolna_llm_model})` : "") + (c.bolna_llm_note ? ` · ${c.bolna_llm_note}` : "")],
-      ["Counter-offers per call", String(c.max_counter_rounds ?? 1)],
-      ["Your test phone", c.live_test_phone_set ? "✓ set" : "enter in Hybrid form"],
-      ["Gemini (brief parsing" + (c.sim_llm_rephrase ? " + sim wording)" : ")"),
-        !c.gemini_enabled ? "off (rules fallback)" : Object.keys(c.gemini?.rate_limited_models || {}).length
-          ? "⚠ free daily quota used up, using rules until it resets" : "✓ " + c.gemini_model],
-      ["Razorpay", c.razorpay_enabled ? "✓ test keys" : "mock checkout"],
-      ["WhatsApp Cloud API", c.whatsapp_api_enabled ? "✓" : "wa.me link"],
-      ["Tool auth secret", c.tool_auth_enabled ? "✓" : "off"],
+      ["Call LLM", (c.bolna_llm_active || c.bolna_llm_model) + (c.bolna_llm_note ? ` · ${c.bolna_llm_note}` : "")],
+      ["Concierge model", c.gemini_enabled ? (g.models?.chat || "rate-limited, using rules") : "off (rules)"],
+      ["Voice fallback (Gemini)", c.gemini_enabled ? `listen: ${g.models?.stt || "—"}, speak: ${g.models?.tts || "—"}` : "off"],
+      ["Test phone", c.live_test_phone_set ? c.test_phone : "not set"],
+      ["Real numbers", c.call_real_numbers ? "ON — calls businesses" : "off (test phone only)"],
       ["Bolna auto-setup", `${c.bolna_sync?.state || "?"}: ${c.bolna_sync?.detail || ""}`],
     ];
     try { rows.unshift(["Deployed version", (await api("/api/health")).commit]); } catch { /* offline */ }
-    $("#cfgList").innerHTML = rows.map(([k, v]) => `<div><span class="muted">${esc(k)}</span><span>${esc(v)}</span></div>`).join("");
+    $("#cfgList").innerHTML = rows.map(([k, v]) => `<div><span class="fine">${esc(k)}</span><span>${esc(v)}</span></div>`).join("");
     $("#adminToken").value = store.get("adminToken", "");
-    $("#adminModal").showModal();
+    $("#settings").showModal();
   }
-  async function adminCall(dry) {
+  async function adminCall(kind) {
     store.set("adminToken", $("#adminToken").value);
-    const out = $("#adminOut");
-    out.hidden = false;
-    out.textContent = dry ? "Building payload…" : "Calling Bolna…";
+    const out = $("#adminOut"); out.hidden = false;
+    const langs = $("#syncLangs").value.split(",").map((s) => s.trim()).filter(Boolean);
     try {
-      const langs = $("#syncLangs").value.split(",").map((s) => s.trim()).filter(Boolean);
-      const res = dry ? await api(`/api/admin/agent_payload?lang=${encodeURIComponent(langs[0] || "hi")}`)
-        : await api("/api/admin/sync_agent", { method: "POST", body: { languages: langs } });
-      out.textContent = (res.env_hint ? `✓ Done. Add this to Railway variables so it survives restarts:\n${res.env_hint}\n\n` : "") + JSON.stringify(res, null, 2);
-      if (!dry) S.config = await api("/api/config");
-      setMode(S.mode);
-    } catch (e) {
-      out.textContent = "✗ " + e.message;
-    }
+      if (kind === "check") { out.textContent = "Checking…"; out.textContent = JSON.stringify(await api("/api/admin/bolna_check"), null, 2); }
+      if (kind === "preview") { out.textContent = "Building…"; out.textContent = JSON.stringify(await api(`/api/admin/agent_payload?lang=${encodeURIComponent(langs[0] || "hi")}`), null, 2); }
+      if (kind === "sync") {
+        out.textContent = "Calling Bolna…";
+        const res = await api("/api/admin/sync_agent", { method: "POST", body: { languages: langs } });
+        out.textContent = (res.env_hint ? `Done. To keep these ids across restarts, add:\n${res.env_hint}\n\n` : "") + JSON.stringify(res, null, 2);
+        S.config = await api("/api/config"); applyToggles();
+      }
+      if (kind === "selftest") { out.textContent = "Replaying every call scenario in all 11 languages…"; out.textContent = await (await fetch("/api/selftest?format=text")).text(); }
+    } catch (e) { out.textContent = "✗ " + e.message; }
   }
 
-  // ------------------------------------------------------------------ boot
+  // ================================================================ reset + boot
+  function newRequest() {
+    if (S.ws) { S.ws.onclose = null; S.ws.close(); }
+    clearInterval(S.poll); stopCountdown(); Voice.stopSpeaking(); Narrator.queue = [];
+    Object.assign(S, { session: null, phase: "intake", providers: [], sel: new Set(), dealShown: null, log: [], conv: { id: null, task: {}, ready: false, trace: [] } });
+    $("#calls").hidden = true; $("#shortlist").hidden = true; $("#task").hidden = true; $("#callList").innerHTML = "";
+    dock(false);
+    history.replaceState(null, "", location.pathname);
+    showUser("");
+    sendChat("");
+  }
+
   async function boot() {
     S.config = await api("/api/config");
-    renderPresets();
-    applyPreset(S.config.default_preset);
-    $("#livePhone").value = store.get("livePhone", "");
-    setMode(S.mode);
-    setupMic();
-    $$("#modeSeg button").forEach((b) => b.addEventListener("click", async () => {
-      setMode(b.dataset.mode);
-      try { S.config = await api("/api/config"); setMode(b.dataset.mode); } catch { /* keep cached config */ }
-    }));
-    $("#parseBtn").addEventListener("click", parseBrief);
-    $("#launchBtn").addEventListener("click", launch);
-    $("#lockBestBtn").addEventListener("click", () => lockWinner());
-    $("#newBtn").addEventListener("click", () => {
-      if (S.ws) { S.ws.onclose = null; S.ws.close(); }
-      clearInterval(S.poll); clearInterval(S.tickTimer);
-      S.session = null; S.modalShownFor = null;
-      $("#cards").innerHTML = "";
-      $("#warRoom").hidden = true; $("#ticker").hidden = true; $("#chatPanel").hidden = false;
-      $("#providersPanel").hidden = !S.providers.length;
-      history.replaceState(null, "", location.pathname);
+    for (const l of S.config.languages || []) S.langs[l.code] = l;
+    S.commands = S.config.voice_commands || S.commands;
+    $("#userLang").innerHTML = Object.values(S.langs).map((l) => `<option value="${esc(l.code)}">${esc(l.native)} · ${esc(l.name)}</option>`).join("");
+    $("#userLang").value = S.langs[S.userLang] ? S.userLang : "en";
+    applyToggles(); renderLangPill(); setOrb("idle");
+    try { window.speechSynthesis?.getVoices(); window.speechSynthesis?.addEventListener?.("voiceschanged", () => {}); } catch { /* none */ }
+
+    $("#orb").addEventListener("click", () => {
+      const st = $("#orb").dataset.state;
+      if (st === "listening") Voice.stopListening();
+      else if (st === "speaking") { Voice.stopSpeaking(); Narrator.queue = []; listen(); }
+      else if (st !== "thinking") listen();
     });
-    $("#adminBtn").addEventListener("click", openAdmin);
-    $("#chatSend").addEventListener("click", () => sendChat());
-    $("#chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
-    $("#findBtn").addEventListener("click", findProviders);
-    $("#callBtn").addEventListener("click", callProviders);
-    $("#geoBtn").addEventListener("click", useLocation);
-    $("#classicBtn").addEventListener("click", () => { $("#briefPanel").hidden = !$("#briefPanel").hidden; });
-    setupChatMic();
-    sendChat("");
-    $("#previewBtn").addEventListener("click", () => adminCall(true));
-    $("#checkBtn").addEventListener("click", async () => {
-      store.set("adminToken", $("#adminToken").value);
-      const out = $("#adminOut");
-      out.hidden = false;
-      out.textContent = "Checking Bolna key…";
-      try { out.textContent = "✓ Bolna key works\n" + JSON.stringify(await api("/api/admin/bolna_check"), null, 2); }
-      catch (e) { out.textContent = "✗ " + e.message; }
+    $("#typeForm").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const text = $("#typeInput").value.trim();
+      if (!text) return;
+      $("#typeInput").value = ""; S.interacted = true; S.typing = true;
+      onUtterance(text).finally(() => { S.typing = false; });
     });
-    $("#syncBtn").addEventListener("click", () => adminCall(false));
-    $("#selftestBtn").addEventListener("click", async () => {
-      const out = $("#adminOut");
-      out.hidden = false;
-      out.textContent = "Replaying every call scenario through the live negotiation code…";
-      try {
-        const r = await fetch("/api/selftest?format=text");
-        out.textContent = await r.text();
-      } catch (e) { out.textContent = "✗ " + e.message; }
+    $("#taskLine").addEventListener("click", () => { const ed = $("#taskEdit"); ed.hidden = !ed.hidden; $("#taskLine").setAttribute("aria-expanded", String(!ed.hidden)); });
+    $("#saveTask").addEventListener("click", () => { readTask(); renderTask(); $("#taskEdit").hidden = true; toast("Updated"); });
+    $("#langPill").addEventListener("click", openLangSheet);
+    $("#menuBtn").addEventListener("click", openSettings);
+    $("#callBtn").addEventListener("click", callSelected);
+    $("#newBtn").addEventListener("click", newRequest);
+    $("#vConfirm").addEventListener("click", () => { const rec = S.session?.recommendation; if (rec?.leg_id) lockWinner(rec.leg_id); });
+    $("#vOther").addEventListener("click", () => { Narrator.push(narr("pick", {}), true); $$(".call details").forEach((d) => { d.open = true; }); });
+    $$("#modeSeg input").forEach((i) => i.addEventListener("change", () => { S.mode = i.value; store.set("mode", S.mode); applyToggles(); updateCallBtn(); }));
+    $("#voiceOn").addEventListener("change", (e) => { S.voiceOn = e.target.checked; store.set("voiceOn", S.voiceOn ? "1" : "0"); if (!S.voiceOn) Voice.stopSpeaking(); });
+    $("#handsFree").addEventListener("change", (e) => { S.handsFree = e.target.checked; store.set("handsFree", S.handsFree ? "1" : "0"); });
+    $("#glossOn").addEventListener("change", (e) => { S.glossOn = e.target.checked; store.set("glossOn", S.glossOn ? "1" : "0"); applyToggles(); });
+    $("#userLang").addEventListener("change", (e) => { S.userLang = e.target.value; store.set("userLang", S.userLang); });
+    $("#checkBtn").addEventListener("click", () => adminCall("check"));
+    $("#previewBtn").addEventListener("click", () => adminCall("preview"));
+    $("#syncBtn").addEventListener("click", () => adminCall("sync"));
+    $("#selftestBtn").addEventListener("click", () => adminCall("selftest"));
+    document.addEventListener("keydown", (e) => {
+      if (e.code === "Space" && document.activeElement === document.body) { e.preventDefault(); $("#orb").click(); }
     });
+
     const m = location.hash.match(/s=([a-f0-9]+)/);
-    if (m) { try { startWarRoom(await api(`/api/session/${m[1]}`)); } catch { /* expired */ } }
+    if (m) {
+      try {
+        const session = await api(`/api/session/${m[1]}`);
+        S.session = session; startCalls(session); return;
+      } catch { /* expired: start fresh */ }
+    }
+    await sendChat("");
   }
-  boot().catch((e) => { document.body.insertAdjacentHTML("afterbegin", `<p class="err" style="padding:16px">Failed to load: ${esc(e.message)}</p>`); });
+  boot().catch((e) => { showBot("Couldn't load: " + e.message); });
 })();

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from app import llm
+from app import lexicon, llm
 from app.pricing import CATEGORIES, ServiceRequest, parse_inr
 
 PRESETS: dict[str, dict] = {
@@ -53,27 +53,27 @@ DEFAULT_PRESET = "coorg_suv"
 VENDOR_PERSONAS: dict[str, list[dict]] = {
     "cab_outstation": [
         {"name": "Sri Sai Travels", "language": "kn", "style": "trap", "open_ratio_t": 1.02, "floor_ratio_t": 1.06,
-         "concession": 0.5, "greeting": "Hello, Sri Sai Travels, heli sir."},
+         "concession": 0.5},
         {"name": "Namma Cabs & Tours", "language": "hi", "style": "budget_first", "open_ratio_t": 1.14,
-         "floor_ratio_t": 1.04, "concession": 0.6, "greeting": "Haan ji, Namma Cabs, boliye."},
+         "floor_ratio_t": 1.04, "concession": 0.6},
         {"name": "Metro Cab Service", "language": "hi", "style": "sharp", "open_ratio_c": 1.08, "per_km_if_long": True,
-         "floor_ratio_t": 1.10, "concession": 0.4, "greeting": "Haan, Metro Cab Service. Kaun bol raha hai?"},
+         "floor_ratio_t": 1.10, "concession": 0.4},
     ],
     "mini_truck": [
         {"name": "Namma Mini Trucks", "language": "hi", "style": "trap", "open_ratio_t": 0.97, "floor_ratio_t": 1.05,
-         "concession": 0.5, "greeting": "Haan ji, Namma Mini Trucks."},
+         "concession": 0.5},
         {"name": "Sri Ganesh Packers", "language": "kn", "style": "budget_first", "open_ratio_t": 1.20,
-         "floor_ratio_t": 1.03, "concession": 0.6, "greeting": "Hello, Ganesh Packers, heli."},
+         "floor_ratio_t": 1.03, "concession": 0.6},
         {"name": "Quick Shift Tempo", "language": "ta", "style": "sharp", "open_ratio_c": 1.10, "floor_ratio_t": 1.12,
-         "concession": 0.4, "greeting": "Hello, Quick Shift, sollunga."},
+         "concession": 0.4},
     ],
     "ac_repair": [
         {"name": "Cool Care AC Service", "language": "kn", "style": "trap", "open_ratio_t": 0.6, "floor_ratio_t": 1.08,
-         "concession": 0.5, "greeting": "Hello, Cool Care AC Service."},
+         "concession": 0.5},
         {"name": "Sharma Refrigeration", "language": "hi", "style": "budget_first", "open_ratio_t": 1.25,
-         "floor_ratio_t": 1.04, "concession": 0.6, "greeting": "Haan ji, Sharma Refrigeration."},
+         "floor_ratio_t": 1.04, "concession": 0.6},
         {"name": "Arctic Fix Technicians", "language": "en", "style": "sharp", "open_ratio_c": 1.15,
-         "floor_ratio_t": 1.12, "concession": 0.4, "greeting": "Hello, Arctic Fix, tell me."},
+         "floor_ratio_t": 1.12, "concession": 0.4},
     ],
 }
 
@@ -84,125 +84,17 @@ def request_from_preset(key: str, **overrides) -> ServiceRequest:
     return ServiceRequest(**data)
 
 
-WHEN_WORDS = {
-    "tomorrow": {"kn": "naale", "hi": "kal", "ta": "naalaikku", "mr": "udya"},
-    "today": {"kn": "ivattu", "hi": "aaj", "ta": "inniki", "mr": "aaj"},
-    "tonight": {"kn": "ivattu raatri", "hi": "aaj raat", "ta": "inniki raathiri", "mr": "aaj raatri"},
-    "asap": {"kn": "bega", "hi": "jaldi", "ta": "seekiram", "mr": "lavkar"},
-    "saturday": {"kn": "shanivaara", "hi": "shanivaar", "ta": "sanikizhamai", "mr": "shanivaari"},
-    "sunday": {"kn": "bhaanuvaara", "hi": "ravivaar", "ta": "nyaayitrukizhamai", "mr": "ravivaari"},
-    "monday": {"kn": "somavaara", "hi": "somvaar", "ta": "thingal", "mr": "somvaari"},
-    "tuesday": {"kn": "mangalavaara", "hi": "mangalvaar", "ta": "sevvaai", "mr": "mangalvaari"},
-    "wednesday": {"kn": "budhavaara", "hi": "budhvaar", "ta": "budhan", "mr": "budhvaari"},
-    "thursday": {"kn": "guruvaara", "hi": "guruvaar", "ta": "viyazhan", "mr": "guruvaari"},
-    "friday": {"kn": "shukravaara", "hi": "shukravaar", "ta": "velli", "mr": "shukravaari"},
-    "next": {"kn": "mundina", "hi": "agle", "ta": "adutha", "mr": "pudhchya"},
-    "this": {"kn": "ee", "hi": "is", "ta": "indha", "mr": "ya"},
-    "weekend": {"kn": "weekend", "hi": "weekend", "ta": "weekend", "mr": "weekend"},
-    "morning": {"kn": "beligge", "hi": "subah", "ta": "kaalaila", "mr": "sakali"},
-    "evening": {"kn": "sanje", "hi": "shaam", "ta": "saayangaalam", "mr": "sandhyakali"},
-    "afternoon": {"kn": "madhyaahna", "hi": "dopahar", "ta": "madhiyam", "mr": "dupari"},
-    "night": {"kn": "raatri", "hi": "raat", "ta": "raathiri", "mr": "raatri"},
-}
-# "from Monday" -> "somvaar se": the postposition goes after the day in Indian languages
-FROM_SUFFIX = {"kn": "inda", "hi": "se", "ta": "la irundhu", "mr": "pasun"}
-NATIVE_FROM_SUFFIX = {"hi": "से", "kn": "ಇಂದ"}
-
-
-def _split_from(text: str) -> tuple[str, bool]:
-    m = re.match(r"^\s*(?:starting\s+)?from\s+(.+)$", text or "", re.I)
-    return (m.group(1), True) if m else (text, False)
-
-
 def localize_when(when: str, language: str) -> str:
-    """'Tomorrow 6:00 AM' -> 'naale 6 AM' for a Kannada call. Unknown words are kept as spoken English."""
-    text = (when or "").strip() or "tomorrow"
-    if language == "en":
-        return text
-    text, starts = _split_from(text)
-    text = re.sub(r"(\d{1,2}):00", r"\1", text)
-    text = re.sub(r"\b(\d{1,2})\s*am\b", r"\1 AM", text, flags=re.I)
-    text = re.sub(r"\b(\d{1,2})\s*pm\b", r"\1 PM", text, flags=re.I)
-    out = []
-    for word in re.split(r"(\s+|,)", text):
-        out.append(WHEN_WORDS.get(word.lower(), {}).get(language, word))
-    text = "".join(out).replace(",", "").strip()
-    return f"{text} {FROM_SUFFIX.get(language, 'from')}" if starts else text
+    """'Tomorrow 6:00 AM' -> 'ನಾಳೆ ಬೆಳಿಗ್ಗೆ 6 ಗಂಟೆಗೆ' for a Kannada call; unchanged for English."""
+    return lexicon.localize_when(when or "tomorrow", language)
 
 
-NATIVE_WHEN = {
-    "hi": {"tomorrow": "कल", "today": "आज", "tonight": "आज रात", "asap": "जल्दी", "saturday": "शनिवार",
-           "afternoon": "दोपहर", "night": "रात",
-           "sunday": "रविवार", "morning": "सुबह", "evening": "शाम", "monday": "सोमवार", "tuesday": "मंगलवार",
-           "wednesday": "बुधवार", "thursday": "गुरुवार", "friday": "शुक्रवार", "next": "अगले", "this": "इस"},
-    "kn": {"tomorrow": "ನಾಳೆ", "today": "ಇವತ್ತು", "tonight": "ಇವತ್ತು ರಾತ್ರಿ", "asap": "ಬೇಗ", "saturday": "ಶನಿವಾರ",
-           "afternoon": "ಮಧ್ಯಾಹ್ನ", "night": "ರಾತ್ರಿ",
-           "sunday": "ಭಾನುವಾರ", "morning": "ಬೆಳಿಗ್ಗೆ", "evening": "ಸಂಜೆ", "monday": "ಸೋಮವಾರ", "tuesday": "ಮಂಗಳವಾರ",
-           "wednesday": "ಬುಧವಾರ", "thursday": "ಗುರುವಾರ", "friday": "ಶುಕ್ರವಾರ", "next": "ಮುಂದಿನ", "this": "ಈ"},
-}
-
-
-def native_when(when: str, language: str) -> str:
-    """'Tomorrow 6:00 AM' -> 'कल सुबह 6 बजे' / 'ನಾಳೆ ಬೆಳಿಗ್ಗೆ 6 ಗಂಟೆಗೆ' so Sarvam's TTS reads it naturally."""
-    words = NATIVE_WHEN[language]
-    text, starts = _split_from((when or "tomorrow").strip())
-
-    def clock(m: re.Match) -> str:
-        hour, ampm = int(m.group(1)), (m.group(3) or "").lower()
-        part = "evening" if ampm == "pm" and hour != 12 else "morning"
-        suffix = "बजे" if language == "hi" else "ಗಂಟೆಗೆ"
-        return f"{words[part]} {hour} {suffix}"
-
-    text = re.sub(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", clock, text, flags=re.I)
-    out = [words.get(w.lower(), w) for w in re.split(r"(\s+|,)", text)]
-    text = "".join(out).replace(",", "").strip()
-    return f"{text} {NATIVE_FROM_SUFFIX[language]}" if starts else text
-
-
-def opening_line(req: ServiceRequest, language: str, native: bool = False) -> str:
-    """The first sentence after pickup: the job, the date and the place, no company name, no pitch.
-
-    native=True gives Devanagari/Kannada script for live calls (Sarvam pronounces it far better than
-    romanized text); the romanized version stays for the on-screen simulation."""
-    route_missing = req.category in {"cab_outstation", "mini_truck"} and not (req.pickup and req.drop)
-    if req.category not in LEGACY_OPENINGS or req.details or route_missing:
-        return generic_opening(req, language, native)
-    if native and language in NATIVE_WHEN:
-        return _native_opening(req, language)
-    pickup = req.pickup.split(",")[0] or "JP Nagar"
-    drop = (req.drop.split(",")[0] or "").strip()
-    when = localize_when(req.when, language)
-    if req.category == "cab_outstation":
-        return {
-            "kn": f"Namaskara anna, {when} {pickup} inda {drop} ge 7-seater Innova beku, available idya?",
-            "hi": f"Haan bhaiya namaste, {when} {pickup} se {drop} ke liye Innova 7-seater chahiye, milegi?",
-            "ta": f"Vanakkam anna, {when} {pickup} la irundhu {drop} ku Innova 7-seater venum, kidaikuma?",
-            "mr": f"Namaskar dada, {when} {pickup} pasun {drop} la Innova 7-seater pahije, milel ka?",
-        }.get(language, f"Hello sir, I need an Innova 7-seater {when} from {pickup} to {drop}. Is one available?")
-    if req.category == "mini_truck":
-        return {
-            "kn": f"Namaskara anna, {when} {pickup} inda {drop} ge 1BHK shifting ide, chikka tempo sigutta?",
-            "hi": f"Haan bhaiya namaste, {when} {pickup} se {drop} 1BHK shifting hai, chhota tempo milega?",
-            "ta": f"Vanakkam anna, {when} {pickup} la irundhu {drop} ku 1BHK shifting, chinna tempo kidaikuma?",
-        }.get(language, f"Hello, I have a 1BHK shifting {when} from {pickup} to {drop}. Is a mini tempo available?")
-    return {
-        "kn": f"Namaskara, {pickup} nalli split AC cooling aagtilla, {when.lower()} technician bartara?",
-        "hi": f"Namaste ji, {pickup} mein split AC cooling nahi kar raha, {when.lower()} koi aa sakta hai?",
-        "ta": f"Vanakkam, {pickup} la split AC cooling aagala, {when.lower()} technician vara mudiyuma?",
-    }.get(language, f"Hello, my split AC in {pickup} is not cooling. Can a technician come {when.lower()}?")
-
-
-LEGACY_OPENINGS = ("cab_outstation", "mini_truck", "ac_repair")
-
-
-OR_WORD = {"hi": "ya", "kn": "athava", "ta": "illa", "mr": "kinva", "en": "or"}
-AND_WORD = {"hi": "aur", "kn": "mattu", "ta": "matrum", "mr": "ani", "en": "and"}
+native_when = localize_when
 
 
 def spoken(label: str, language: str) -> str:
-    """'AC repair / service' -> 'AC repair ya service': the opening is read verbatim by the TTS."""
-    label = re.sub(r"\s*&\s*", f" {AND_WORD.get(language, 'and')} ", label or "")
-    return re.sub(r"\s*/\s*", f" {OR_WORD.get(language, 'or')} ", label).strip()
+    """'AC repair / service' -> 'AC repair or service'; in other languages the native words for those charges."""
+    return lexicon.charge_words(label, language)
 
 
 def _short(text: str, limit: int = 70) -> str:
@@ -210,53 +102,72 @@ def _short(text: str, limit: int = 70) -> str:
     return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0]
 
 
-def generic_opening(req: ServiceRequest, language: str, native: bool = False) -> str:
-    """Any service: lead with the concrete job, the place and the time. Appointments ask for a slot."""
-    service = spoken(req.service_label or "service", language)
-    place = (req.location or req.pickup or "").split(",")[0] or "Bengaluru"
-    detail = _short(req.details)
-    pickup, drop = (req.pickup or "").split(",")[0].strip(), (req.drop or "").split(",")[0].strip()
+def short_name(name: str) -> str:
+    """'Sri Sai Travels, JP Nagar' -> 'Sri Sai Travels' (how a shop answers its phone)."""
+    return (name or "").split(",")[0].strip()[:40]
+
+
+def _first(place: str) -> str:
+    return (place or "").split(",")[0].strip()
+
+
+def opening_line(req: ServiceRequest, language: str, native: bool = True, local: Optional[dict] = None) -> str:
+    """The first sentence after pickup: the job, the date and the place, no company name, no pitch.
+
+    Always in the call's own script (Sarvam pronounces it far better, and the call never switches to English).
+    `local` holds Gemini's translation of the user's own words (service, details, place…) into that language; without
+    it the service gets its catalogue name and free-text details are left for the voice agent to explain."""
+    local = local or {}
+    if language in PRESET_OPENINGS and not local and req.category in PRESET_OPENINGS[language] and \
+            any(req.summary == p["request"]["summary"] for p in PRESETS.values()):
+        return PRESET_OPENINGS[language][req.category].format(when=localize_when(req.when, language),
+                                                              pickup=_first(req.pickup), drop=_first(req.drop))
+    table = lexicon.OPENINGS.get(language) or lexicon.OPENINGS["en"]
+    if language in lexicon.NATIVE:
+        service = local.get("service") or lexicon.service_name(req.category, req.service_label, language)
+        detail = local.get("details", "")
+        when = local.get("when") or localize_when(req.when, language)
+    else:
+        service = lexicon.spoken_en(req.service_label or "service")
+        detail = _short(req.details)
+        when = req.when or "soon"
+    place = local.get("place") or _first(req.location or req.pickup) or "Bengaluru"
+    pickup, drop = local.get("pickup") or _first(req.pickup), local.get("drop") or _first(req.drop)
+    fields = dict(service=service, when=when, place=place, pickup=pickup, drop=drop,
+                  detail=f", {detail}" if detail else "")
     if pickup and drop:
-        # Cabs, movers, courier: the route is the job ("JP Nagar se Mysuru")
-        return _route_opening(service, pickup, drop, detail, req, language, native)
-    if native and language in NATIVE_WHEN:
-        when = native_when(req.when, language)
-        if language == "hi":
-            if req.goal == "appointment":
-                return f"नमस्ते जी, {when} {service} के लिए appointment चाहिए{', ' + detail if detail else ''}। कोई slot मिलेगा?"
-            return f"नमस्ते जी, {when} {place} में {service} चाहिए{', ' + detail if detail else ''}। आप कर पाएंगे?"
-        if req.goal == "appointment":
-            return f"ನಮಸ್ಕಾರ, {when} {service} appointment ಬೇಕಿತ್ತು{', ' + detail if detail else ''}. Slot ಸಿಗುತ್ತಾ?"
-        return f"ನಮಸ್ಕಾರ, {when} {place} ಅಲ್ಲಿ {service} ಬೇಕಿತ್ತು{', ' + detail if detail else ''}. ನೀವು ಮಾಡ್ತೀರಾ?"
-    when = localize_when(req.when, language)
-    d = f", {detail}" if detail else ""
+        return table["route"].format(**fields)
     if req.goal == "appointment":
-        return {
-            "hi": f"Namaste ji, {when} {service} ke liye appointment chahiye{d}. Koi slot milega?",
-            "kn": f"Namaskara, {when} {service} appointment bekittu{d}. Slot sigutta?",
-            "ta": f"Vanakkam, {when} {service} appointment venum{d}. Slot kidaikuma?",
-        }.get(language, f"Hello, I'd like to book a {service} appointment {when}{d}. Do you have a slot?")
-    return {
-        "hi": f"Namaste ji, {when} {place} mein {service} chahiye{d}. Aap kar paoge?",
-        "kn": f"Namaskara, {when} {place} alli {service} bekittu{d}. Neevu madtira?",
-        "ta": f"Vanakkam, {when} {place} la {service} venum{d}. Neenga panna mudiyuma?",
-    }.get(language, f"Hello, I need a {service} in {place} {when}{d}. Can you take it up?")
+        return table["appointment"].format(**fields)
+    return table["generic"].format(**fields)
 
 
-def _route_opening(service: str, pickup: str, drop: str, detail: str, req: ServiceRequest, language: str,
-                   native: bool) -> str:
-    if native and language in NATIVE_WHEN:
-        when = native_when(req.when, language)
-        if language == "hi":
-            return f"नमस्ते भैया, {when} {pickup} से {drop} के लिए {service} चाहिए{', ' + detail if detail else ''}। मिल जाएगा?"
-        return f"ನಮಸ್ಕಾರ ಅಣ್ಣ, {when} {pickup} ಇಂದ {drop} ಗೆ {service} ಬೇಕಿತ್ತು{', ' + detail if detail else ''}. ಸಿಗುತ್ತಾ?"
-    when = localize_when(req.when, language)
-    d = f", {detail}" if detail else ""
-    return {
-        "hi": f"Namaste bhaiya, {when} {pickup} se {drop} ke liye {service} chahiye{d}. Mil jayega?",
-        "kn": f"Namaskara anna, {when} {pickup} inda {drop} ge {service} bekittu{d}. Sigutta?",
-        "ta": f"Vanakkam anna, {when} {pickup} la irundhu {drop} ku {service} venum{d}. Kidaikuma?",
-    }.get(language, f"Hello, I need a {service} {when} from {pickup} to {drop}{d}. Is one available?")
+def opening_gloss(req: ServiceRequest) -> str:
+    """English meaning of the opening line, for the screen."""
+    return opening_line(req, "en")
+
+
+# The demo presets keep their richer openings (vehicle model, 1BHK, split AC) in Hindi and Kannada
+PRESET_OPENINGS = {
+    "hi": {"cab_outstation": "नमस्ते भैया, {when} {pickup} से {drop} के लिए इनोवा सात सीटर गाड़ी चाहिए, मिल जाएगी?",
+           "mini_truck": "नमस्ते भैया, {when} {pickup} से {drop} एक कमरे का सामान शिफ़्ट करना है, छोटा टेम्पो मिलेगा?",
+           "ac_repair": "नमस्ते जी, {pickup} में एसी ठंडा नहीं कर रहा, {when} कोई मिस्त्री आ सकता है?"},
+    "kn": {"cab_outstation": "ನಮಸ್ಕಾರ ಅಣ್ಣ, {when} {pickup} ಇಂದ {drop} ಗೆ ಇನ್ನೋವಾ ಏಳು ಸೀಟಿನ ಗಾಡಿ ಬೇಕಿತ್ತು, ಸಿಗುತ್ತಾ?",
+           "mini_truck": "ನಮಸ್ಕಾರ ಅಣ್ಣ, {when} {pickup} ಇಂದ {drop} ಗೆ ಮನೆ ಸಾಮಾನು ಸಾಗಿಸಬೇಕು, ಚಿಕ್ಕ ಟೆಂಪೋ ಸಿಗುತ್ತಾ?",
+           "ac_repair": "ನಮಸ್ಕಾರ, {pickup} ಅಲ್ಲಿ ಎಸಿ ತಣ್ಣಗೆ ಮಾಡ್ತಿಲ್ಲ, {when} ಯಾರಾದ್ರೂ ಬರ್ತಾರಾ?"},
+}
+
+
+def personas_for_providers(req: ServiceRequest, providers: list[dict], language: str) -> list[dict]:
+    """Simulated behaviour for real map listings: each provider gets a different negotiation style."""
+    out = []
+    for i, p in enumerate(providers):
+        name = str(p.get("name") or f"Provider {i + 1}")[:60]
+        persona = {**GENERIC_STYLES[i % len(GENERIC_STYLES)], "name": name, "language": language}
+        if req.category == "cab_outstation" and i == 2:
+            persona["per_km_if_long"] = True
+        out.append(persona)
+    return out
 
 
 GENERIC_STYLES = (
@@ -266,38 +177,6 @@ GENERIC_STYLES = (
     {"style": "budget_first", "open_ratio_t": 1.25, "floor_ratio_t": 1.08, "concession": 0.5},
     {"style": "trap", "open_ratio_t": 0.95, "floor_ratio_t": 1.12, "concession": 0.45},
 )
-GREETINGS = {"hi": "Haan ji, {name}, boliye.", "kn": "Hello, {name}, heli.", "ta": "Hello, {name}, sollunga.",
-             "en": "Hello, {name}, tell me."}
-
-
-def personas_for_providers(req: ServiceRequest, providers: list[dict], language: str) -> list[dict]:
-    """Simulated behaviour for real map listings: each provider gets a different negotiation style."""
-    out = []
-    for i, p in enumerate(providers):
-        name = str(p.get("name") or f"Provider {i + 1}")[:60]
-        persona = {**GENERIC_STYLES[i % len(GENERIC_STYLES)], "name": name, "language": language,
-                   "greeting": GREETINGS.get(language, GREETINGS["en"]).format(name=name.split(",")[0])}
-        if req.category == "cab_outstation" and i == 2:
-            persona["per_km_if_long"] = True
-        out.append(persona)
-    return out
-
-
-def _native_opening(req: ServiceRequest, language: str) -> str:
-    pickup = req.pickup.split(",")[0] or "JP Nagar"
-    drop = (req.drop.split(",")[0] or "").strip()
-    when = native_when(req.when, language)
-    if language == "hi":
-        if req.category == "cab_outstation":
-            return f"नमस्ते भैया, {when} {pickup} से {drop} के लिए Innova 7-seater चाहिए, मिल जाएगी?"
-        if req.category == "mini_truck":
-            return f"नमस्ते भैया, {when} {pickup} से {drop} 1BHK का सामान shift करना है, छोटा tempo मिलेगा?"
-        return f"नमस्ते जी, {pickup} में split AC ठंडा नहीं कर रहा, {when} कोई technician आ सकता है?"
-    if req.category == "cab_outstation":
-        return f"ನಮಸ್ಕಾರ ಅಣ್ಣ, {when} {pickup} ಇಂದ {drop} ಗೆ Innova 7-seater ಬೇಕಿತ್ತು, ಸಿಗುತ್ತಾ?"
-    if req.category == "mini_truck":
-        return f"ನಮಸ್ಕಾರ ಅಣ್ಣ, {when} {pickup} ಇಂದ {drop} ಗೆ 1BHK shifting ಇದೆ, ಚಿಕ್ಕ tempo ಸಿಗುತ್ತಾ?"
-    return f"ನಮಸ್ಕಾರ, {pickup} ಅಲ್ಲಿ split AC cooling ಆಗ್ತಿಲ್ಲ, {when} technician ಬರ್ತಾರಾ?"
 
 
 def _fallback_parse(text: str) -> dict:

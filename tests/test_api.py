@@ -1,6 +1,7 @@
 """HTTP surface: Bolna tool webhooks, execution webhook, hybrid mode with a mocked Bolna, full simulation."""
 
 import asyncio
+import re
 import time
 
 import pytest
@@ -93,7 +94,8 @@ def test_hybrid_mode_with_mocked_bolna(client, monkeypatch):
         toll="included", driver_bata="included", other_charges="included", availability="yes")).json()
     assert r["action"] == "COUNTER" and r["best_competing_quote_inr"] is not None
     assert r["counter_price_inr"] <= r["best_competing_quote_inr"]
-    assert "operator" in r["say_this"] and r["say_this"] in r["instruction"]
+    assert "दूसरी जगह" in r["say_this"] and r["say_this"] in r["instruction"]   # "another place nearby", in Hindi
+    assert "Another operator nearby" in r["meaning"] and not re.search(r"[A-Za-z]", r["say_this"])
 
     status = client.post("/api/tools/check_auction_status", json={"session_id": sid, "leg_id": "A"}).json()
     assert status["ok"]

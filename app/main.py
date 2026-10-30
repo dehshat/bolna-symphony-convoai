@@ -6,19 +6,25 @@ Run:  uvicorn app.main:app --host 0.0.0.0 --port $PORT      (one worker: the auc
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hashlib
 import logging
 import os
 import re
+import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app import bolna_client, briefs, config, intake, llm, payments, places, ratelimit, scenarios, services, state
+from app import (bolna_client, briefs, config, intake, languages, llm, payments, places, ratelimit, scenarios, services,
+                 state)
 from app.auction_engine import GuardrailViolation
 from app.pricing import ServiceRequest
 from app.webhooks import router as webhook_router
@@ -56,14 +62,54 @@ async def auto_provision_bolna() -> None:
         log.warning("Bolna auto-provisioning failed: %s", exc)
 
 
+SESSION_TTL = 6 * 3600        # finished sessions are dropped from memory after this (SQLite keeps the snapshot)
+CONVERSATION_TTL = 3 * 3600
+
+
+def prune(now: Optional[float] = None) -> dict:
+    """Keep memory flat on a 512 MB free instance: forget old sessions and conversations."""
+    now = now or time.time()
+    engine = state.engine
+    old = [sid for sid, s in engine.sessions.items() if now - s.created_at > SESSION_TTL]
+    for sid in old:
+        engine.sessions.pop(sid, None)
+        engine._locks.pop(sid, None)
+        state.orchestrator.cancel(sid)
+    for execution_id in [e for e, (sid, _) in engine._execution_index.items() if sid in old]:
+        engine._execution_index.pop(execution_id, None)
+    stale = [cid for cid, c in intake.CONVERSATIONS.items() if now - c.touched > CONVERSATION_TTL]
+    for cid in stale:
+        intake.CONVERSATIONS.pop(cid, None)
+    return {"sessions": len(old), "conversations": len(stale)}
+
+
+async def housekeeping() -> None:
+    """Every few minutes: prune memory and, if KEEP_AWAKE_MINUTES is set, ping our own URL so Render's free plan
+    doesn't put the app to sleep in the middle of a demo."""
+    import httpx
+    last_ping = 0.0
+    while True:
+        await asyncio.sleep(60)
+        prune()
+        s = config.settings
+        if s.keep_awake_minutes > 0 and s.public_base_url and time.time() - last_ping > s.keep_awake_minutes * 60:
+            last_ping = time.time()
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.get(f"{s.public_base_url}/api/health")
+            except httpx.HTTPError as exc:
+                log.info("keep-awake ping failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    task = asyncio.create_task(auto_provision_bolna())
+    tasks = [asyncio.create_task(auto_provision_bolna()), asyncio.create_task(housekeeping())]
     yield
-    task.cancel()
+    for task in tasks:
+        task.cancel()
 
 
-app = FastAPI(title="Swarm Local Negotiator", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Swarm Local Negotiator", version="2.0.0", lifespan=lifespan)
 app.include_router(webhook_router)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
@@ -97,7 +143,7 @@ class CreateSession(BaseModel):
     autostart: bool = True
     task: Optional[dict] = None                # from the chat intake (any service)
     providers: Optional[list[dict]] = None     # chosen from the map search (up to 5)
-    language: Optional[str] = None             # call language for task sessions: hi | kn | en | ta
+    language: Optional[str] = None             # call language for task sessions (one of the 11); default: the task's
 
 
 class ChatBody(BaseModel):
@@ -105,6 +151,18 @@ class ChatBody(BaseModel):
     message: str = Field(default="", max_length=600)
     lat: Optional[float] = None
     lng: Optional[float] = None
+    user_lang: Optional[str] = None            # the language the user talks to the app in
+    call_language: Optional[str] = None        # set when the user picks the call language on screen
+
+
+class SpeakBody(BaseModel):
+    text: str = Field(min_length=1, max_length=600)
+
+
+class ListenBody(BaseModel):
+    audio: str = Field(min_length=10)          # base64 audio (the browser records 16 kHz mono WAV)
+    mime: str = "audio/wav"
+    language: Optional[str] = None
 
 
 class ProviderSearch(BaseModel):
@@ -166,7 +224,8 @@ async def index() -> FileResponse:
 async def health() -> dict:
     # Render and Railway expose the deployed commit; it tells you which version is live
     commit = os.getenv("RENDER_GIT_COMMIT") or os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("GIT_COMMIT", "")
-    return {"ok": True, "sessions": len(state.engine.sessions), "commit": commit[:7] or "unknown"}
+    return {"ok": True, "sessions": len(state.engine.sessions), "conversations": len(intake.CONVERSATIONS),
+            "commit": commit[:7] or "unknown", "version": app.version}
 
 
 @app.get("/api/config")
@@ -181,7 +240,57 @@ async def get_config(request: Request) -> dict:
         "services": services.catalogue(),
         "gemini": llm.status(),
         "vendors": briefs.VENDOR_PERSONAS,
+        "languages": languages.public_list(),
+        "voice_commands": languages.voice_commands(),
     }
+
+
+@app.get("/api/languages")
+async def get_languages(location: str = "", state_name: str = "") -> dict:
+    """The 11 call languages, and which one fits a place ("Kothrud, Pune" -> Marathi)."""
+    code, reason = languages.detect(location, state_name)
+    return {"languages": languages.public_list(), "detected": code, "reason": reason}
+
+
+# ----------------------------------------------------------------------------- voice (Gemini, same API key)
+
+_tts_cache: "OrderedDict[str, bytes]" = OrderedDict()
+
+
+@app.post("/api/tts")
+async def tts(body: SpeakBody, request: Request) -> Response:
+    """Speak a line with a Gemini TTS model, for languages the browser has no voice for. Cached; 503 if unavailable."""
+    key = hashlib.sha1(body.text.encode()).hexdigest()
+    audio = _tts_cache.get(key)
+    if audio is None:
+        ratelimit.check(request, "voice", config.settings.rate_limit_voice)
+        audio = await llm.speak(body.text)
+        if not audio:
+            raise HTTPException(503, "no voice model available right now")
+        _tts_cache[key] = audio
+        while len(_tts_cache) > 64:
+            _tts_cache.popitem(last=False)
+    _tts_cache.move_to_end(key)
+    return Response(audio, media_type="audio/wav", headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.post("/api/stt")
+async def stt(body: ListenBody, request: Request) -> dict:
+    """Speech to text with a Gemini model, for browsers without built-in speech recognition."""
+    if len(body.audio) > 3_000_000:
+        raise HTTPException(413, "recording too long; keep it under 30 seconds")
+    try:
+        audio = base64.b64decode(body.audio, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(422, "audio must be base64")
+    if body.mime.split(";")[0] not in {"audio/wav", "audio/x-wav", "audio/ogg", "audio/webm", "audio/mp4",
+                                       "audio/mpeg", "audio/aac", "audio/flac"}:
+        raise HTTPException(415, "unsupported audio type")
+    ratelimit.check(request, "voice", config.settings.rate_limit_voice)
+    result = await llm.transcribe(audio, body.mime.split(";")[0], languages.normalize(body.language) or "")
+    if result is None:
+        raise HTTPException(503, "speech recognition isn't available right now; please type instead")
+    return result
 
 
 @app.post("/api/parse_brief")
@@ -194,7 +303,8 @@ async def parse_brief(body: BriefText) -> dict:
 @app.post("/api/chat")
 async def chat(body: ChatBody, request: Request) -> dict:
     ratelimit.check(request, "chat", config.settings.rate_limit_chat)
-    return await intake.chat(body.conversation_id, body.message, body.lat, body.lng)
+    return await intake.chat(body.conversation_id, body.message, body.lat, body.lng, body.user_lang,
+                             body.call_language)
 
 
 def _task_from(conversation_id: Optional[str], task: Optional[dict]) -> dict:
@@ -227,7 +337,8 @@ async def _create_task_session(body: CreateSession, mode: str) -> dict:
     providers = (body.providers or [])[:5]
     if not providers:
         raise HTTPException(422, "pick at least one provider")
-    language = body.language or body.live_language or "hi"
+    language = languages.normalize(body.language or body.live_language or (body.task or {}).get("call_language")) \
+        or languages.DEFAULT
     personas = briefs.personas_for_providers(req, providers, language)
     test_phone = s.test_phone_override or s.live_test_phone
     vendors = []
@@ -243,6 +354,16 @@ async def _create_task_session(body: CreateSession, mode: str) -> dict:
                         "mode": "live" if live else "sim", "phone": _phone(dial) if dial else "",
                         "provider": provider_meta, "persona": persona})
     session = await state.engine.create_session(req, vendors, mode)
+    task = body.task or {}
+    reason = task.get("call_language_reason") or ""
+    await state.engine.trace(session.session_id, "concierge",
+                             f"{req.service_label} · {req.location or req.pickup or ''} · {req.when or 'flexible'}"
+                             + (f" · target {req.target_price}, max {req.walkaway_ceiling} (never told to the callers)"
+                                if req.has_budget else " · appointment, no haggling"))
+    await state.engine.trace(session.session_id, "linguist", f"calls in {languages.name(language)}"
+                             + (f" — {reason}" if reason else ""))
+    await state.engine.trace(session.session_id, "scout", "picked " + "; ".join(
+        f"{p.get('name', '?')}" + (f" ★{p['rating']}" if p.get("rating") is not None else "") for p in providers))
     if body.autostart:
         await state.orchestrator.start(session.session_id)
     return session.public()
@@ -369,11 +490,16 @@ async def selftest(format: str = "json"):
     """Replays every scripted call scenario through the live tool code on a private, in-memory engine.
     No calls are placed and nothing touches real sessions, so it is safe to run on a deployed instance."""
     report = await scenarios.run_all()
+    sweep = await scenarios.language_sweep()
     if format == "text":
-        return PlainTextResponse(scenarios.render(report))
+        langs = "  ".join(f"{v['name']} {v['passed']}/{v['total']}" for v in sweep["languages"].values())
+        return PlainTextResponse(f"Every scenario in all {len(sweep['languages'])} call languages (no English words "
+                                 f"allowed on non-English calls): {sweep['passed']}/{sweep['total']}\n{langs}\n\n"
+                                 + scenarios.render(report))
     return {"passed": report["passed"], "total": report["total"],
             "failures": [{"name": r["name"], "problems": r["problems"]} for r in report["results"] if not r["ok"]],
-            "scenarios": [{"name": r["name"], "about": r["about"], "ok": r["ok"]} for r in report["results"]]}
+            "scenarios": [{"name": r["name"], "about": r["about"], "ok": r["ok"]} for r in report["results"]],
+            "languages": sweep}
 
 
 @app.get("/api/admin/agent_payload")

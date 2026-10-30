@@ -26,7 +26,7 @@
 | Team name | *(blank if solo)* or `Swarm Negotiator` |
 | Full name / Email | Exactly as in your Symphony registration |
 | Project name | `Swarm Negotiator: The Anti-Justdial` |
-| Project description (181 chars, limit 200) | `Speak once: 3 AI voice agents call local vendors in Kannada/Hindi at once, use each live quote as leverage on the others & lock the best all-inclusive deal. Your number never leaks.` |
+| Project description (195 chars, limit 200) | `Say what you need: AI voice agents call the best-rated providers nearby in the local language (11 Indian languages), use each live quote as leverage & book the best deal. Your number never leaks.` |
 | Submission link | `https://github.com/dehshat/bolna-symphony-convoai` |
 | Pitch deck / video link | Your Google Drive / Google Slides link (*Anyone with the link*) |
 

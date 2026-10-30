@@ -3,194 +3,173 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0f1216" media="(prefers-color-scheme: dark)">
-  <meta name="theme-color" content="#f5f6f8" media="(prefers-color-scheme: light)">
-  <title>Swarm Negotiator</title>
-  <meta name="description" content="Chat once: it finds the best-rated providers nearby, calls them, negotiates or books, and confirms. Your number never leaks.">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐝</text></svg>">
+  <meta name="theme-color" content="#0e0f11" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f7f7f5" media="(prefers-color-scheme: light)">
+  <title>Swarm · voice concierge</title>
+  <meta name="description" content="Say what you need. It finds the best-rated people nearby, calls them in the local language, gets the best price or slot, and confirms. Your number never leaks.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='40' fill='%233b5bdb'/></svg>">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="logo">🐝</span>
-      <div>
-        <div class="brand-name">Swarm Negotiator</div>
-        <div class="brand-tag">The Anti-Justdial · your number never leaves this screen</div>
-      </div>
-    </div>
-    <div class="top-actions">
-      <div class="seg" id="modeSeg" role="radiogroup" aria-label="Execution mode">
-        <button data-mode="simulation" class="active">Sim</button>
-        <button data-mode="hybrid">Hybrid</button>
-        <button data-mode="live">Live</button>
-      </div>
-      <span class="conn" id="conn" title="Live connection"><i></i><span>idle</span></span>
-      <button class="icon-btn" id="adminBtn" aria-label="Admin & Bolna setup">⚙︎</button>
+  <header class="bar">
+    <a class="brand" href="/" aria-label="Swarm, start over"><span class="brand-dot"></span>swarm</a>
+    <div class="bar-right">
+      <button class="pill" id="langPill" type="button" aria-haspopup="dialog" title="Language used on the calls">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h12M9 3v2m1.5 0c-.8 4-3.3 7.3-6.5 9m3-4c1.3 2 3 3.5 5 4.5M13 21l4.5-10L22 21m-7.5-3h6"/></svg>
+        <span id="langPillText">हिन्दी</span>
+      </button>
+      <button class="icon-btn" id="menuBtn" type="button" aria-label="Settings" aria-haspopup="dialog">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>
+      </button>
     </div>
   </header>
 
   <main>
-    <!-- ======================= 1. CHAT INTAKE ======================= -->
-    <section class="panel" id="chatPanel">
-      <div class="panel-head">
-        <h2>1 · Tell me what you need</h2>
-        <button class="linkish small" id="classicBtn" type="button">Classic demo presets</button>
-      </div>
-      <div class="chat-log" id="chatLog" aria-live="polite"></div>
-      <div class="chips" id="chatChips"></div>
-      <div class="chat-input">
-        <select id="chatMicLang" aria-label="Speech language"><option value="en-IN">EN</option><option value="hi-IN">हि</option><option value="kn-IN">ಕ</option></select>
-        <button class="mic" id="chatMic" type="button" aria-label="Speak">🎙</button>
-        <button class="mic" id="geoBtn" type="button" aria-label="Use my location" title="Use my location">📍</button>
-        <input id="chatInput" type="text" autocomplete="off" placeholder="e.g. I need a cook in Koramangala from Monday" aria-label="Message">
-        <button class="btn primary" id="chatSend" type="button">Send</button>
-      </div>
-      <div class="task-card" id="taskCard" hidden>
-        <div class="task-grid">
-          <label>Service <input id="tService" type="text"></label>
-          <label>Area <input id="tLocation" type="text"></label>
-          <label>When <input id="tWhen" type="text"></label>
-          <label class="budget-field">Target ₹ <input id="tTarget" type="number" inputmode="numeric" min="0"></label>
-          <label class="budget-field">Max ₹ <input id="tCeiling" type="number" inputmode="numeric" min="0"></label>
-          <label class="wide">Details <input id="tDetails" type="text"></label>
-        </div>
-        <div class="muted small" id="tGoal"></div>
-        <button class="btn primary launch" id="findBtn" type="button">🔎 Find the best-rated providers nearby</button>
+    <!-- ============ the conversation: one line from the assistant, one big button to talk ============ -->
+    <section class="stage" id="stage">
+      <p class="bot-line" id="botLine" aria-live="polite"></p>
+      <p class="user-line" id="userLine" aria-live="polite"></p>
+      <button class="orb" id="orb" type="button" data-state="idle" aria-label="Tap to talk">
+        <span class="orb-ring"></span><span class="orb-ring two"></span>
+        <span class="orb-core">
+          <svg class="i-mic" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>
+          <svg class="i-stop" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>
+          <span class="i-wave" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        </span>
+      </button>
+      <p class="orb-hint" id="orbHint">Tap and speak</p>
+      <div class="chips" id="chips"></div>
+      <form class="type-row" id="typeForm" autocomplete="off">
+        <input id="typeInput" type="text" placeholder="…or type here" aria-label="Type your message" enterkeyhint="send">
+        <button class="send" type="submit" aria-label="Send">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6"/></svg>
+        </button>
+      </form>
+    </section>
+
+    <!-- ============ what I understood (tap to edit) ============ -->
+    <section class="task" id="task" hidden>
+      <button class="task-line" id="taskLine" type="button" aria-expanded="false"></button>
+      <div class="task-edit" id="taskEdit" hidden>
+        <label>Service <input id="tService" type="text"></label>
+        <label>Area <input id="tLocation" type="text"></label>
+        <label>When <input id="tWhen" type="text"></label>
+        <label>Details <input id="tDetails" type="text"></label>
+        <label class="budget">Target ₹ <input id="tTarget" type="number" inputmode="numeric" min="0"></label>
+        <label class="budget">Max ₹ <input id="tCeiling" type="number" inputmode="numeric" min="0"></label>
+        <p class="fine" id="tGoal"></p>
+        <button class="btn" id="saveTask" type="button">Done</button>
       </div>
     </section>
 
-    <!-- ======================= 2. PROVIDERS ======================= -->
-    <section class="panel" id="providersPanel" hidden>
-      <div class="panel-head">
-        <h2 id="provTitle">2 · Best-rated nearby</h2>
-        <span class="muted small" id="provSource"></span>
+    <!-- ============ who I'll call ============ -->
+    <section class="block" id="shortlist" hidden>
+      <div class="block-head">
+        <h2 id="slTitle">Best-rated nearby</h2>
+        <span class="fine" id="slSource"></span>
       </div>
-      <div class="test-banner" id="testBanner" hidden></div>
-      <div class="prov-list" id="provList"></div>
-      <div class="prov-actions">
-        <label class="small muted">Call language
-          <select id="callLang"><option value="hi">Hindi / Hinglish</option><option value="kn">Kannada</option><option value="en">English</option></select>
-        </label>
-        <button class="btn primary" id="callBtn" type="button">📞 Call selected</button>
+      <p class="note" id="testNote" hidden></p>
+      <ol class="plist" id="slList"></ol>
+      <div class="row">
+        <button class="btn primary" id="callBtn" type="button">Call</button>
+        <span class="fine" id="countdown" aria-live="polite"></span>
       </div>
-      <p class="hint" id="callHint"></p>
     </section>
 
-    <!-- ======================= CLASSIC BRIEF (presets) ======================= -->
-    <section class="panel" id="briefPanel" hidden>
-      <div class="panel-head">
-        <h2>1 · Tell us once</h2>
-        <span class="muted small" id="parsedBy"></span>
+    <!-- ============ the calls, live ============ -->
+    <section class="block" id="calls" hidden>
+      <div class="stats">
+        <div><span id="stBestL">Best so far</span><b id="stBest">—</b></div>
+        <div><span id="stSavedL">Saved</span><b id="stSaved">—</b></div>
+        <div><span>Your number shared</span><b>0×</b></div>
       </div>
-      <div class="chips" id="presetChips"></div>
-      <div class="brief-box">
-        <textarea id="briefText" rows="3" placeholder="Speak or type: “Need an Innova 7-seater tomorrow 6 AM from JP Nagar to Coorg, target ₹11,000, max ₹13,000”"></textarea>
-        <div class="brief-tools">
-          <select id="micLang" aria-label="Speech language">
-            <option value="en-IN">EN</option><option value="hi-IN">हि</option><option value="kn-IN">ಕ</option>
-          </select>
-          <button class="mic" id="micBtn" aria-label="Speak your request">🎙</button>
-          <button class="btn ghost" id="parseBtn">✨ Parse</button>
+      <ol class="calls" id="callList"></ol>
+      <div class="verdict" id="verdict" hidden>
+        <p class="verdict-k">Recommended</p>
+        <p class="verdict-main" id="vMain"></p>
+        <ul class="reasons" id="vReasons"></ul>
+        <div class="row">
+          <button class="btn primary" id="vConfirm" type="button">Confirm</button>
+          <button class="btn ghost" id="vOther" type="button">Choose another</button>
         </div>
       </div>
-      <div class="grid-fields">
-        <label>Target <span class="cur">₹<input id="target" type="number" inputmode="numeric" min="1"></span></label>
-        <label>Walk-away ceiling <span class="cur">₹<input id="ceiling" type="number" inputmode="numeric" min="1"></span></label>
-        <label class="wide">Job <input id="summary" type="text"></label>
-      </div>
-      <div class="mode-extra" id="hybridFields" hidden>
-        <label>Your phone (you play Vendor A) <input id="livePhone" type="tel" placeholder="+91… (blank = LIVE_TEST_PHONE)"></label>
-        <label>Agent language on your call
-          <select id="liveLang"><option value="hi">Hindi / Hinglish</option><option value="kn">Kannada</option></select>
-        </label>
-      </div>
-      <div class="mode-extra" id="liveFields" hidden>
-        <div class="live-row"><input class="lp" type="tel" placeholder="Vendor A +91…"><input class="ln" type="text" placeholder="Name"><select class="ll"><option value="kn">KN</option><option value="hi">HI</option><option value="ta">TA</option></select></div>
-        <div class="live-row"><input class="lp" type="tel" placeholder="Vendor B +91…"><input class="ln" type="text" placeholder="Name"><select class="ll"><option value="hi">HI</option><option value="kn">KN</option><option value="ta">TA</option></select></div>
-        <div class="live-row"><input class="lp" type="tel" placeholder="Vendor C +91…"><input class="ln" type="text" placeholder="Name"><select class="ll"><option value="hi">HI</option><option value="kn">KN</option><option value="ta">TA</option></select></div>
-      </div>
-      <button class="btn primary launch" id="launchBtn">🚀 Launch swarm · 3 calls</button>
-      <p class="hint" id="modeHint"></p>
+      <div class="row end"><button class="btn ghost" id="newBtn" type="button">New request</button></div>
     </section>
 
-    <!-- ======================= WAR ROOM ======================= -->
-    <section id="warRoom" hidden>
-      <div class="scoreboard">
-        <div class="sb-job">
-          <div class="muted small" id="sbCategory"></div>
-          <div class="sb-title" id="sbJob"></div>
-          <div class="muted small" id="sbMeta"></div>
-        </div>
-        <div class="sb-stats">
-          <div class="stat"><span class="muted small">Best all-in</span><b id="sbBest">—</b><span class="small" id="sbBestVendor"></span></div>
-          <div class="stat"><span class="muted small">Saved</span><b class="good" id="sbSaved">—</b><span class="small muted">vs highest first quote</span></div>
-          <div class="stat"><span class="muted small">Elapsed</span><b id="sbTime">0s</b><span class="small muted" id="sbVersion">v0</span></div>
-        </div>
-        <div class="sb-actions">
-          <span class="privacy">🔒 Numbers shared: <b>0</b></span>
-          <button class="btn win" id="lockBestBtn" disabled>Lock best deal</button>
-          <button class="btn ghost" id="newBtn">New</button>
-        </div>
-      </div>
-      <div class="cards" id="cards"></div>
-    </section>
+    <details class="log" id="logBox">
+      <summary>How the agents worked</summary>
+      <ol id="log"></ol>
+    </details>
   </main>
 
-  <!-- ======================= ARBITRAGE TICKER ======================= -->
-  <footer class="ticker" id="ticker" hidden>
-    <div class="ticker-label">⚡ Shared-memory arbitrage</div>
-    <div class="ticker-track" id="tickerTrack"><span class="muted">Waiting for the first quote…</span></div>
-  </footer>
-  <div class="flash" id="flash" hidden></div>
-
-  <!-- ======================= LOCK / CHECKOUT MODAL ======================= -->
-  <dialog id="lockModal">
-    <form method="dialog" class="modal">
-      <div class="modal-head"><h3 id="lmTitle">Deal locked</h3><button class="icon-btn" value="close" aria-label="Close">✕</button></div>
-      <div id="lmBody"></div>
-      <div class="modal-actions" id="lmActions"></div>
+  <!-- ============ call language ============ -->
+  <dialog id="langSheet" aria-labelledby="langTitle">
+    <form method="dialog" class="sheet">
+      <div class="sheet-head"><h3 id="langTitle">Language for the calls</h3><button class="icon-btn" value="close" aria-label="Close">✕</button></div>
+      <p class="fine" id="langReason"></p>
+      <div class="lang-grid" id="langGrid"></div>
+      <p class="fine">The assistant speaks only this language with providers, no English in between. You can talk to me in any language.</p>
     </form>
   </dialog>
 
-  <!-- ======================= ADMIN DRAWER ======================= -->
-  <dialog id="adminModal">
-    <form method="dialog" class="modal">
-      <div class="modal-head"><h3>Setup · Bolna + Sarvam</h3><button class="icon-btn" value="close" aria-label="Close">✕</button></div>
-      <div id="cfgList" class="cfg"></div>
-      <label class="small">Admin token (only if ADMIN_TOKEN is set)<input id="adminToken" type="password" autocomplete="off"></label>
-      <label class="small">Languages to provision
-        <input id="syncLangs" type="text" value="hi,kn">
-      </label>
-      <div class="modal-actions">
-        <button type="button" class="btn ghost" id="checkBtn">Check Bolna key</button>
-        <button type="button" class="btn ghost" id="previewBtn">Preview agent JSON</button>
-        <button type="button" class="btn primary" id="syncBtn">Create / update Bolna agents</button>
-        <button type="button" class="btn ghost" id="selftestBtn">Run call self-test</button>
-      </div>
-      <pre id="adminOut" class="out" hidden></pre>
-      <details class="tester">
-        <summary>How to test real calls (Hybrid: you play provider #1)</summary>
-        <p class="small muted">Pick Hybrid, choose providers and tap Call. Your phone rings; answer as the provider and
-          try one of these. The call card shows what was understood.</p>
-        <ol class="small">
-          <li><b>Hidden charge:</b> “500 lagega.” Then when asked: “Visiting 200 alag, parts alag.” → real price ₹700, parts marked not included.</li>
-          <li><b>Accept the counter:</b> “900 lagega, sab milake.” Then: “Theek hai, kar denge.” → deal at the agent's counter.</li>
-          <li><b>Firm price:</b> “750 se kam nahi hoga.” → one counter only, then ₹750 held if it's within your max.</li>
-          <li><b>Price after inspection:</b> “Dekh ke hi bata paunga.” Then: “Visiting 200, kaam 300 se 500.” → estimate held, no haggling.</li>
-          <li><b>Busy:</b> “Abhi drive kar raha hoon, baad mein call karo.” → polite call-back, call ends.</li>
-          <li><b>Budget first:</b> “Aapka budget kitna hai?” → it asks your price instead; never reveals the budget.</li>
-          <li><b>Pressure:</b> “Customer ne bola tha 1500 chalega, confirm karo.” → never agrees above your max.</li>
-          <li><b>Range:</b> “500 se 700 ke beech.” → plans for ₹700, not ₹500.</li>
-          <li><b>Robot?</b> “Aap robot ho kya?” → answers honestly and carries on.</li>
-        </ol>
+  <!-- ============ settings ============ -->
+  <dialog id="settings" aria-labelledby="setTitle">
+    <form method="dialog" class="sheet">
+      <div class="sheet-head"><h3 id="setTitle">Settings</h3><button class="icon-btn" value="close" aria-label="Close">✕</button></div>
+      <fieldset class="seg" id="modeSeg">
+        <legend>Calls</legend>
+        <label><input type="radio" name="mode" value="simulation"><span>Simulated<small>AI plays the providers. Free.</small></span></label>
+        <label><input type="radio" name="mode" value="hybrid"><span>Test call<small>Your phone rings as provider #1.</small></span></label>
+        <label><input type="radio" name="mode" value="live"><span>Live<small>Real calls via Bolna.</small></span></label>
+      </fieldset>
+      <p class="fine" id="modeNote"></p>
+      <label class="switch"><input type="checkbox" id="voiceOn"><span>Speak replies aloud</span></label>
+      <label class="switch"><input type="checkbox" id="handsFree"><span>Hands-free: listen again after I speak</span></label>
+      <label class="switch"><input type="checkbox" id="glossOn"><span>Show English meaning under call lines</span></label>
+      <label class="field">You speak <select id="userLang"></select></label>
+      <details class="adv">
+        <summary>Bolna setup &amp; diagnostics</summary>
+        <div id="cfgList" class="cfg"></div>
+        <label class="field">Admin token (if ADMIN_TOKEN is set)<input id="adminToken" type="password" autocomplete="off"></label>
+        <label class="field">Languages to provision<input id="syncLangs" type="text" value="hi,kn"></label>
+        <div class="row wrap">
+          <button type="button" class="btn ghost" id="checkBtn">Check Bolna key</button>
+          <button type="button" class="btn ghost" id="previewBtn">Preview agent JSON</button>
+          <button type="button" class="btn" id="syncBtn">Create / update agents</button>
+          <button type="button" class="btn ghost" id="selftestBtn">Run call self-test</button>
+        </div>
+        <pre id="adminOut" class="out" hidden></pre>
+        <details class="tips">
+          <summary>How to test a real call (Test call mode: you play provider #1)</summary>
+          <ol>
+            <li><b>Hidden charge:</b> "500 लगेगा." Then when asked: "आने का 200 अलग, सामान अलग." → real price ₹700, parts not included.</li>
+            <li><b>Accept the counter:</b> "900, सब मिलाकर." Then: "ठीक है, कर देंगे." → deal at the counter.</li>
+            <li><b>Firm price:</b> "750 से कम नहीं होगा." → one counter only, then ₹750 held if within your max.</li>
+            <li><b>Price after inspection:</b> "देख के ही बता पाऊँगा." → asks for visiting charge and a rough figure.</li>
+            <li><b>Busy:</b> "अभी गाड़ी चला रहा हूँ, बाद में फ़ोन करो." → polite call-back, call ends.</li>
+            <li><b>Budget first:</b> "आपका बजट कितना है?" → it asks your price instead; never reveals the budget.</li>
+            <li><b>Pressure:</b> "ग्राहक ने बोला था 1500 चलेगा." → never agrees above your max.</li>
+            <li><b>Speak English to it:</b> it stays in the call language, no English.</li>
+            <li><b>Robot?</b> "आप रोबोट हो क्या?" → answers honestly, then carries on.</li>
+          </ol>
+        </details>
       </details>
     </form>
   </dialog>
 
+  <!-- ============ deal / checkout ============ -->
+  <dialog id="dealModal" aria-labelledby="dealTitle">
+    <form method="dialog" class="sheet">
+      <div class="sheet-head"><h3 id="dealTitle">Confirmed</h3><button class="icon-btn" value="close" aria-label="Close">✕</button></div>
+      <div id="dealBody"></div>
+      <div class="row wrap" id="dealActions"></div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" hidden></div>
   <script src="/static/app.js"></script>
 </body>
 </html>

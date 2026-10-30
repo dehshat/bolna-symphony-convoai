@@ -20,8 +20,12 @@ from app import config  # noqa: E402
 @pytest.fixture(autouse=True)
 def fresh_state(monkeypatch):
     config.reload_settings()
-    from app import places, ratelimit, state
+    from app import bolna_client, intake, localizer, places, ratelimit, state
     state.reset(":memory:")
     places._cache.clear()
+    places._geo_state.clear()
+    intake.CONVERSATIONS.clear()
+    localizer._cache.clear()
+    bolna_client._ensure_failed.clear()
     ratelimit.reset()
     yield state

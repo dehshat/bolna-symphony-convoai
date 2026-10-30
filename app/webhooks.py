@@ -90,6 +90,7 @@ async def _payload(request: Request) -> dict:
     for key, value in request.query_params.items():
         if key != "secret":
             data.setdefault(key, value)
+    data.pop("_spoken", None)   # internal (simulated vendors' own words); never accepted from outside
     return data
 
 

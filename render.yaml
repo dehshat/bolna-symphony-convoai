@@ -13,7 +13,11 @@ services:
       - key: BOLNA_TELEPHONY_PROVIDER
         value: plivo
       - key: BOLNA_AGENT_LANGUAGES
-        value: hi,kn
+        value: hi,kn          # the other call languages are created on first use
+      - key: KEEP_AWAKE_MINUTES
+        value: "0"            # set to 10 to keep the free instance awake (fits in the free 750 h/month)
+      - key: AUTO_CALL_COUNT
+        value: "3"
       - key: GEMINI_API_KEY
         sync: false
       - key: BOLNA_API_KEY
