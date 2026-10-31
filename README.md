@@ -60,6 +60,27 @@ The UI is one screen: a sentence from the assistant, one big mic button, a text 
 
 Every step shows up in **"How the agents worked"** under the calls, so you can see who decided what.
 
+### How the concierge decides (one decision tree, `app/intake.py` → `decide`)
+
+Each message is **understood** (rules + the chat model), then one function **decides** the next step, then the reply
+is **worded** in the user's language. The model never decides what happens next; it only reads and words.
+
+```
+"what?" / "फिर से" / "மறுபடியும்"         → repeat   the last question, plainly; nothing changes
+a plain yes to the summary                → go       find providers nearby and call them
+something still missing, in this order:   → ask      the first one, one thing at a time
+  service → place → when → details →                 ("sorry, I didn't catch that" first if the answer gave nothing)
+  budget (priced jobs only)
+    └ answered twice with nothing usable  → default  when: as soon as possible · details: none · budget: the usual
+                                                     range (shown in the summary, so it can still be changed)
+"no" / "change something" to the summary  → change   ask what to change
+everything known                          → confirm  one-line summary: "shall I call them?"
+```
+
+What the user needs and where are never guessed. A greeting ("hello", "नमस्ते"), a bare yes/no or a bare place
+("Koramangala, Bengaluru") is never taken for the service. First launch gets a short introduction with an example of
+what to say; a returning user gets "Hello again! What do you need today?".
+
 ---
 
 ## 11 call languages, no English in between
@@ -194,7 +215,7 @@ Railway works too (`railway.json`, `RAILWAY_PUBLIC_DOMAIN` auto-detected).
 pip install -r requirements.txt
 cp .env.example .env
 uvicorn app.main:app --reload --port 8000
-pytest          # 520 tests, ~15 s
+pytest          # 612 tests, ~15 s
 ```
 
 `SIM_SPEED=3` makes simulated providers talk 3× faster for rehearsals.

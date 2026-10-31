@@ -258,6 +258,7 @@
     text = String(text || "").trim();
     if (!text) return;
     if (text.startsWith("📍") || /^use my (current |live )?location$/i.test(text)) { showUser(text); await useLocation(); return; }
+    if (S.phase !== "intake" && isRepeat(text)) { showUser(text); Narrator.push($("#botLine").textContent, true); return; }
     if (S.phase === "calling" || S.phase === "done") { showUser(text); await onCallCommand(text); return; }
     if (S.phase === "shortlist") { showUser(text); onShortlistCommand(text); return; }
     await sendChat(text, heard ? { heard_lang: heard } : {});
@@ -271,11 +272,13 @@
     try {
       r = await api("/api/chat", { method: "POST", body: {
         conversation_id: S.conv.id, message: text || "", lat: S.geo?.lat, lng: S.geo?.lng,
-        user_lang: S.userLang, heard_lang: S.conv.id ? undefined : browserLang(), ...extra } });
+        user_lang: S.userLang, heard_lang: S.conv.id ? undefined : browserLang(),
+        returning: !S.conv.id && store.get("seen", "") === "1", ...extra } });
     } catch (e) {
       setOrb("idle"); showBot("Sorry, I couldn't reach the server: " + e.message); return;
     }
     S.conv = { id: r.conversation_id, task: r.task || {}, ready: r.ready, trace: r.trace || [], service: r.service_name };
+    store.set("seen", "1");   // next visit: a short "hello again" instead of the full introduction
     S.langLocked = !!r.user_lang_locked;
     await setSpokenLang(r.user_lang);
     if (r.call_language) {
@@ -639,6 +642,8 @@
   }
   const isNo = (t) => matches(String(t).replace(/no problem/gi, ""), S.commands.no);
   const isYes = (t) => !isNo(t) && String(t).split(/\s+/).length <= 6 && matches(t, S.commands.yes);
+  // "what? / फिर से": the whole message, as on the server (app/languages.py is_repeat)
+  const isRepeat = (t) => (S.commands.repeat || []).includes(String(t).toLowerCase().replace(/[.,!?;:"'()\[\]–—।॥]/g, " ").replace(/\s+/g, " ").trim().replace(/ (please|ji|plz)$/, ""));
 
   async function onCallCommand(text) {
     const s = S.session; if (!s) return;

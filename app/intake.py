@@ -73,13 +73,30 @@ def _skip(text: str) -> bool:
         (languages.is_no(text) and len(text.split()) <= 2)
 
 
+GREETINGS = {"hi", "hii", "hello", "hey", "namaste", "namaskar", "namaskaram", "vanakkam", "sat sri akal",
+             "good morning", "good afternoon", "good evening", "नमस्ते", "नमस्कार", "प्रणाम", "নমস্কার", "નમસ્તે",
+             "ਸਤ ਸ੍ਰੀ ਅਕਾਲ", "ନମସ୍କାର", "ನಮಸ್ಕಾರ", "வணக்கம்", "నమస్కారం", "നമസ്കാരം"}
+
+
+def _greeting(text: str) -> bool:
+    """'Hello' / 'नमस्ते जी': a greeting, nothing to act on (and nothing misunderstood)."""
+    t = re.sub(r"[\s.,!?।]+", " ", text.lower()).strip()
+    return re.sub(r"\s+(ji|sir|madam|there)$", "", t) in GREETINGS
+
+
+def _not_a_service(text: str) -> bool:
+    """A greeting, a bare yes/no, or only a place or time: none of these names the service."""
+    return _greeting(text) or _only_place_or_time(text) or \
+        (len(text.split()) <= 2 and (languages.is_yes(text) or languages.is_no(text)))
+
+
 @dataclass
 class Intake:
     id: str
     messages: list = field(default_factory=list)
     task: dict = field(default_factory=dict)
-    asked: list = field(default_factory=list)
-    last_question: str = ""
+    last_question: str = ""         # what the last reply asked: a field, "confirm", "change" or "go"
+    misses: dict = field(default_factory=dict)   # field -> answers to it that gave nothing usable
     user_lang: str = "en"           # the language the user talks to the app in (detected, or chosen)
     lang_auto: bool = True          # detect it (off once the user picks one in the settings)
     lang_locked: bool = False       # fixed for the rest of the conversation (detected once, or picked)
@@ -87,7 +104,7 @@ class Intake:
     touched: float = field(default_factory=time.time)
 
     def public(self) -> dict:
-        missing = missing_fields(self.task, self.asked)
+        missing = missing_fields(self.task)
         code = self.task.get("call_language") or languages.DEFAULT
         return {"conversation_id": self.id, "messages": self.messages[-30:], "task": self.task,
                 "ready": not missing, "missing": missing, "user_lang": self.user_lang,
@@ -188,6 +205,16 @@ def _residual(text: str, svc) -> str:
     return re.sub(r"[\s,.;!?]+", " ", rest).strip()
 
 
+def _only_place_or_time(text: str) -> bool:
+    """'Koramangala, Bengaluru' or 'tomorrow' says where or when, not what: never take it for the service."""
+    rest = WHEN_RE.sub(" ", text)
+    for part in _find_location(text).split(","):
+        if part.strip():
+            rest = re.sub(re.escape(part.strip()), " ", rest, flags=re.I)
+    rest = re.sub(r"\b(in|at|near|around|from|to|on|by)\b", " ", rest, flags=re.I)
+    return not [w for w in re.split(r"[\s,.;!?।]+", rest) if w and not lexicon.english_when(w)]
+
+
 def extract_rules(text: str, task: dict, asking: str) -> dict:
     """Pull whatever we can out of one user message. `asking` = the field we just asked about."""
     out: dict = {}
@@ -197,7 +224,7 @@ def extract_rules(text: str, task: dict, asking: str) -> dict:
         residual = _residual(text, svc)
         if not svc.transport and len(residual.split()) >= 3 and not task.get("details"):
             out["details"] = residual[:240]  # "my kitchen tap is leaking…" already says what's wrong
-    elif asking == "service" and not task.get("service_key"):
+    elif asking == "service" and not task.get("service_key") and not _not_a_service(text):
         label = re.sub(r"^(i need|i want|need|want|looking for|get me|book|find|please)\s+", "", text.strip(),
                        flags=re.I)
         label = re.sub(r"^(an?|some(one|body)|a person|people)\s+(to|for|who can|who will)?\s*", "", label,
@@ -238,7 +265,8 @@ def extract_rules(text: str, task: dict, asking: str) -> dict:
 
 # ---------------------------------------------------------------------------- dialogue
 
-def missing_fields(task: dict, asked: list) -> list[str]:
+def missing_fields(task: dict) -> list[str]:
+    """What we still need to know, in the order it is asked."""
     missing = []
     if not task.get("service_key"):
         missing.append("service")
@@ -247,7 +275,7 @@ def missing_fields(task: dict, asked: list) -> list[str]:
     if not task.get("when"):
         missing.append("when")
     svc = services.get(task.get("service_key"), task.get("service_label", ""))
-    if not task.get("details") and not task.get("details_done") and "details" not in asked:
+    if not task.get("details") and not task.get("details_done"):
         missing.append("details")
     if task.get("goal", svc.goal) == "negotiate" and not task.get("walkaway_ceiling"):
         missing.append("budget")
@@ -265,15 +293,16 @@ def service_for_user(task: dict, user_lang: str) -> str:
     return lexicon.service_name(svc.key, label, lang)
 
 
-def question(field_name: str, task: dict, user_lang: str = "en") -> tuple[str, list[str]]:
-    """The built-in question for a field (used when the concierge model is unavailable), in the user's language."""
+def question(field_name: str, task: dict, user_lang: str = "en", opening: str = "greet") -> tuple[str, list[str]]:
+    """The built-in question for a field (used when the concierge model is unavailable), in the user's language.
+    `opening` words the service question: 'greet' (first visit), 'greet_back' (returning) or 'service_q' (mid-chat)."""
     svc = services.get(task.get("service_key"), task.get("service_label", ""))
     lang = userlex.code(user_lang)
     label = service_for_user(task, lang)
     generic = svc.key == "other"
     say = lambda key, **kw: userlex.line(lang, key, **kw)  # noqa: E731
     if field_name == "service":
-        return say("greet"), userlex.chips(lang, "chip_examples")
+        return say(opening), userlex.chips(lang, "chip_examples")
     if field_name == "location":
         if svc.transport:
             return say("location_route", service=label), (["From JP Nagar to Kempegowda Airport"] if lang == "en" else [])
@@ -386,18 +415,161 @@ async def _place_state(task: dict) -> None:
         task["state"] = state
 
 
+# ---------------------------------------------------------------------------- one turn: understand → decide → reply
+
+@dataclass
+class Turn:
+    """What one user message did: the facts the decision tree looks at."""
+    text: str = ""
+    repeat: bool = False        # "what? / फिर से": they want the last question again
+    go: bool = False            # a plain yes to the summary
+    change: bool = False        # "no / change something" to the summary
+    understood: bool = False    # the message gave or changed something, asked a question, or just said hello
+    defaulted: bool = False     # a safe default was just filled in for a question they couldn't answer
+    thought: dict = field(default_factory=dict)   # the concierge model's reading ({} without Gemini)
+
+
+MAX_MISSES = 2   # answers that give nothing before a question gets a safe default (service and place: never)
+DEFAULTS = {"when": "as soon as possible", "details": "no details", "budget": "the usual price range"}
+
+
+async def _understand(intake: Intake, turn: Turn) -> None:
+    """Read one message with the rules and (if available) the concierge model, and apply what it gives."""
+    text, asking, task = turn.text, intake.last_question, intake.task
+    confirming = asking in {"confirm", "change"} and not missing_fields(task)
+    rules = extract_rules(text, task, asking)
+    # A bare "yes / haan / ಹೌದು" starts the calls without asking the model; "yes but call in Hindi" changes first
+    if confirming and languages.is_yes(text) and not rules and not languages.requested_language(text):
+        turn.go = turn.understood = True
+        return
+    thought = turn.thought = await concierge.think(
+        intake.messages, text, task, missing_fields(task), task.get("call_language") or languages.DEFAULT,
+        task.get("call_language_reason", ""), intake.user_lang)
+    llm_updates = thought.get("updates", {})
+    if rules.get("service_key") == "other" and llm_updates.get("service_key") not in (None, "other"):
+        rules.pop("service_key")    # the model recognised a known service in the user's own words
+    # The model fills gaps; explicit rule hits on the field we just asked about win
+    merged = {**llm_updates, **{k: v for k, v in rules.items() if v not in (None, "")}}
+    if merged.get("service_key") and task.get("service_key") and asking != "service":
+        merged.pop("service_key", None)  # don't silently switch service mid-conversation
+        merged.pop("service_label", None)
+    # The call language follows the place; it changes only when the user names a language for the calls
+    # (never on the model's guess, e.g. their own language when they didn't ask for it)
+    llm_language = merged.pop("call_language", None)
+    requested = languages.requested_language(text) or (llm_language if languages.mentions_language(text) else None)
+    moved = any(merged.get(k) and merged[k] != task.get(k) for k in ("location", "pickup"))
+    if moved and not places.is_near_me(merged.get("location", "")):
+        task.pop("state", None)   # a GPS state belongs to the old place, not the one just typed
+    task.update(merged)
+    await _place_state(task)
+    _set_call_language(intake, requested, "you asked")
+    intake.trace.append({"agent": "concierge", "text": ("understood with " + llm.status()["last_used"].get(
+        "chat", "Gemini")) if thought.get("updates") or thought.get("reply") else "understood with rules"})
+    turn.understood = bool(merged or requested) or _greeting(text) or \
+        thought.get("intent") in {"question", "smalltalk"}
+    if confirming and not merged and not requested:
+        if thought.get("intent") == "yes":
+            turn.go = True
+        elif languages.is_no(text) or thought.get("intent") == "no" or userlex.matches_chip(text, "chip_change"):
+            turn.change = True
+
+
+def _use_default(intake: Intake, field_name: str) -> bool:
+    """Fill a safe value for a question the user couldn't answer twice, so nobody gets stuck on it."""
+    task = intake.task
+    if field_name == "when":
+        task["when"] = DEFAULTS["when"]
+    elif field_name == "details":
+        task["details_done"] = True
+    elif field_name == "budget":
+        svc = services.get(task.get("service_key"), task.get("service_label", ""))
+        task["target_price"], task["walkaway_ceiling"] = services.suggested_budget(svc)
+    else:
+        return False     # what they need and where are never guessed
+    intake.trace.append({"agent": "concierge", "text": f"no clear answer about {field_name} twice: using "
+                                                       f"{DEFAULTS[field_name]} (you can change it before the calls)"})
+    return True
+
+
+def decide(intake: Intake, turn: Turn) -> tuple[str, str]:
+    """The concierge's decision tree: what to do after this message. Returns (step, field).
+
+        they want the last line again ("what?", "फिर से")  → repeat   the last question, plainly; nothing changes
+        a plain yes to the summary                         → go       find providers nearby and call them
+        something still missing, in this order: service,   → ask      the first one, one thing at a time ("sorry,
+          place, when, details, budget (priced jobs only)              I didn't catch that" first if their answer
+                                                                       gave nothing)
+            └ answered twice with nothing usable           → default  when: as soon as possible · details: none ·
+                                                                       budget: the usual range; then carry on
+        "no / change something" to the summary             → change   ask what to change
+        everything known                                   → confirm  one-line summary: "shall I call them?"
+    """
+    if turn.repeat:
+        return "repeat", intake.last_question
+    if turn.go:
+        return "go", ""
+    missing = missing_fields(intake.task)
+    while missing and intake.misses.get(missing[0], 0) >= MAX_MISSES and _use_default(intake, missing[0]):
+        turn.defaulted = True
+        missing = missing_fields(intake.task)
+    if missing:
+        return "ask", missing[0]
+    return ("change" if turn.change else "confirm"), ""
+
+
+def _reply(intake: Intake, step: str, nxt: str, turn: Turn, returning: bool) -> tuple[str, list[str]]:
+    """Word the decision in the user's language. The model's wording is used only if it's about the right thing,
+    invents no price and is in their language; otherwise the built-in line (`app.userlex`)."""
+    task, lang = intake.task, intake.user_lang
+    llm_reply, asking = turn.thought.get("reply", ""), turn.thought.get("asking")
+    usable = bool(llm_reply) and not turn.defaulted and concierge.reply_ok(llm_reply, task) and \
+        languages.writes_in(llm_reply, lang)
+    if step == "repeat":     # said again, the plain built-in way
+        step, usable = ("ask" if nxt in FIELDS else nxt), False
+    if step == "go":
+        return userlex.line(lang, "go", service=service_for_user(task, lang)), []
+    if step == "ask":
+        opening = "service_q" if turn.text else "greet_back" if returning or intake.messages else "greet"
+        reply, suggestions = question(nxt, task, lang, opening)
+        if usable and asking == nxt:
+            reply = llm_reply
+        elif turn.text and not turn.understood and not turn.repeat and intake.last_question == nxt:
+            reply = f"{userlex.line(lang, 'again')} {reply}"
+        return reply, suggestions
+    if step == "change":
+        return (llm_reply if usable else userlex.line(lang, "change"),
+                [userlex.line(lang, k) for k in ("chip_time", "chip_money", "chip_language")])
+    reply = llm_reply if usable and asking in {"confirm", "none"} else _confirm_line(task, lang)
+    return reply, [userlex.line(lang, "chip_yes"), userlex.line(lang, "chip_change")]
+
+
+def _complete(task: dict) -> None:
+    """What follows from the service: its label, its goal, and the suggested budget if the user asked for one."""
+    if not task.get("service_key"):
+        return
+    svc = services.get(task["service_key"], task.get("service_label", ""))
+    task.setdefault("service_label", svc.label)
+    task["goal"] = task.get("goal") if task.get("goal") in {"negotiate", "appointment"} else svc.goal
+    if task.pop("budget_suggested", False):
+        task["target_price"], task["walkaway_ceiling"] = services.suggested_budget(svc)
+
+
 async def chat(conversation_id: Optional[str], message: str, lat: Optional[float] = None,
                lng: Optional[float] = None, user_lang: Optional[str] = None,
-               call_language: Optional[str] = None, heard_lang: Optional[str] = None) -> dict:
-    """One turn. `user_lang` is the language picked in the settings ('auto' or None: detect it); `heard_lang` is the
-    language speech recognition heard (or, before the first message, the browser's language)."""
+               call_language: Optional[str] = None, heard_lang: Optional[str] = None,
+               returning: bool = False) -> dict:
+    """One turn: understand the message, decide what to do next (`decide`), say it in the user's language.
+
+    `user_lang` is the language picked in the settings ('auto' or None: detect it); `heard_lang` is the language
+    speech recognition heard (or, before the first message, the browser's language); `returning` means this browser
+    has used the app before, so the greeting is short."""
     intake = CONVERSATIONS.get(conversation_id or "") or Intake(id=uuid.uuid4().hex[:10])
     CONVERSATIONS[intake.id] = intake
     intake.touched = time.time()
     text = (message or "").strip()[:600]
     _set_user_language(intake, user_lang, text, heard_lang)
     if _RESTART_RE.search(text):
-        intake.task, intake.asked, intake.last_question = {}, [], ""
+        intake.task, intake.misses, intake.last_question = {}, {}, ""
         text = ""
     if call_language:
         _set_call_language(intake, languages.normalize(call_language), "picked on screen")
@@ -407,94 +579,29 @@ async def chat(conversation_id: Optional[str], message: str, lat: Optional[float
             # live location: name the area so the user can see (and correct) where we'll search
             intake.task["location"] = await places.reverse_geocode(lat, lng) or "your current location"
             intake.task["state"] = places.state_for(lat, lng)
-    action, thought, wants_change = "", {}, False
+    turn = Turn(text=text)
     if text:
-        asking = intake.last_question
-        confirming = asking in {"confirm", "change"} and not missing_fields(intake.task, intake.asked)
-        # A bare "yes / haan / ಹೌದು" starts the calls; "yes but call them in Hindi" changes something first
-        if confirming and languages.is_yes(text) and not languages.requested_language(text) and \
-                not extract_rules(text, intake.task, asking):
-            action = "go"
+        if intake.last_question and languages.is_repeat(text):
+            turn.repeat = True
         else:
-            updates = extract_rules(text, intake.task, asking)
-            thought = await concierge.think(intake.messages, text, intake.task,
-                                            missing_fields(intake.task, intake.asked),
-                                            intake.task.get("call_language") or languages.DEFAULT,
-                                            intake.task.get("call_language_reason", ""), intake.user_lang)
-            llm_updates = thought.get("updates", {})
-            if thought.get("intent") == "yes" and asking in {"confirm", "change"} and not llm_updates and \
-                    not missing_fields(intake.task, intake.asked):
-                action = "go"
-            if updates.get("service_key") == "other" and llm_updates.get("service_key") not in (None, "other"):
-                updates.pop("service_key")
-            # The model fills gaps; explicit rule hits on the field we just asked about win
-            merged = {**llm_updates, **{k: v for k, v in updates.items() if v not in (None, "")}}
-            if merged.get("service_key") and intake.task.get("service_key") and asking != "service":
-                merged.pop("service_key", None)  # don't silently switch service mid-conversation
-                merged.pop("service_label", None)
-            # The call language follows the place; it changes only when the user names a language for the calls
-            # (never on the model's guess, e.g. their own language when they didn't ask for it)
-            llm_language = merged.pop("call_language", None)
-            requested = languages.requested_language(text) or \
-                (llm_language if languages.mentions_language(text) else None)
-            moved = any(merged.get(k) and merged[k] != intake.task.get(k) for k in ("location", "pickup"))
-            if moved and not places.is_near_me(merged.get("location", "")):
-                intake.task.pop("state", None)   # a GPS state belongs to the old place, not the one just typed
-            intake.task.update(merged)
-            await _place_state(intake.task)
-            _set_call_language(intake, requested, "you asked")
-            intake.trace.append({"agent": "concierge", "text": ("understood with " + llm.status()["last_used"].get(
-                "chat", "Gemini")) if thought.get("updates") or thought.get("reply") else "understood with rules"})
-            if confirming and (languages.is_no(text) or thought.get("intent") == "no" or
-                               userlex.matches_chip(text, "chip_change")) and not merged and not requested:
-                wants_change = True
-        intake.messages.append({"role": "user", "text": text})
+            await _understand(intake, turn)
+            if not turn.understood and intake.last_question in FIELDS:
+                intake.misses[intake.last_question] = intake.misses.get(intake.last_question, 0) + 1
     task = intake.task
-    if task.get("service_key"):
-        svc = services.get(task["service_key"], task.get("service_label", ""))
-        task.setdefault("service_label", svc.label)
-        task["goal"] = task.get("goal") if task.get("goal") in {"negotiate", "appointment"} else svc.goal
-        if task.pop("budget_suggested", False) or (task["goal"] == "negotiate" and "budget" in intake.asked
-                                                   and not task.get("walkaway_ceiling") and _not_sure(text)):
-            task["target_price"], task["walkaway_ceiling"] = services.suggested_budget(svc)
+    _complete(task)
     _set_call_language(intake, None, "")
-    missing = missing_fields(task, intake.asked)
-    if missing:
-        nxt = missing[0]
-        if nxt == "details" and "details" in intake.asked:
-            task["details_done"] = True
-            missing = missing_fields(task, intake.asked)
-            nxt = missing[0] if missing else ""
+    step, nxt = decide(intake, turn)
     lang = intake.user_lang
-    reply_lang = lang
-    llm_reply = thought.get("reply", "")
-    # The model's wording is used only if it's about the right thing, invents no price and is in the user's language
-    usable = bool(llm_reply) and concierge.reply_ok(llm_reply, task) and languages.writes_in(llm_reply, lang)
-    if action == "go":
-        intake.last_question = "go"
-        reply = userlex.line(lang, "go", service=service_for_user(task, lang))
-        suggestions = []
-    elif missing:
-        reply, suggestions = question(nxt, task, lang)
-        if usable and thought.get("asking") == nxt:
-            reply = llm_reply
-        if nxt not in intake.asked:
-            intake.asked.append(nxt)
-        intake.last_question = nxt
-    elif wants_change:
-        intake.last_question = "change"
-        reply = llm_reply if usable else userlex.line(lang, "change")
-        suggestions = [userlex.line(lang, k) for k in ("chip_time", "chip_money", "chip_language")]
-    else:
-        intake.last_question = "confirm"
-        reply = _confirm_line(task, lang)
-        if usable and thought.get("asking") in {"confirm", "none"}:
-            reply = llm_reply
-        suggestions = [userlex.line(lang, "chip_yes"), userlex.line(lang, "chip_change")]
+    reply, suggestions = _reply(intake, step, nxt, turn, returning)
+    if step != "repeat":
+        intake.last_question = nxt if step == "ask" else step
     task["user_lang"] = lang      # travels with the task, so the calls are narrated and summed up in it too
+    if text:
+        intake.messages.append({"role": "user", "text": text})
     intake.messages.append({"role": "assistant", "text": reply})
-    return {**intake.public(), "reply": reply, "reply_language": reply_lang, "suggestions": suggestions,
-            "action": action, "service_name": service_for_user(task, lang) if task.get("service_key") else ""}
+    return {**intake.public(), "reply": reply, "reply_language": lang, "suggestions": suggestions,
+            "action": "go" if step == "go" else "", "decision": step,
+            "service_name": service_for_user(task, lang) if task.get("service_key") else ""}
 
 
 def to_request(task: dict) -> ServiceRequest:

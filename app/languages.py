@@ -238,9 +238,29 @@ def is_yes(text: str) -> bool:
     return _has(text, _YES)
 
 
+# "What? / Say that again / I didn't understand": the whole message, so a real answer is never mistaken for one
+_REPEAT = ("what", "what did you say", "sorry", "pardon", "come again", "repeat", "repeat that", "repeat please",
+           "say again", "say that again", "again please", "i didn't understand", "didn't get it", "i didn't get that",
+           "kya", "kya bola", "kya kaha", "phir se", "phir se bolo", "dobara", "dobara bolo", "samjha nahi",
+           "क्या", "क्या बोला", "क्या कहा", "फिर से", "फिर से बोलो", "फिर से बोलिए", "दोबारा", "दोबारा बोलो",
+           "समझा नहीं", "समझ नहीं आया", "काय", "काय म्हणालात", "पुन्हा", "पुन्हा सांगा", "समजलं नाही", "कळलं नाही",
+           "શું", "ફરીથી", "ફરી બોલો", "સમજાયું નહીં", "কী", "কি", "আবার", "আবার বলুন", "বুঝিনি", "বুঝতে পারিনি",
+           "ਕੀ", "ਫਿਰ ਤੋਂ", "ਦੁਬਾਰਾ", "ਦੁਬਾਰਾ ਦੱਸੋ", "ਸਮਝ ਨਹੀਂ ਆਇਆ", "କଣ", "କ ଣ", "ପୁଣି", "ପୁଣି କୁହନ୍ତୁ",
+           "ବୁଝିପାରିଲି ନାହିଁ", "ಏನು", "ಏನಂದ್ರಿ", "ಮತ್ತೆ", "ಮತ್ತೆ ಹೇಳಿ", "ಅರ್ಥ ಆಗಲಿಲ್ಲ", "என்ன", "மீண்டும்",
+           "மறுபடியும்", "மறுபடியும் சொல்லுங்கள்", "புரியவில்லை", "ఏమిటి", "ఏంటి", "మళ్ళీ", "మళ్ళీ చెప్పండి",
+           "అర్థం కాలేదు", "എന്ത്", "എന്താ", "വീണ്ടും", "വീണ്ടും പറയൂ", "മനസ്സിലായില്ല")
+_REPEAT_SET = set(_REPEAT)
+
+
+def is_repeat(text: str) -> bool:
+    """The user didn't catch the last line and wants it again ('what?', 'फिर से', 'மறுபடியும்')."""
+    t = re.sub(r"\s+", " ", _PUNCT_RE.sub(" ", (text or "").lower())).strip()
+    return t in _REPEAT_SET or re.sub(r"\s+(please|ji|plz)$", "", t) in _REPEAT_SET
+
+
 def voice_commands() -> dict:
-    """Shared with the browser so voice yes/no work the same on both sides."""
-    return {"yes": list(_YES), "no": list(_NO)}
+    """Shared with the browser so voice yes/no/repeat work the same on both sides."""
+    return {"yes": list(_YES), "no": list(_NO), "repeat": list(_REPEAT)}
 
 
 # ---------------------------------------------------------------------------------------------- purity checks
